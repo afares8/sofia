@@ -115,6 +115,9 @@ async def check_service(svc: ServiceConfig) -> ServiceStatus:
         )
         if sent:
             await db_service.mark_notified(event_id)
+        # Trigger restore prompt for restoreable services
+        from app.services import restore_service
+        await restore_service.notify_down_with_restore_prompt(svc.id, svc.name)
         logger.warning(
             f"[HEALTH] {svc.name} DOWN after {new_failures} consecutive failures — alert sent"
         )

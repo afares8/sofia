@@ -14,6 +14,7 @@ class ServiceConfig(BaseModel):
     expected_status: int = 200
     timeout_seconds: int = 5
     failure_threshold: int = 3       # consecutive failures before alerting (grace for --reload)
+    restore_enabled: bool = False    # enable WhatsApp-triggered restore for this service
 
 
 class AlertConfig(BaseModel):
@@ -40,6 +41,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         url="http://192.168.0.123:8075/health",
         log_path="D:/mayor/backend/logs/app.log",
         enabled=True,
+        restore_enabled=True,
     ),
     ServiceConfig(
         id="packing",
@@ -47,6 +49,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         url="http://192.168.0.123:8100/health",
         log_path="D:/packing/backend/logs/app.log",
         enabled=True,
+        restore_enabled=True,
     ),
     ServiceConfig(
         id="pantalla",
@@ -54,6 +57,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         url="http://192.168.0.123:8000/health",
         log_path="D:/Pantalla/backend/logs/app.log",
         enabled=True,
+        restore_enabled=True,
     ),
     ServiceConfig(
         id="cortana",

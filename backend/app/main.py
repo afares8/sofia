@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pathlib import Path
 
-from app.routers import health, events, ingest, logs, config
+from app.routers import health, events, ingest, logs, config, webhook, restore
 from app.services.db_service import init_db
 from app.services.health_service import poll_loop
 from app.services.log_service import log_poll_loop
@@ -23,12 +23,31 @@ logging.basicConfig(
 logger = logging.getLogger("sofia")
 
 
+async def _register_wppconnect_webhook():
+    """Register Sofia's webhook URL in WPPConnect so it receives incoming messages."""
+    import asyncio, httpx
+    from app.services.config_service import load_config
+    await asyncio.sleep(5)  # Wait for WPPConnect to be ready
+    cfg = load_config()
+    webhook_url = "http://192.168.0.123:5180/api/webhook/wppconnect"
+    url = f"{cfg.alerts.wppconnect_url}/api/{cfg.alerts.wppconnect_session}/webhook"
+    headers = {"Authorization": f"Bearer {cfg.alerts.wppconnect_token}"}
+    payload = {"webhook": webhook_url, "events": ["onMessage", "onAnyMessage"]}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            logger.info(f"[WEBHOOK] WPPConnect webhook registered: {resp.status_code} — {webhook_url}")
+    except Exception as exc:
+        logger.warning(f"[WEBHOOK] Could not register WPPConnect webhook (WPPConnect may not be running): {exc}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     # Start background polling tasks
     asyncio.create_task(poll_loop())
     asyncio.create_task(log_poll_loop())
+    asyncio.create_task(_register_wppconnect_webhook())
     logger.info("Sofia Monitor started.")
     yield
     logger.info("Sofia Monitor shutting down.")
@@ -54,6 +73,8 @@ app.include_router(events.router, prefix="/api")
 app.include_router(ingest.router, prefix="/api")
 app.include_router(logs.router, prefix="/api")
 app.include_router(config.router, prefix="/api")
+app.include_router(webhook.router, prefix="/api")
+app.include_router(restore.router, prefix="/api")
 
 
 @app.get("/api/ping")

@@ -1,9 +1,10 @@
 import { Routes, Route, NavLink } from 'react-router-dom'
-import { Activity, AlertTriangle, FileText, Settings, Zap } from 'lucide-react'
+import { Activity, AlertTriangle, FileText, Settings, Zap, RotateCcw } from 'lucide-react'
 import DashboardPage from './pages/DashboardPage'
 import EventsPage from './pages/EventsPage'
 import LogsPage from './pages/LogsPage'
 import ConfigPage from './pages/ConfigPage'
+import RestorePage from './pages/RestorePage'
 import clsx from 'clsx'
 import { useState, useEffect } from 'react'
 
@@ -11,6 +12,7 @@ const nav = [
   { to: '/',        label: 'Dashboard',     icon: Activity },
   { to: '/events',  label: 'Errores',       icon: AlertTriangle },
   { to: '/logs',    label: 'Logs',          icon: FileText },
+  { to: '/restore', label: 'Restauraciones',icon: RotateCcw },
   { to: '/config',  label: 'Configuración', icon: Settings },
 ]
 
@@ -66,8 +68,9 @@ export default function App() {
         <Routes>
           <Route path="/"       element={<DashboardPage />} />
           <Route path="/events" element={<EventsPage />} />
-          <Route path="/logs"   element={<LogsPage />} />
-          <Route path="/config" element={<ConfigPage />} />
+          <Route path="/logs"    element={<LogsPage />} />
+          <Route path="/restore" element={<RestorePage />} />
+          <Route path="/config"  element={<ConfigPage />} />
         </Routes>
       </main>
     </div>
