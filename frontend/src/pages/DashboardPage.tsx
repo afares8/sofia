@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react'
-import { getStatuses, forceCheck, getEvents, ServiceStatus, ErrorEvent } from '../api/client'
+import { getStatuses, forceCheck, getIssues, ServiceStatus, Issue } from '../api/client'
 import { RefreshCw, CheckCircle, XCircle, Clock, Wifi, WifiOff } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -65,14 +65,14 @@ function LevelBadge({ level }: { level: string }) {
 
 export default function DashboardPage() {
   const [statuses, setStatuses] = useState<ServiceStatus[]>([])
-  const [events,   setEvents]   = useState<ErrorEvent[]>([])
+  const [events,   setEvents]   = useState<Issue[]>([])
   const [loading,  setLoading]  = useState(true)
 
   const load = useCallback(async () => {
     try {
       const [s, e] = await Promise.all([
         getStatuses(),
-        getEvents({ limit: 20, since_hours: 24 }),
+        getIssues({ limit: 20, since_hours: 24 }),
       ])
       setStatuses(s)
       setEvents(e)
@@ -156,7 +156,7 @@ export default function DashboardPage() {
                 <div className="flex-1 min-w-0">
                   <div className="text-sm text-white truncate">{e.message}</div>
                   <div className="text-xs text-gray-500 mt-0.5">
-                    {e.service_name} · {new Date(e.timestamp).toLocaleString('es')} · {e.source}
+                    {e.service_name} · {new Date(e.last_seen).toLocaleString('es')} · {e.count}× ocurrencias
                   </div>
                 </div>
               </div>

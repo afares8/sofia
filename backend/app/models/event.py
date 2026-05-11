@@ -1,6 +1,3 @@
-"""
-Event / error models stored in SQLite.
-"""
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
@@ -10,12 +7,14 @@ class ErrorEvent(BaseModel):
     id: Optional[int] = None
     service_id: str
     service_name: str
-    level: str          # ERROR | WARNING | CRITICAL
+    level: str
     message: str
     detail: Optional[str] = None
     traceback: Optional[str] = None
-    source: str         # "active" (SDK pushed) | "passive" (log tail)
-    timestamp: datetime = None
+    url: Optional[str] = None
+    user_info: Optional[str] = None
+    source: str = "active"
+    timestamp: Optional[datetime] = None
     notified: bool = False
 
     class Config:
@@ -25,7 +24,7 @@ class ErrorEvent(BaseModel):
 class ServiceStatus(BaseModel):
     id: str
     name: str
-    status: str         # "up" | "down" | "unknown"
+    status: str
     status_code: Optional[int] = None
     response_ms: Optional[float] = None
     last_checked: Optional[datetime] = None
