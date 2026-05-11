@@ -13,9 +13,10 @@ async function req<T>(path: string, opts?: RequestInit): Promise<T> {
 }
 
 export interface ServiceStatus {
-  id: string; name: string; status: 'up' | 'down' | 'unknown'
+  id: string; name: string; status: 'up' | 'down' | 'restarting' | 'unknown'
   status_code?: number; response_ms?: number
   last_checked?: string; last_seen_up?: string; enabled: boolean
+  consecutive_failures?: number
 }
 
 export interface Issue {
@@ -50,6 +51,7 @@ export interface Occurrence {
 export interface ServiceConfig {
   id: string; name: string; url: string; enabled: boolean
   log_path?: string; expected_status: number; timeout_seconds: number
+  failure_threshold: number
 }
 
 export interface AlertConfig {

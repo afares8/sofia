@@ -1,17 +1,19 @@
 import { useEffect, useState, useCallback } from 'react'
 import { getStatuses, forceCheck, getIssues, ServiceStatus, Issue } from '../api/client'
-import { RefreshCw, CheckCircle, XCircle, Clock, Wifi, WifiOff } from 'lucide-react'
+import { RefreshCw, CheckCircle, XCircle, Clock, Wifi, WifiOff, RotateCw } from 'lucide-react'
 import clsx from 'clsx'
 
 function StatusCard({ s, onRefresh }: { s: ServiceStatus; onRefresh: (id: string) => void }) {
-  const isUp = s.status === 'up'
-  const isDown = s.status === 'down'
+  const isUp         = s.status === 'up'
+  const isDown       = s.status === 'down'
+  const isRestarting = s.status === 'restarting'
   return (
     <div className={clsx(
       'rounded-xl border p-4 flex flex-col gap-3 transition-all',
-      isUp   && 'bg-gray-900 border-green-500/30',
-      isDown && 'bg-gray-900 border-red-500/40 shadow-red-900/20 shadow-lg',
-      !isUp && !isDown && 'bg-gray-900 border-gray-700',
+      isUp         && 'bg-gray-900 border-green-500/30',
+      isDown       && 'bg-gray-900 border-red-500/40 shadow-red-900/20 shadow-lg',
+      isRestarting && 'bg-gray-900 border-yellow-500/40 shadow-yellow-900/10 shadow-md',
+      !isUp && !isDown && !isRestarting && 'bg-gray-900 border-gray-700',
     )}>
       <div className="flex items-center justify-between">
         <span className="font-semibold text-white text-sm">{s.name}</span>
@@ -25,19 +27,29 @@ function StatusCard({ s, onRefresh }: { s: ServiceStatus; onRefresh: (id: string
       </div>
 
       <div className="flex items-center gap-2">
-        {isUp   && <CheckCircle size={20} className="text-green-400" />}
-        {isDown && <XCircle     size={20} className="text-red-400" />}
-        {!isUp && !isDown && <Clock size={20} className="text-gray-500" />}
+        {isUp         && <CheckCircle size={20} className="text-green-400" />}
+        {isDown       && <XCircle     size={20} className="text-red-400" />}
+        {isRestarting && <RotateCw    size={20} className="text-yellow-400 animate-spin" />}
+        {!isUp && !isDown && !isRestarting && <Clock size={20} className="text-gray-500" />}
         <span className={clsx(
           'font-bold uppercase text-sm tracking-wide',
-          isUp && 'text-green-400', isDown && 'text-red-400', !isUp && !isDown && 'text-gray-500',
+          isUp         && 'text-green-400',
+          isDown       && 'text-red-400',
+          isRestarting && 'text-yellow-400',
+          !isUp && !isDown && !isRestarting && 'text-gray-500',
         )}>
-          {s.status}
+          {isRestarting ? 'Reiniciando…' : s.status}
         </span>
         {s.status_code && (
           <span className="ml-auto text-xs text-gray-500">HTTP {s.status_code}</span>
         )}
       </div>
+
+      {isRestarting && s.consecutive_failures != null && (
+        <div className="text-xs text-yellow-600 bg-yellow-950/40 rounded px-2 py-1">
+          Intento {s.consecutive_failures} — esperando que levante antes de alertar
+        </div>
+      )}
 
       <div className="text-xs text-gray-500 flex gap-3">
         {s.response_ms != null && <span>{s.response_ms} ms</span>}
@@ -91,8 +103,9 @@ export default function DashboardPage() {
     setStatuses(prev => prev.map(s => s.id === id ? updated : s))
   }
 
-  const upCount   = statuses.filter(s => s.status === 'up').length
-  const downCount = statuses.filter(s => s.status === 'down').length
+  const upCount          = statuses.filter(s => s.status === 'up').length
+  const downCount        = statuses.filter(s => s.status === 'down').length
+  const restartingCount  = statuses.filter(s => s.status === 'restarting').length
 
   return (
     <div className="p-6 space-y-6">
@@ -107,7 +120,7 @@ export default function DashboardPage() {
       </div>
 
       {/* Summary */}
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-4 gap-4">
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
           <div className="text-3xl font-bold text-white">{statuses.length}</div>
           <div className="text-xs text-gray-400 mt-1">Servicios</div>
@@ -117,6 +130,16 @@ export default function DashboardPage() {
             <Wifi size={24} /> {upCount}
           </div>
           <div className="text-xs text-gray-400 mt-1">En línea</div>
+        </div>
+        <div className={clsx(
+          'rounded-xl p-4 text-center border',
+          restartingCount > 0 ? 'bg-yellow-950/30 border-yellow-500/30' : 'bg-gray-900 border-gray-800',
+        )}>
+          <div className={clsx('text-3xl font-bold flex items-center justify-center gap-2',
+            restartingCount > 0 ? 'text-yellow-400' : 'text-gray-500')}>
+            <RotateCw size={24} /> {restartingCount}
+          </div>
+          <div className="text-xs text-gray-400 mt-1">Reiniciando</div>
         </div>
         <div className={clsx(
           'rounded-xl p-4 text-center border',

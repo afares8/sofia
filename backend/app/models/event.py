@@ -24,9 +24,10 @@ class ErrorEvent(BaseModel):
 class ServiceStatus(BaseModel):
     id: str
     name: str
-    status: str
+    status: str   # "up" | "down" | "restarting" | "unknown"
     status_code: Optional[int] = None
     response_ms: Optional[float] = None
     last_checked: Optional[datetime] = None
     last_seen_up: Optional[datetime] = None
     enabled: bool = True
+    consecutive_failures: int = 0   # how many consecutive failed checks

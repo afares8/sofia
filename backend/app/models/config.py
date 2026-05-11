@@ -8,11 +8,12 @@ from typing import List, Optional
 class ServiceConfig(BaseModel):
     id: str
     name: str
-    url: str                  # health-check URL  e.g. http://localhost:8075/health
+    url: str                  # health-check URL  e.g. http://192.168.0.123:8075/health
     enabled: bool = True
     log_path: Optional[str] = None   # absolute path to log file (passive monitoring)
     expected_status: int = 200
     timeout_seconds: int = 5
+    failure_threshold: int = 3       # consecutive failures before alerting (grace for --reload)
 
 
 class AlertConfig(BaseModel):
