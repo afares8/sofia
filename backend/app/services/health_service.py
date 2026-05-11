@@ -31,6 +31,7 @@ async def check_service(svc: ServiceConfig) -> ServiceStatus:
     status = ServiceStatus(
         id=svc.id,
         name=svc.name,
+        status="unknown",
         enabled=svc.enabled,
         last_checked=datetime.utcnow(),
         last_seen_up=prev.last_seen_up if prev else None,
