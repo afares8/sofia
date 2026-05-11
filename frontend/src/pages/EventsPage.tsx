@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import { getIssues, getOccurrences, resolveIssue, purgeEvents, Issue, Occurrence } from '../api/client'
 import clsx from 'clsx'
-import { Trash2, CheckCheck, ChevronDown, ChevronUp, Clock, Link, User, Zap, FileText } from 'lucide-react'
+import { Trash2, CheckCheck, ChevronDown, ChevronUp, Clock, Link, User, Zap, FileText, Search } from 'lucide-react'
 
 function LevelBadge({ level }: { level: string }) {
   const cls: Record<string, string> = {
@@ -169,6 +169,7 @@ export default function EventsPage() {
   const [level,      setLevel]      = useState('')
   const [sinceHours, setSinceHours] = useState(24 * 7)
   const [showResolved, setShowResolved] = useState(false)
+  const [search,      setSearch]      = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -178,7 +179,7 @@ export default function EventsPage() {
         level:      level || undefined,
         since_hours: sinceHours,
         resolved: showResolved,
-        limit: 500,
+        limit: 100,
       })
       setIssues(data)
     } finally { setLoading(false) }
@@ -196,11 +197,15 @@ export default function EventsPage() {
     load()
   }
 
+  const filtered = issues.filter(i =>
+    search === '' || i.message.toLowerCase().includes(search.toLowerCase())
+  )
+
   // Stats
-  const critical = issues.filter(i => i.level === 'CRITICAL').length
-  const errors   = issues.filter(i => i.level === 'ERROR').length
-  const warnings = issues.filter(i => i.level === 'WARNING').length
-  const totalOcc = issues.reduce((a, i) => a + i.count, 0)
+  const critical = filtered.filter(i => i.level === 'CRITICAL').length
+  const errors   = filtered.filter(i => i.level === 'ERROR').length
+  const warnings = filtered.filter(i => i.level === 'WARNING').length
+  const totalOcc = filtered.reduce((a, i) => a + i.count, 0)
 
   return (
     <div className="p-6 space-y-5">
@@ -209,7 +214,7 @@ export default function EventsPage() {
         <div>
           <h1 className="text-2xl font-bold text-white">Issues</h1>
           <p className="text-gray-400 text-sm mt-1">
-            {issues.length} issues · {totalOcc.toLocaleString()} ocurrencias
+            {filtered.length} issues · {totalOcc.toLocaleString()} ocurrencias
           </p>
         </div>
         <button onClick={handlePurge} className="flex items-center gap-2 px-3 py-2 bg-red-900/20 hover:bg-red-900/40 border border-red-700/30 rounded-lg text-sm text-red-400 transition-colors">
@@ -234,6 +239,16 @@ export default function EventsPage() {
 
       {/* Filters */}
       <div className="flex flex-wrap gap-2">
+        <div className="relative">
+          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+          <input
+            type="text"
+            placeholder="Buscar en mensajes..."
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            className="bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-sky-500 w-56"
+          />
+        </div>
         <input
           className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-sky-500"
           placeholder="Filtrar por servicio..."
@@ -266,14 +281,14 @@ export default function EventsPage() {
       {/* List */}
       {loading ? (
         <div className="text-gray-500 text-center py-12">Cargando...</div>
-      ) : issues.length === 0 ? (
+      ) : filtered.length === 0 ? (
         <div className="text-gray-500 text-sm bg-gray-900 border border-gray-800 rounded-xl p-10 text-center">
           <CheckCheck size={32} className="text-green-500 mx-auto mb-3" />
           Sin issues en este período
         </div>
       ) : (
         <div className="space-y-2">
-          {issues.map(i => <IssueRow key={i.id} issue={i} onResolve={handleResolve} />)}
+          {filtered.map(i => <IssueRow key={i.id} issue={i} onResolve={handleResolve} />)}
         </div>
       )}
     </div>

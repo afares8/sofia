@@ -13,6 +13,7 @@ const sectionCls = 'bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4'
 const BLANK_SERVICE: ServiceConfig = {
   id: '', name: '', url: '', enabled: true,
   log_path: '', expected_status: 200, timeout_seconds: 5,
+  failure_threshold: 3,
 }
 
 function ServiceForm({

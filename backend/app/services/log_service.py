@@ -17,6 +17,7 @@ logger = logging.getLogger("sofia.logs")
 
 # Track file positions between tails
 _file_positions: Dict[str, int] = {}
+_positions_lock = asyncio.Lock()
 
 # Regex to detect log levels
 _LEVEL_RE = re.compile(r"\b(ERROR|CRITICAL|WARNING|WARN)\b", re.IGNORECASE)
@@ -37,7 +38,9 @@ async def tail_log(service_id: str, service_name: str, log_path: str, tail_lines
         return []
 
     current_size = path.stat().st_size
-    last_pos = _file_positions.get(log_path, max(0, current_size - 8192))
+
+    async with _positions_lock:
+        last_pos = _file_positions.get(log_path, max(0, current_size - 8192))
 
     if current_size < last_pos:
         # File was rotated
@@ -50,10 +53,13 @@ async def tail_log(service_id: str, service_name: str, log_path: str, tail_lines
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             f.seek(last_pos)
             new_lines = f.readlines()
-            _file_positions[log_path] = f.tell()
+            new_position = f.tell()
     except Exception as exc:
         logger.warning(f"[LOGS] Cannot read {log_path}: {exc}")
         return []
+
+    async with _positions_lock:
+        _file_positions[log_path] = new_position
 
     events = []
     cfg = load_config()

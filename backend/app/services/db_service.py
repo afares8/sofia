@@ -62,6 +62,13 @@ async def init_db():
                 FOREIGN KEY(issue_id) REFERENCES issues(id)
             )
         """)
+        # Indexes for common query patterns
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_issues_service ON issues(service_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_issues_level ON issues(level)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_issues_last_seen ON issues(last_seen)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_issues_resolved ON issues(resolved)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_occ_issue ON occurrences(issue_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_occ_ts ON occurrences(timestamp)")
         # Migrate old schema if needed
         try:
             await db.execute("ALTER TABLE issues ADD COLUMN url TEXT")
@@ -83,6 +90,7 @@ async def upsert_event(event: ErrorEvent) -> tuple[int, bool]:
     ts = (event.timestamp or datetime.utcnow()).isoformat()
 
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
         db.row_factory = aiosqlite.Row
         row = await (await db.execute(
             "SELECT id, count, notified FROM issues WHERE fingerprint = ?", (fp,)
@@ -148,6 +156,7 @@ async def get_issues(
     params.append(limit)
 
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute(query, params)).fetchall()
         return [dict(r) for r in rows]
@@ -155,6 +164,7 @@ async def get_issues(
 
 async def get_occurrences(issue_id: int, limit: int = 50) -> List[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute(
             "SELECT * FROM occurrences WHERE issue_id = ? ORDER BY timestamp DESC LIMIT ?",
@@ -165,12 +175,14 @@ async def get_occurrences(issue_id: int, limit: int = 50) -> List[dict]:
 
 async def resolve_issue(issue_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("UPDATE issues SET resolved = 1 WHERE id = ?", (issue_id,))
         await db.commit()
 
 
 async def mark_notified(issue_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("UPDATE issues SET notified = 1 WHERE id = ?", (issue_id,))
         await db.commit()
 
@@ -178,10 +190,11 @@ async def mark_notified(issue_id: int):
 async def purge_old_events(retention_days: int = 7):
     cutoff = (datetime.utcnow() - timedelta(days=retention_days)).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        async with db.execute("BEGIN"):
+            pass
         await db.execute("DELETE FROM occurrences WHERE timestamp < ?", (cutoff,))
-        await db.execute(
-            "DELETE FROM issues WHERE last_seen < ? AND resolved = 1", (cutoff,)
-        )
+        await db.execute("DELETE FROM issues WHERE last_seen < ? AND resolved = 1", (cutoff,))
         await db.commit()
 
 

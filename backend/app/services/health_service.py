@@ -125,6 +125,13 @@ async def check_service(svc: ServiceConfig) -> ServiceStatus:
         )
     elif new_status == "up" and prev_status in ("restarting", "down"):
         logger.info(f"[HEALTH] {svc.name} recovered after {prev_failures} failure(s)")
+        if prev_status == "down" and svc.enabled:
+            cfg = load_config()
+            await whatsapp_service.send_alert(
+                cfg.alerts, svc.name, svc.id, "INFO",
+                f"✅ {svc.name} recuperado",
+                f"El servicio volvió a responder después de {prev_failures} fallo(s). URL: {svc.url}",
+            )
 
     _status_cache[svc.id] = status
     return status

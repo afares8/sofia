@@ -5,6 +5,7 @@ import EventsPage from './pages/EventsPage'
 import LogsPage from './pages/LogsPage'
 import ConfigPage from './pages/ConfigPage'
 import clsx from 'clsx'
+import { useState, useEffect } from 'react'
 
 const nav = [
   { to: '/',        label: 'Dashboard',     icon: Activity },
@@ -14,6 +15,15 @@ const nav = [
 ]
 
 export default function App() {
+  const [connected, setConnected] = useState(true)
+  
+  useEffect(() => {
+    const check = () => fetch('/api/ping').then(() => setConnected(true)).catch(() => setConnected(false))
+    check()
+    const id = setInterval(check, 10000)
+    return () => clearInterval(id)
+  }, [])
+
   return (
     <div className="flex min-h-screen">
       {/* Sidebar */}
@@ -22,6 +32,7 @@ export default function App() {
           <div className="flex items-center gap-2">
             <Zap className="text-sky-400" size={22} />
             <span className="text-lg font-bold text-white">Sofia</span>
+            <span className={clsx('w-2 h-2 rounded-full', connected ? 'bg-green-400' : 'bg-red-500 animate-pulse')} title={connected ? 'Backend conectado' : 'Backend desconectado'} />
             <span className="text-xs text-gray-400 mt-0.5">Monitor</span>
           </div>
         </div>
