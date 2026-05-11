@@ -25,3 +25,4 @@ class PendingRestore(BaseModel):
     confirmed_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     result_message: Optional[str] = None
+    devin_output: Optional[str] = None      # last lines of devin session output

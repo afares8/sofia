@@ -10,6 +10,7 @@ interface RestoreEntry {
   confirmed_at: string | null
   finished_at: string | null
   result_message: string | null
+  devin_output: string | null
 }
 
 function timeAgo(iso: string | null) {
@@ -183,6 +184,17 @@ function RestoreCard({ entry }: { entry: RestoreEntry }) {
         <div className="text-xs text-gray-300 bg-gray-950/50 rounded px-3 py-2">
           {entry.result_message}
         </div>
+      )}
+
+      {entry.devin_output && (
+        <details className="text-xs">
+          <summary className="cursor-pointer text-gray-500 hover:text-gray-300 select-none py-1">
+            🤖 Ver output de Devin
+          </summary>
+          <pre className="mt-1 bg-gray-950 rounded p-3 overflow-auto max-h-64 text-gray-400 whitespace-pre-wrap break-words leading-4">
+            {entry.devin_output}
+          </pre>
+        </details>
       )}
 
       {entry.status === 'pending' && (

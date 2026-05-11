@@ -1,32 +1,35 @@
 """
-Restore service - handles WhatsApp-triggered service restoration.
+Restore service - handles WhatsApp-triggered service restoration via Devin.
 
 Flow:
   1. health_service detects DOWN → calls notify_down_with_restore_prompt()
   2. Sofia sends WA: "🔴 <name> caído. Responde *SI <ID>* para restaurar."
   3. User replies "SI MAYOR" (or SI PACKING, SI PANTALLA)
   4. wpp_webhook router calls handle_incoming_message(sender, text)
-  5. If valid: runs restore script, waits for health, reports result
+  5. If valid: launches `devin -p --permission-mode dangerous "<prompt>"` with
+     full context about the service, how it starts, what to check, etc.
+  6. Devin diagnoses the problem, kills orphans, restarts the service,
+     verifies health (+ DIAPI for mayor/packing), and reports result.
+  7. Sofia reads Devin's output and reports back via WhatsApp.
 
 Rules:
   - Only accepts commands from whatsapp_number in config
   - Format: "SI <service_id>" (case-insensitive) or "NO"
-  - Only acts if service is currently in "down" state
-  - No retry loop: one attempt, report success or failure
-  - Timeout: 5 minutes for user to confirm, 3 minutes for service to come up
-  - For mayor/packing: also verifies DIAPI middleware is up
+  - No retry loop: one Devin session per confirmation, report result
+  - Timeout: 5 minutes to confirm, 10 minutes for Devin to finish
+  - For mayor/packing: Devin explicitly verifies SAP DIAPI middleware
 """
 import asyncio
 import logging
 import subprocess
 import httpx
+import shutil
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 from pathlib import Path
 
 from app.models.restore import PendingRestore, RestoreStatus
 from app.services.config_service import load_config
-from app.services import whatsapp_service
 from app.services.health_service import get_status, check_service
 
 logger = logging.getLogger("sofia.restore")
@@ -37,17 +40,49 @@ _pending: Dict[str, PendingRestore] = {}
 # Confirmation timeout: user must reply within this many minutes
 CONFIRM_TIMEOUT_MINUTES = 5
 
-# How long to wait for service to come back up after running the script
-RESTORE_TIMEOUT_SECONDS = 180
+# How long to wait for Devin to finish (generous — Devin may need to diagnose)
+DEVIN_TIMEOUT_SECONDS = 600   # 10 minutes
 
 # DIAPI health endpoint (Mayor and Packing use SAP middleware on port 9000)
 DIAPI_HEALTH_URL = "http://localhost:9000/api/Health/Ping"
 DIAPI_SERVICES = {"mayor", "packing"}
 
-# Base64-encoded PowerShell restore commands for each service
-# These mirror exactly the same watchdog pattern used in the .bat startup files
-# Script path: D:/sofia/backend/scripts/restore_<service_id>.ps1
-SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
+# Per-service context that Devin receives as part of the prompt
+SERVICE_CONTEXT = {
+    "mayor": {
+        "port": 8075,
+        "health_url": "http://192.168.0.123:8075/health",
+        "work_dir": r"D:\mayor\backend",
+        "start_cmd": r"C:\Users\ahmed\AppData\Local\Programs\Python\Python312\python.exe run.py",
+        "extra": (
+            "Mayor also manages a SAP DI API middleware (.NET) that starts automatically "
+            "when the backend starts. After Mayor is up, verify the DIAPI middleware at "
+            "http://localhost:9000/api/Health/Ping responds with HTTP 200. "
+            "The middleware executable is at "
+            r"D:\mayor\sap-diapi-middleware\SapDiApiMiddleware\bin\x86\Release\net48\SapDiApiMiddleware.exe "
+            "(also check Debug path if Release doesn't exist). "
+            "If DIAPI is not responding, try starting SapDiApiMiddleware.exe directly."
+        ),
+    },
+    "packing": {
+        "port": 8100,
+        "health_url": "http://192.168.0.123:8100/health",
+        "work_dir": r"D:\packing\backend",
+        "start_cmd": "python run.py",
+        "extra": (
+            "Packing also uses the SAP DI API middleware. After Packing is up, verify "
+            "DIAPI at http://localhost:9000/api/Health/Ping responds. "
+            "If not responding, check if Mayor already started it (they share the same DIAPI process)."
+        ),
+    },
+    "pantalla": {
+        "port": 8000,
+        "health_url": "http://192.168.0.123:8000/health",
+        "work_dir": r"D:\Pantalla\backend",
+        "start_cmd": "poetry run python run.py",
+        "extra": "Pantalla is a display/dashboard service. No special middleware required.",
+    },
+}
 
 
 def get_all_pending() -> Dict[str, PendingRestore]:
@@ -174,97 +209,181 @@ async def handle_incoming_message(sender_phone: str, text: str) -> None:
     logger.debug(f"[RESTORE] Ignoring unrecognized command: '{text}'")
 
 
+def _build_devin_prompt(service_id: str, service_name: str) -> str:
+    """Build a rich, contextual prompt for Devin to diagnose and restore a service."""
+    ctx = SERVICE_CONTEXT.get(service_id, {})
+    port      = ctx.get("port", "unknown")
+    health    = ctx.get("health_url", f"http://192.168.0.123:{port}/health")
+    work_dir  = ctx.get("work_dir", f"D:\\{service_id}\\backend")
+    start_cmd = ctx.get("start_cmd", "python run.py")
+    extra     = ctx.get("extra", "")
+
+    return f"""You are being asked to diagnose and restore the {service_name} backend service which is currently DOWN.
+
+## Your mission
+Diagnose why the service is down, fix the problem, restart it, and confirm it is healthy.
+
+## Service details
+- Service name: {service_name}
+- Working directory: {work_dir}
+- Start command (run from working directory): {start_cmd}
+- Health check URL: {health}
+- Port: {port}
+
+## Step-by-step instructions
+
+### 1. Diagnose
+- Check what process (if any) is occupying port {port}: `netstat -ano | findstr :{port}`
+- Check the last 50 lines of the log file if it exists (look in {work_dir}\\logs\\ for app.log, error.log, out.log)
+- Try to understand WHY the service is down (crash, port conflict, import error, missing env var, etc.)
+
+### 2. Clean up orphan processes
+- Kill any process holding port {port} using taskkill /F /PID <pid>
+- Wait 2-3 seconds after killing
+
+### 3. Start the service
+- Change directory to: {work_dir}
+- Run: {start_cmd}
+- Run it as a background process so you can continue monitoring (use Start-Process in PowerShell or start a background job)
+
+### 4. Verify health
+- Poll {health} every 5 seconds for up to 3 minutes
+- The service is healthy when it returns HTTP status < 500
+- If it doesn't come up in 3 minutes, check the logs again for startup errors and try to fix them
+
+{f"### 5. Additional checks{chr(10)}{extra}" if extra else ""}
+
+## Rules
+- Work autonomously — do not ask questions, just proceed
+- If you encounter an error (missing dependency, config issue, etc.), fix it and retry
+- At the end of your work, output a clear summary line starting with either:
+  - RESTORE_SUCCESS: <brief description of what you did>
+  - RESTORE_FAILED: <brief description of what went wrong>
+
+The output line is machine-read by Sofia Monitor to report the result via WhatsApp.
+"""
+
+
 async def _run_restore(service_id: str) -> None:
-    """Execute the restore script and wait for service to come back up."""
+    """Launch a Devin session to diagnose and restore the service."""
     restore = _pending.get(service_id)
     if not restore:
         return
 
     restore.status = RestoreStatus.RUNNING
-    cfg = load_config()
 
-    script_path = SCRIPTS_DIR / f"restore_{service_id}.ps1"
-    if not script_path.exists():
-        msg = f"❌ Script de restauración no encontrado: {script_path}"
+    # Locate devin binary
+    devin_bin = shutil.which("devin") or shutil.which("devin.exe")
+    if not devin_bin:
+        msg = "Devin CLI no encontrado en PATH."
         logger.error(f"[RESTORE] {msg}")
         restore.status = RestoreStatus.FAILED
         restore.finished_at = datetime.utcnow()
         restore.result_message = msg
-        await _send_simple_message(f"❌ No se encontró el script de restauración para *{restore.service_name}*.")
+        await _send_simple_message(f"❌ {msg} Instalar Devin CLI para restauración inteligente.")
         return
 
     await _send_simple_message(
-        f"⚙️ Ejecutando restauración de *{restore.service_name}*...\n"
-        f"_Espera hasta {RESTORE_TIMEOUT_SECONDS // 60} minutos._"
+        f"🤖 *Devin* está diagnosticando y restaurando *{restore.service_name}*...\n"
+        f"_Puede tomar hasta {DEVIN_TIMEOUT_SECONDS // 60} minutos. Te avisaré cuando termine._"
     )
 
-    logger.info(f"[RESTORE] Running script: {script_path}")
+    prompt = _build_devin_prompt(service_id, restore.service_name)
+    logger.info(f"[RESTORE] Launching Devin session for {service_id}")
+
     try:
-        # Run the PowerShell script (non-blocking, detached)
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
-            creationflags=subprocess.CREATE_NEW_CONSOLE,
+        # Run devin in non-interactive print mode with dangerous permissions
+        # asyncio.create_subprocess_exec lets us capture stdout without blocking
+        proc = await asyncio.create_subprocess_exec(
+            devin_bin, "--print", "--permission-mode", "dangerous", "--", prompt,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=SERVICE_CONTEXT.get(service_id, {}).get("work_dir", "D:\\"),
         )
+
+        try:
+            stdout_bytes, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=DEVIN_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            msg = f"Devin tardó más de {DEVIN_TIMEOUT_SECONDS // 60} minutos y fue cancelado."
+            logger.error(f"[RESTORE] {msg}")
+            restore.status = RestoreStatus.FAILED
+            restore.finished_at = datetime.utcnow()
+            restore.result_message = msg
+            await _send_simple_message(
+                f"⏰ *{restore.service_name}*: Devin tardó demasiado y fue cancelado.\n"
+                f"Revisar manualmente."
+            )
+            return
+
+        output = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+        # Keep last 2000 chars for storage/display
+        restore.devin_output = output[-2000:] if len(output) > 2000 else output
+        logger.info(f"[RESTORE] Devin finished for {service_id}. Exit={proc.returncode}")
+        logger.debug(f"[RESTORE] Devin output tail:\n{restore.devin_output[-500:]}")
+
     except Exception as exc:
-        msg = f"Error al ejecutar script: {exc}"
+        msg = f"Error lanzando Devin: {exc}"
         logger.error(f"[RESTORE] {msg}")
         restore.status = RestoreStatus.FAILED
         restore.finished_at = datetime.utcnow()
         restore.result_message = msg
-        await _send_simple_message(f"❌ Error ejecutando restauración de *{restore.service_name}*: {exc}")
+        await _send_simple_message(f"❌ Error al lanzar Devin para *{restore.service_name}*: {exc}")
         return
 
-    # Wait for service to come back up
+    # Parse Devin's summary line
+    output_lines = output.splitlines()
+    summary_line = next(
+        (l for l in reversed(output_lines) if l.startswith("RESTORE_SUCCESS:") or l.startswith("RESTORE_FAILED:")),
+        None
+    )
+
+    # Also do an independent health check to verify
+    cfg = load_config()
     svc_config = next((s for s in cfg.services if s.id == service_id), None)
-    deadline = datetime.utcnow() + timedelta(seconds=RESTORE_TIMEOUT_SECONDS)
     came_up = False
-
-    while datetime.utcnow() < deadline:
-        await asyncio.sleep(10)
+    if svc_config:
         try:
-            if svc_config:
-                status = await check_service(svc_config)
-                if status.status == "up":
-                    came_up = True
-                    break
-        except Exception as exc:
-            logger.debug(f"[RESTORE] Health check error during wait: {exc}")
+            status = await check_service(svc_config)
+            came_up = status.status == "up"
+        except Exception:
+            came_up = False
 
-    # For mayor/packing also verify DIAPI
     diapi_ok = True
     if came_up and service_id in DIAPI_SERVICES:
         diapi_ok = await _check_diapi()
-        if not diapi_ok:
-            logger.warning(f"[RESTORE] {service_id} came up but DIAPI middleware is not responding")
 
     restore.finished_at = datetime.utcnow()
+    elapsed = int((restore.finished_at - restore.confirmed_at).total_seconds())
 
     if came_up and diapi_ok:
         restore.status = RestoreStatus.SUCCESS
-        restore.result_message = "Servicio restaurado correctamente."
-        elapsed = int((restore.finished_at - restore.confirmed_at).total_seconds())
-        msg = (
-            f"✅ *{restore.service_name}* restaurado correctamente en {elapsed}s.\n"
-        )
+        summary = summary_line.replace("RESTORE_SUCCESS:", "").strip() if summary_line and "SUCCESS" in summary_line else "Servicio restaurado."
+        restore.result_message = summary
+        msg = f"✅ *{restore.service_name}* restaurado en {elapsed}s.\n_{summary}_"
         if service_id in DIAPI_SERVICES:
-            msg += "✅ Middleware SAP DIAPI también respondiendo.\n"
+            msg += "\n✅ Middleware SAP DIAPI respondiendo."
         await _send_simple_message(msg)
-        logger.info(f"[RESTORE] {service_id} restored successfully in {elapsed}s")
     elif came_up and not diapi_ok:
         restore.status = RestoreStatus.FAILED
-        restore.result_message = "Servicio levantó pero DIAPI middleware no responde."
+        restore.result_message = "Servicio levantó pero DIAPI no responde."
         await _send_simple_message(
             f"⚠️ *{restore.service_name}* levantó pero el middleware SAP DIAPI no responde.\n"
-            f"Verificar D:\\mayor\\sap-diapi-middleware manualmente."
+            f"Revisar manualmente."
         )
     else:
         restore.status = RestoreStatus.FAILED
-        restore.result_message = f"El servicio no respondió en {RESTORE_TIMEOUT_SECONDS}s."
+        summary = summary_line.replace("RESTORE_FAILED:", "").strip() if summary_line and "FAILED" in summary_line else "El servicio no respondió al health check."
+        restore.result_message = summary
         await _send_simple_message(
-            f"❌ *{restore.service_name}* no levantó en {RESTORE_TIMEOUT_SECONDS // 60} minutos.\n"
-            f"Revisar manualmente."
+            f"❌ *{restore.service_name}* no levantó tras {elapsed}s.\n"
+            f"_{summary}_\n"
+            f"Revisar logs manualmente."
         )
-        logger.error(f"[RESTORE] {service_id} failed to come back up within timeout")
+        logger.error(f"[RESTORE] {service_id} failed. Devin summary: {summary}")
 
 
 async def _check_diapi() -> bool:

@@ -20,6 +20,7 @@ async def list_restores():
             "confirmed_at": r.confirmed_at.isoformat() if r.confirmed_at else None,
             "finished_at": r.finished_at.isoformat() if r.finished_at else None,
             "result_message": r.result_message,
+            "devin_output": r.devin_output,
         }
         for r in pending.values()
     ]
