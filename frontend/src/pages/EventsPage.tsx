@@ -1,7 +1,8 @@
 import { useEffect, useState, useCallback } from 'react'
 import { getIssues, getOccurrences, resolveIssue, purgeEvents, Issue, Occurrence } from '../api/client'
 import clsx from 'clsx'
-import { Trash2, CheckCheck, ChevronDown, ChevronUp, Clock, Link, User, Zap, FileText, Search } from 'lucide-react'
+import { Trash2, CheckCheck, ChevronDown, ChevronUp, Clock, Link, User, Zap, FileText, Search, History, AlertCircle } from 'lucide-react'
+import { BarChart, Bar, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 
 function LevelBadge({ level }: { level: string }) {
   const cls: Record<string, string> = {
@@ -40,16 +41,57 @@ function OccurrenceList({ issueId }: { issueId: number }) {
   return (
     <div className="space-y-1 mt-2">
       <div className="text-xs text-gray-400 font-medium mb-2">Últimas {occurrences.length} ocurrencias</div>
-      {occurrences.map(o => (
-        <div key={o.id} className="flex items-center gap-3 text-xs text-gray-400 bg-gray-950 rounded px-2 py-1">
-          <Clock size={10} className="shrink-0" />
-          <span>{new Date(o.timestamp).toLocaleString('es')}</span>
-          {o.url && <span className="truncate text-gray-500">{o.url}</span>}
-          {o.user_info && <span className="text-sky-400">👤 {o.user_info}</span>}
-        </div>
-      ))}
+      {occurrences.map(o => {
+        let breadcrumbs: Array<{ category?: string; message?: string; timestamp?: number; level?: string }> = []
+        if (o.breadcrumbs) {
+          try { breadcrumbs = JSON.parse(o.breadcrumbs) } catch { /* ignore */ }
+        }
+        return (
+          <div key={o.id} className="text-xs text-gray-400 bg-gray-950 rounded px-2 py-1">
+            <div className="flex items-center gap-3">
+              <Clock size={10} className="shrink-0" />
+              <span>{new Date(o.timestamp).toLocaleString('es')}</span>
+              {o.url && <span className="truncate text-gray-500">{o.url}</span>}
+              {o.user_info && <span className="text-sky-400">👤 {o.user_info}</span>}
+            </div>
+            {breadcrumbs.length > 0 && (
+              <details className="mt-1">
+                <summary className="cursor-pointer text-gray-500 hover:text-gray-300 select-none">
+                  {breadcrumbs.length} breadcrumbs
+                </summary>
+                <ul className="mt-1 space-y-0.5 ml-3">
+                  {breadcrumbs.map((c, i) => (
+                    <li key={i} className="text-[11px] text-gray-500 truncate">
+                      <span className="text-gray-600">[{c.category ?? '–'}]</span> {c.message}
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
+}
+
+function bucketIssuesHourly(issues: Issue[]) {
+  const buckets: Record<string, number> = {}
+  const now = new Date()
+  for (let i = 23; i >= 0; i--) {
+    const d = new Date(now.getTime() - i * 3600_000)
+    const key = `${d.getHours().toString().padStart(2, '0')}h`
+    buckets[key] = 0
+  }
+  issues.forEach(iss => {
+    const t = new Date(iss.last_seen)
+    if (isNaN(t.getTime())) return
+    const ageHours = (now.getTime() - t.getTime()) / 3600_000
+    if (ageHours > 24) return
+    const key = `${t.getHours().toString().padStart(2, '0')}h`
+    buckets[key] = (buckets[key] ?? 0) + iss.count
+  })
+  return Object.entries(buckets).map(([hour, count]) => ({ hour, count }))
 }
 
 function IssueRow({ issue, onResolve }: { issue: Issue; onResolve: (id: number) => void }) {
@@ -90,9 +132,32 @@ function IssueRow({ issue, onResolve }: { issue: Issue; onResolve: (id: number) 
 
         {/* Message + meta */}
         <div className="flex-1 min-w-0">
-          <div className="text-sm text-white font-medium truncate">{issue.message}</div>
+          <div className="text-sm text-white font-medium truncate flex items-center gap-2">
+            {/* Regression: resolved=false but first_seen is older than last_seen by a notable margin
+               and count is >= 2 — heuristic until backend exposes a dedicated flag. */}
+            {!issue.resolved && new Date(issue.last_seen).getTime() - new Date(issue.first_seen).getTime() > 60 * 60 * 1000 && issue.count >= 2 && (
+              <span className="shrink-0 inline-flex items-center gap-1 text-[10px] uppercase tracking-wide font-bold px-1.5 py-0.5 rounded bg-purple-900/40 text-purple-300 border border-purple-700/40">
+                <History size={10} /> Reaparece
+              </span>
+            )}
+            <span className="truncate">{issue.message}</span>
+          </div>
           <div className="flex flex-wrap items-center gap-2 mt-1 text-xs text-gray-500">
             <span className="text-gray-400 font-medium">{issue.service_name}</span>
+            {issue.environment && (
+              <>
+                <span>·</span>
+                <span className="text-sky-400 uppercase tracking-wide font-bold text-[10px]">
+                  {issue.environment}
+                </span>
+              </>
+            )}
+            {issue.release && (
+              <>
+                <span>·</span>
+                <span className="text-gray-400">v{issue.release}</span>
+              </>
+            )}
             <span>·</span>
             <span className={clsx('flex items-center gap-1',
               issue.source === 'active' ? 'text-sky-400' : 'text-gray-500')}>
@@ -153,6 +218,12 @@ function IssueRow({ issue, onResolve }: { issue: Issue; onResolve: (id: number) 
             <div>
               <div className="text-xs text-gray-400 mb-1 font-medium uppercase tracking-wide">Stack Trace</div>
               <pre className="text-xs text-red-300 bg-gray-950 rounded p-3 overflow-auto max-h-64 font-mono leading-5">{issue.traceback}</pre>
+            </div>
+          )}
+          {issue.tags && (
+            <div>
+              <div className="text-xs text-gray-400 mb-1 font-medium uppercase tracking-wide">Tags</div>
+              <pre className="text-xs text-gray-300 bg-gray-950 rounded p-3 whitespace-pre-wrap break-words">{issue.tags}</pre>
             </div>
           )}
           <OccurrenceList issueId={issue.id} />
@@ -235,6 +306,26 @@ export default function EventsPage() {
             <div className="text-xs text-gray-500 mt-0.5">{label}</div>
           </div>
         ))}
+      </div>
+
+      {/* Hourly trend */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+        <div className="text-xs uppercase tracking-wide text-gray-400 mb-2 flex items-center gap-1">
+          <AlertCircle size={12} /> Distribución de errores · últimas 24h
+        </div>
+        <div style={{ width: '100%', height: 140 }}>
+          <ResponsiveContainer>
+            <BarChart data={bucketIssuesHourly(filtered)}>
+              <XAxis dataKey="hour" stroke="#6b7280" fontSize={10} />
+              <YAxis stroke="#6b7280" fontSize={10} allowDecimals={false} />
+              <Tooltip
+                contentStyle={{ background: '#0b1220', border: '1px solid #1f2937', fontSize: 12 }}
+                labelStyle={{ color: '#94a3b8' }}
+              />
+              <Bar dataKey="count" fill="#f97316" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
       </div>
 
       {/* Filters */}

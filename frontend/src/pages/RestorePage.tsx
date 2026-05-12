@@ -1,17 +1,13 @@
 import { useEffect, useState, useCallback } from 'react'
-import { RefreshCw, CheckCircle, XCircle, Clock, Loader2, Ban, AlertTriangle } from 'lucide-react'
+import {
+  RefreshCw, CheckCircle, XCircle, Clock, Loader2, Ban, AlertTriangle,
+  Bot, User, Hand,
+} from 'lucide-react'
 import clsx from 'clsx'
-
-interface RestoreEntry {
-  service_id: string
-  service_name: string
-  status: 'pending' | 'confirmed' | 'running' | 'success' | 'failed' | 'rejected' | 'expired'
-  requested_at: string | null
-  confirmed_at: string | null
-  finished_at: string | null
-  result_message: string | null
-  devin_output: string | null
-}
+import {
+  getRestores, triggerRestore, getConfig,
+  RestoreEntry, ServiceConfig,
+} from '../api/client'
 
 function timeAgo(iso: string | null) {
   if (!iso) return '—'
@@ -36,16 +32,18 @@ const STATUS_META: Record<string, { label: string; color: string; icon: React.Re
 
 export default function RestorePage() {
   const [entries,  setEntries]  = useState<RestoreEntry[]>([])
+  const [services, setServices] = useState<ServiceConfig[]>([])
   const [loading,  setLoading]  = useState(true)
   const [error,    setError]    = useState<string | null>(null)
+  const [triggering, setTriggering] = useState<string | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch('/api/restore/')
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data: RestoreEntry[] = await res.json()
-      // Sort: active first (pending/running), then by requested_at desc
+      const [data, cfg] = await Promise.all([
+        getRestores(),
+        getConfig().catch(() => null),
+      ])
       data.sort((a, b) => {
         const active = ['pending', 'confirmed', 'running']
         const aActive = active.includes(a.status) ? 1 : 0
@@ -54,10 +52,12 @@ export default function RestorePage() {
         return new Date(b.requested_at ?? 0).getTime() - new Date(a.requested_at ?? 0).getTime()
       })
       setEntries(data)
+      if (cfg) setServices(cfg.services)
       setLastUpdated(new Date())
       setError(null)
-    } catch (e: any) {
-      setError(`No se pudo cargar: ${e.message}`)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(`No se pudo cargar: ${msg}`)
     } finally {
       setLoading(false)
     }
@@ -65,15 +65,26 @@ export default function RestorePage() {
 
   useEffect(() => {
     load()
-    // Auto-refresh every 5s when there are active restores
-    const id = setInterval(() => {
-      load()
-    }, 5000)
+    const id = setInterval(() => { load() }, 5000)
     return () => clearInterval(id)
   }, [load])
 
-  const active = entries.filter(e => ['pending', 'confirmed', 'running'].includes(e.status))
+  const onTrigger = async (id: string) => {
+    setTriggering(id)
+    try {
+      await triggerRestore(id)
+      await load()
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(`No se pudo lanzar: ${msg}`)
+    } finally {
+      setTriggering(null)
+    }
+  }
+
+  const active   = entries.filter(e => ['pending', 'confirmed', 'running'].includes(e.status))
   const finished = entries.filter(e => !['pending', 'confirmed', 'running'].includes(e.status))
+  const restorableServices = services.filter(s => s.restore_enabled)
 
   return (
     <div className="p-6 space-y-6">
@@ -82,7 +93,7 @@ export default function RestorePage() {
         <div>
           <h1 className="text-2xl font-bold text-white">Restauraciones</h1>
           <p className="text-gray-400 text-sm mt-1">
-            Restauraciones automáticas vía WhatsApp
+            Restauraciones manuales, vía WhatsApp o automáticas
             {lastUpdated && (
               <span className="ml-2 text-gray-600">· {lastUpdated.toLocaleTimeString('es')}</span>
             )}
@@ -102,15 +113,47 @@ export default function RestorePage() {
         </div>
       )}
 
+      {/* Manual trigger panel */}
+      {restorableServices.length > 0 && (
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <Hand size={14} className="text-sky-400" />
+            <h2 className="text-sm font-semibold text-white uppercase tracking-wide">Restaurar manualmente</h2>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {restorableServices.map(s => (
+              <button
+                key={s.id}
+                onClick={() => onTrigger(s.id)}
+                disabled={triggering === s.id}
+                className={clsx(
+                  'flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-colors',
+                  triggering === s.id
+                    ? 'bg-gray-700 text-gray-400 cursor-wait'
+                    : 'bg-sky-600 hover:bg-sky-500 text-white',
+                )}
+              >
+                {triggering === s.id ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+                {s.name}
+              </button>
+            ))}
+          </div>
+          <p className="text-xs text-gray-500 mt-3">
+            El restore se lanza sin pasar por WhatsApp. Solo se muestran los servicios con
+            <span className="text-gray-300 font-medium"> "Restauración habilitada"</span> en config.
+          </p>
+        </div>
+      )}
+
       {/* How it works */}
       <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 text-sm text-gray-400 space-y-1">
         <div className="text-white font-medium mb-2">¿Cómo funciona?</div>
         <div>1. Sofia detecta que un servicio lleva 3 chequeos fallidos consecutivos (≈90s)</div>
-        <div>2. Envía WhatsApp: <span className="text-yellow-400 font-mono">"🔴 Mayor caído. Responde SI MAYOR para restaurar."</span></div>
-        <div>3. Tú respondes <span className="text-green-400 font-mono">SI MAYOR</span> (o <span className="text-green-400 font-mono">SI PACKING</span> / <span className="text-green-400 font-mono">SI PANTALLA</span>)</div>
-        <div>4. Sofia mata huérfanos, lanza el proceso y espera hasta 3 minutos que levante</div>
-        <div>5. Para Mayor y Packing también verifica que el middleware SAP DIAPI responda</div>
-        <div>6. Te confirma el resultado por WhatsApp</div>
+        <div>2. Si <strong className="text-white">auto-restore</strong> está activo: restaura sin preguntar.</div>
+        <div>3. Si está OFF: envía WhatsApp <span className="text-yellow-400 font-mono">"🔴 Mayor caído. Responde SI MAYOR..."</span></div>
+        <div>4. Sofia ejecuta Devin (si está instalado) o cae a un script PowerShell de fallback.</div>
+        <div>5. Si falla, reintenta hasta 3 veces con backoff exponencial.</div>
+        <div>6. Para Mayor/Packing también verifica que el middleware SAP DIAPI responda.</div>
         <div className="text-gray-500 text-xs mt-2">
           Responde <span className="font-mono">NO</span> para cancelar · Tienes 5 minutos para confirmar
         </div>
@@ -124,14 +167,14 @@ export default function RestorePage() {
           {active.length > 0 && (
             <div className="space-y-3">
               <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">En progreso</h2>
-              {active.map(e => <RestoreCard key={e.service_id} entry={e} />)}
+              {active.map(e => <RestoreCard key={`a-${e.service_id}-${e.requested_at}`} entry={e} />)}
             </div>
           )}
 
           {finished.length > 0 && (
             <div className="space-y-3">
               <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">Historial</h2>
-              {finished.map(e => <RestoreCard key={`${e.service_id}-${e.requested_at}`} entry={e} />)}
+              {finished.map(e => <RestoreCard key={`h-${e.service_id}-${e.requested_at}`} entry={e} />)}
             </div>
           )}
 
@@ -147,19 +190,41 @@ export default function RestorePage() {
   )
 }
 
+function Badge({ children, tone }: { children: React.ReactNode; tone: 'green' | 'blue' | 'purple' | 'gray' }) {
+  const toneCls =
+    tone === 'green'  ? 'bg-green-900/40 text-green-400 border-green-500/30' :
+    tone === 'blue'   ? 'bg-sky-900/40 text-sky-400 border-sky-500/30' :
+    tone === 'purple' ? 'bg-purple-900/40 text-purple-400 border-purple-500/30' :
+                        'bg-gray-800 text-gray-400 border-gray-700'
+  return (
+    <span className={clsx('text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded border font-bold inline-flex items-center gap-1', toneCls)}>
+      {children}
+    </span>
+  )
+}
+
 function RestoreCard({ entry }: { entry: RestoreEntry }) {
   const meta = STATUS_META[entry.status] ?? STATUS_META.expired
 
   return (
     <div className={clsx('border rounded-xl p-4 space-y-2', meta.color)}>
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-2">
         <div className="flex items-center gap-2 font-semibold text-white">
           {meta.icon}
           {entry.service_name}
         </div>
-        <span className={clsx('text-xs font-bold uppercase tracking-wide px-2 py-0.5 rounded border', meta.color)}>
-          {meta.label}
-        </span>
+        <div className="flex items-center gap-1.5">
+          {entry.trigger_mode === 'auto' && <Badge tone="green"><Bot size={10} /> AUTO</Badge>}
+          {entry.trigger_mode === 'manual' && <Badge tone="blue"><User size={10} /> MANUAL</Badge>}
+          {entry.restore_method === 'devin'      && <Badge tone="purple">DEVIN</Badge>}
+          {entry.restore_method === 'ps1_script' && <Badge tone="gray">PS1</Badge>}
+          {entry.retry_count != null && entry.retry_count > 0 && (
+            <Badge tone="gray">retry {entry.retry_count}</Badge>
+          )}
+          <span className={clsx('text-xs font-bold uppercase tracking-wide px-2 py-0.5 rounded border', meta.color)}>
+            {meta.label}
+          </span>
+        </div>
       </div>
 
       <div className="flex flex-wrap gap-4 text-xs text-gray-400">
@@ -189,7 +254,7 @@ function RestoreCard({ entry }: { entry: RestoreEntry }) {
       {entry.devin_output && (
         <details className="text-xs">
           <summary className="cursor-pointer text-gray-500 hover:text-gray-300 select-none py-1">
-            🤖 Ver output de Devin
+            🤖 Ver output del restore
           </summary>
           <pre className="mt-1 bg-gray-950 rounded p-3 overflow-auto max-h-64 text-gray-400 whitespace-pre-wrap break-words leading-4">
             {entry.devin_output}
@@ -204,7 +269,7 @@ function RestoreCard({ entry }: { entry: RestoreEntry }) {
       )}
       {entry.status === 'running' && (
         <div className="text-xs text-blue-400 animate-pulse">
-          ⚙️ Script en ejecución — esperando health check…
+          ⚙️ Restore en ejecución — esperando health check…
         </div>
       )}
     </div>

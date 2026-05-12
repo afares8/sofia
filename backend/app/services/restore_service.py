@@ -3,34 +3,35 @@ Restore service - handles WhatsApp-triggered service restoration via Devin.
 
 Flow:
   1. health_service detects DOWN → calls notify_down_with_restore_prompt()
-  2. Sofia sends WA: "🔴 <name> caído. Responde *SI <ID>* para restaurar."
+  2. If the service has auto_restore=True, Sofia restarts it without asking.
+     Otherwise Sofia sends WA: "🔴 <name> caído. Responde *SI <ID>* para restaurar."
   3. User replies "SI MAYOR" (or SI PACKING, SI PANTALLA)
   4. wpp_webhook router calls handle_incoming_message(sender, text)
   5. If valid: launches `devin -p --permission-mode dangerous "<prompt>"` with
      full context about the service, how it starts, what to check, etc.
-  6. Devin diagnoses the problem, kills orphans, restarts the service,
-     verifies health (+ DIAPI for mayor/packing), and reports result.
-  7. Sofia reads Devin's output and reports back via WhatsApp.
+     If Devin is not available, the matching PowerShell script in
+     `app/scripts/restore_<service_id>.ps1` is executed as a fallback.
+  6. Sofia reads the result and reports it via WhatsApp.
 
 Rules:
   - Only accepts commands from whatsapp_number in config
   - Format: "SI <service_id>" (case-insensitive) or "NO"
-  - No retry loop: one Devin session per confirmation, report result
-  - Timeout: 5 minutes to confirm, 10 minutes for Devin to finish
-  - For mayor/packing: Devin explicitly verifies SAP DIAPI middleware
+  - Up to MAX_RESTORE_RETRIES retries with exponential backoff on failure
+  - Timeout: 5 minutes to confirm, 10 minutes for the restore engine
+  - For mayor/packing: Devin also verifies SAP DIAPI middleware
 """
 import asyncio
 import logging
-import subprocess
 import httpx
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Optional
 from pathlib import Path
 
 from app.models.restore import PendingRestore, RestoreStatus
+from app.services import db_service
 from app.services.config_service import load_config
-from app.services.health_service import get_status, check_service
+from app.services.health_service import check_service
 
 logger = logging.getLogger("sofia.restore")
 
@@ -40,8 +41,13 @@ _pending: Dict[str, PendingRestore] = {}
 # Confirmation timeout: user must reply within this many minutes
 CONFIRM_TIMEOUT_MINUTES = 5
 
-# How long to wait for Devin to finish (generous — Devin may need to diagnose)
+# How long to wait for Devin / PS1 to finish
 DEVIN_TIMEOUT_SECONDS = 600   # 10 minutes
+PS1_TIMEOUT_SECONDS = 300
+
+# Retry policy
+MAX_RESTORE_RETRIES = 3
+RETRY_BACKOFF_BASE_SECONDS = 30
 
 # DIAPI health endpoint (Mayor and Packing use SAP middleware on port 9000)
 DIAPI_HEALTH_URL = "http://localhost:9000/api/Health/Ping"
@@ -90,14 +96,73 @@ def get_all_pending() -> Dict[str, PendingRestore]:
     return dict(_pending)
 
 
+# ── helpers ─────────────────────────────────────────────────────────────────
+
+
+def _ps1_script_path(service_id: str) -> Path:
+    return Path(__file__).parent.parent / "scripts" / f"restore_{service_id}.ps1"
+
+
+async def _persist_new_restore(restore: PendingRestore) -> None:
+    """Insert a new row in the restores table and store its id on the in-memory object."""
+    try:
+        restore.db_id = await db_service.save_restore({
+            "service_id": restore.service_id,
+            "service_name": restore.service_name,
+            "status": restore.status.value,
+            "trigger_mode": restore.trigger_mode,
+            "requested_at": restore.requested_at.isoformat() if restore.requested_at else None,
+            "confirmed_at": restore.confirmed_at.isoformat() if restore.confirmed_at else None,
+            "finished_at": restore.finished_at.isoformat() if restore.finished_at else None,
+            "result_message": restore.result_message,
+            "devin_output": restore.devin_output,
+            "retry_count": restore.retry_count,
+            "restore_method": restore.restore_method,
+        })
+    except Exception as exc:
+        logger.warning(f"[RESTORE] save_restore failed: {exc}")
+
+
+async def _persist_update(restore: PendingRestore) -> None:
+    if not restore.db_id:
+        return
+    fields = {
+        "status": restore.status.value,
+        "confirmed_at": restore.confirmed_at.isoformat() if restore.confirmed_at else None,
+        "finished_at": restore.finished_at.isoformat() if restore.finished_at else None,
+        "result_message": restore.result_message,
+        "devin_output": restore.devin_output,
+        "retry_count": restore.retry_count,
+        "restore_method": restore.restore_method,
+        "trigger_mode": restore.trigger_mode,
+    }
+    try:
+        await db_service.update_restore(restore.db_id, **fields)
+    except Exception as exc:
+        logger.warning(f"[RESTORE] update_restore failed: {exc}")
+
+
+# ── public API ──────────────────────────────────────────────────────────────
+
+
 async def notify_down_with_restore_prompt(service_id: str, service_name: str) -> None:
     """
     Called by health_service when a service crosses the failure threshold.
-    Sends WhatsApp alert with restore prompt and stores a PendingRestore.
-    Only sends the prompt for restoreable services (mayor, packing, pantalla).
+    - If the service has auto_restore=True, restart it immediately.
+    - Otherwise send a WhatsApp prompt asking the user for confirmation.
     """
     cfg = load_config()
-    restoreable = {"mayor", "packing", "pantalla"}
+    svc_cfg = next((s for s in cfg.services if s.id == service_id), None)
+
+    if svc_cfg is None or not svc_cfg.restore_enabled:
+        # Service not restoreable — send a plain notification only
+        text = (
+            f"🔴 *{service_name}* ha caído.\n"
+            f"Este servicio no tiene restauración automática configurada.\n"
+            f"Revisar manualmente."
+        )
+        await _send_simple_message(text)
+        return
 
     # Don't spam: if there's already a pending/running restore, skip
     existing = _pending.get(service_id)
@@ -105,42 +170,70 @@ async def notify_down_with_restore_prompt(service_id: str, service_name: str) ->
         logger.info(f"[RESTORE] Already a pending restore for {service_id}, skipping prompt.")
         return
 
-    # Send alert with restore prompt only for restoreable services
-    if service_id in restoreable:
-        text = (
-            f"🔴 *{service_name}* ha caído.\n\n"
-            f"Responde *SI {service_id.upper()}* para que Devin lo restaure automáticamente,\n"
-            f"o *NO* para ignorar.\n\n"
-            f"_(Tienes {CONFIRM_TIMEOUT_MINUTES} minutos para responder)_"
-        )
-    else:
-        text = (
-            f"🔴 *{service_name}* ha caído.\n"
-            f"Este servicio no tiene restauración automática configurada.\n"
-            f"Revisar manualmente."
-        )
-
-    phone = cfg.alerts.whatsapp_number.replace("+", "") + "@c.us"
-    url = f"{cfg.alerts.wppconnect_url}/api/{cfg.alerts.wppconnect_session}/send-message"
-    headers = {"Authorization": f"Bearer {cfg.alerts.wppconnect_token}"}
-    payload = {"phone": phone, "message": text, "isGroup": False}
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(url, json=payload, headers=headers)
-        logger.info(f"[RESTORE] Sent restore prompt for {service_id}")
-    except Exception as exc:
-        logger.error(f"[RESTORE] Failed to send restore prompt: {exc}")
-
-    if service_id in restoreable:
-        _pending[service_id] = PendingRestore(
+    if svc_cfg.auto_restore:
+        # Auto mode — skip the WhatsApp confirmation dance
+        await _send_simple_message(f"🤖 Auto-restaurando *{service_name}*...")
+        restore = PendingRestore(
             service_id=service_id,
             service_name=service_name,
-            status=RestoreStatus.PENDING,
+            status=RestoreStatus.CONFIRMED,
             requested_at=datetime.utcnow(),
+            confirmed_at=datetime.utcnow(),
+            trigger_mode="auto",
         )
-        # Start expiry task
-        asyncio.create_task(_expire_pending(service_id))
+        _pending[service_id] = restore
+        await _persist_new_restore(restore)
+        asyncio.create_task(_run_restore(service_id))
+        return
+
+    # Manual mode — ask the user
+    text = (
+        f"🔴 *{service_name}* ha caído.\n\n"
+        f"Responde *SI {service_id.upper()}* para que Devin lo restaure automáticamente,\n"
+        f"o *NO* para ignorar.\n\n"
+        f"_(Tienes {CONFIRM_TIMEOUT_MINUTES} minutos para responder)_"
+    )
+    await _send_simple_message(text)
+    restore = PendingRestore(
+        service_id=service_id,
+        service_name=service_name,
+        status=RestoreStatus.PENDING,
+        requested_at=datetime.utcnow(),
+        trigger_mode="manual",
+    )
+    _pending[service_id] = restore
+    await _persist_new_restore(restore)
+    asyncio.create_task(_expire_pending(service_id))
+
+
+async def trigger_manual_restore(service_id: str) -> PendingRestore:
+    """
+    Trigger a restore from the UI/API. Skips WhatsApp confirmation and runs
+    the restore engine immediately. Raises ValueError on bad input.
+    """
+    cfg = load_config()
+    svc_cfg = next((s for s in cfg.services if s.id == service_id), None)
+    if svc_cfg is None:
+        raise ValueError(f"Service '{service_id}' not found")
+    if not svc_cfg.restore_enabled:
+        raise ValueError(f"Service '{service_id}' does not have restore_enabled")
+
+    existing = _pending.get(service_id)
+    if existing and existing.status in (RestoreStatus.PENDING, RestoreStatus.RUNNING, RestoreStatus.CONFIRMED):
+        return existing
+
+    restore = PendingRestore(
+        service_id=service_id,
+        service_name=svc_cfg.name,
+        status=RestoreStatus.CONFIRMED,
+        requested_at=datetime.utcnow(),
+        confirmed_at=datetime.utcnow(),
+        trigger_mode="manual",
+    )
+    _pending[service_id] = restore
+    await _persist_new_restore(restore)
+    asyncio.create_task(_run_restore(service_id))
+    return restore
 
 
 async def _expire_pending(service_id: str) -> None:
@@ -152,8 +245,16 @@ async def _expire_pending(service_id: str) -> None:
         restore.finished_at = datetime.utcnow()
         restore.result_message = "Sin respuesta del usuario."
         logger.info(f"[RESTORE] Restore for {service_id} expired (no confirmation).")
-        # Notify user
+        await _persist_update(restore)
         await _send_simple_message(f"⏰ Sin respuesta — restauración de *{restore.service_name}* cancelada.")
+        # Optional escalation to backup numbers
+        cfg = load_config()
+        if cfg.alerts.escalation_enabled and cfg.alerts.escalation_numbers:
+            from app.services import whatsapp_service
+            await whatsapp_service.send_to_escalation(
+                cfg.alerts,
+                f"⚠️ *{restore.service_name}* sigue caído y no hubo respuesta para restaurar.",
+            )
 
 
 async def handle_incoming_message(sender_phone: str, text: str) -> None:
@@ -162,7 +263,6 @@ async def handle_incoming_message(sender_phone: str, text: str) -> None:
     Validates sender, parses command, and triggers restore if appropriate.
     """
     cfg = load_config()
-    # Normalize sender: WPPConnect sends "50766662916@c.us" or "50766662916"
     authorized = cfg.alerts.whatsapp_number.replace("+", "").replace("@c.us", "")
     sender_normalized = sender_phone.replace("+", "").replace("@c.us", "").replace("@lid", "")
 
@@ -173,7 +273,6 @@ async def handle_incoming_message(sender_phone: str, text: str) -> None:
     text = text.strip().upper()
     logger.info(f"[RESTORE] Received command from authorized sender: '{text}'")
 
-    # Parse "NO" — cancel all pending
     if text == "NO":
         cancelled = []
         for sid, restore in list(_pending.items()):
@@ -181,12 +280,12 @@ async def handle_incoming_message(sender_phone: str, text: str) -> None:
                 restore.status = RestoreStatus.REJECTED
                 restore.finished_at = datetime.utcnow()
                 restore.result_message = "Cancelado por el usuario."
+                await _persist_update(restore)
                 cancelled.append(restore.service_name)
         if cancelled:
             await _send_simple_message(f"✅ Restauración cancelada para: {', '.join(cancelled)}")
         return
 
-    # Parse "SI <service_id>"
     if text.startswith("SI "):
         service_id = text[3:].strip().lower()
         restore = _pending.get(service_id)
@@ -198,19 +297,17 @@ async def handle_incoming_message(sender_phone: str, text: str) -> None:
             await _send_simple_message(f"⚠️ La restauración de *{restore.service_name}* ya está en estado: {restore.status.value}")
             return
 
-        # Confirm and run
         restore.status = RestoreStatus.CONFIRMED
         restore.confirmed_at = datetime.utcnow()
+        await _persist_update(restore)
         logger.info(f"[RESTORE] User confirmed restore for {service_id}")
         asyncio.create_task(_run_restore(service_id))
         return
 
-    # Unknown command — just ignore silently (could be a normal conversation message)
     logger.debug(f"[RESTORE] Ignoring unrecognized command: '{text}'")
 
 
 def _build_devin_prompt(service_id: str, service_name: str) -> str:
-    """Build a rich, contextual prompt for Devin to diagnose and restore a service."""
     ctx = SERVICE_CONTEXT.get(service_id, {})
     port      = ctx.get("port", "unknown")
     health    = ctx.get("health_url", f"http://192.168.0.123:{port}/health")
@@ -264,43 +361,24 @@ The output line is machine-read by Sofia Monitor to report the result via WhatsA
 """
 
 
-async def _run_restore(service_id: str) -> None:
-    """Launch a Devin session to diagnose and restore the service."""
-    restore = _pending.get(service_id)
-    if not restore:
-        return
-
-    restore.status = RestoreStatus.RUNNING
-
-    # Locate devin binary
+async def _run_devin(service_id: str, service_name: str) -> tuple[bool, str]:
+    """
+    Run a Devin session. Returns (success, output_tail).
+    Returns (False, "<reason>") if Devin CLI not installed.
+    """
     devin_bin = shutil.which("devin") or shutil.which("devin.exe")
     if not devin_bin:
-        msg = "Devin CLI no encontrado en PATH."
-        logger.error(f"[RESTORE] {msg}")
-        restore.status = RestoreStatus.FAILED
-        restore.finished_at = datetime.utcnow()
-        restore.result_message = msg
-        await _send_simple_message(f"❌ {msg} Instalar Devin CLI para restauración inteligente.")
-        return
+        return False, "DEVIN_NOT_FOUND"
 
-    await _send_simple_message(
-        f"🤖 *Devin* está diagnosticando y restaurando *{restore.service_name}*...\n"
-        f"_Puede tomar hasta {DEVIN_TIMEOUT_SECONDS // 60} minutos. Te avisaré cuando termine._"
-    )
-
-    prompt = _build_devin_prompt(service_id, restore.service_name)
-    logger.info(f"[RESTORE] Launching Devin session for {service_id}")
-
+    prompt = _build_devin_prompt(service_id, service_name)
+    cwd = SERVICE_CONTEXT.get(service_id, {}).get("work_dir", None)
     try:
-        # Run devin in non-interactive print mode with dangerous permissions
-        # asyncio.create_subprocess_exec lets us capture stdout without blocking
         proc = await asyncio.create_subprocess_exec(
             devin_bin, "--print", "--permission-mode", "dangerous", "--", prompt,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            cwd=SERVICE_CONTEXT.get(service_id, {}).get("work_dir", "D:\\"),
+            cwd=cwd if cwd and Path(cwd).exists() else None,
         )
-
         try:
             stdout_bytes, _ = await asyncio.wait_for(
                 proc.communicate(), timeout=DEVIN_TIMEOUT_SECONDS
@@ -308,40 +386,100 @@ async def _run_restore(service_id: str) -> None:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.communicate()
-            msg = f"Devin tardó más de {DEVIN_TIMEOUT_SECONDS // 60} minutos y fue cancelado."
-            logger.error(f"[RESTORE] {msg}")
-            restore.status = RestoreStatus.FAILED
-            restore.finished_at = datetime.utcnow()
-            restore.result_message = msg
-            await _send_simple_message(
-                f"⏰ *{restore.service_name}*: Devin tardó demasiado y fue cancelado.\n"
-                f"Revisar manualmente."
-            )
-            return
-
+            return False, f"DEVIN timeout > {DEVIN_TIMEOUT_SECONDS}s"
         output = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
-        # Keep last 2000 chars for storage/display
-        restore.devin_output = output[-2000:] if len(output) > 2000 else output
-        logger.info(f"[RESTORE] Devin finished for {service_id}. Exit={proc.returncode}")
-        logger.debug(f"[RESTORE] Devin output tail:\n{restore.devin_output[-500:]}")
-
+        tail = output[-2000:] if len(output) > 2000 else output
+        success = proc.returncode == 0 and "RESTORE_FAILED" not in (output or "")
+        return success, tail
     except Exception as exc:
-        msg = f"Error lanzando Devin: {exc}"
-        logger.error(f"[RESTORE] {msg}")
-        restore.status = RestoreStatus.FAILED
-        restore.finished_at = datetime.utcnow()
-        restore.result_message = msg
-        await _send_simple_message(f"❌ Error al lanzar Devin para *{restore.service_name}*: {exc}")
+        return False, f"DEVIN error: {exc}"
+
+
+async def _run_ps1(service_id: str) -> tuple[bool, str]:
+    """
+    Run the PowerShell fallback script for this service.
+    Returns (success, output_tail).
+    """
+    script = _ps1_script_path(service_id)
+    if not script.exists():
+        return False, "PS1_NOT_FOUND"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "powershell", "-ExecutionPolicy", "Bypass", "-File", str(script),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            stdout_bytes, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=PS1_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return False, f"PS1 timeout > {PS1_TIMEOUT_SECONDS}s"
+        output = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+        tail = output[-2000:] if len(output) > 2000 else output
+        return proc.returncode == 0, tail
+    except FileNotFoundError:
+        # PowerShell not installed (e.g. Linux)
+        return False, "POWERSHELL_NOT_INSTALLED"
+    except Exception as exc:
+        return False, f"PS1 error: {exc}"
+
+
+async def _run_restore(service_id: str) -> None:
+    """Run the restore engine — Devin first, PS1 fallback, retry with backoff."""
+    restore = _pending.get(service_id)
+    if not restore:
         return
 
-    # Parse Devin's summary line
-    output_lines = output.splitlines()
-    summary_line = next(
-        (l for l in reversed(output_lines) if l.startswith("RESTORE_SUCCESS:") or l.startswith("RESTORE_FAILED:")),
-        None
-    )
+    restore.status = RestoreStatus.RUNNING
+    await _persist_update(restore)
 
-    # Also do an independent health check to verify
+    # Pick engine: prefer Devin, fall back to PS1 if Devin not available
+    devin_available = shutil.which("devin") is not None or shutil.which("devin.exe") is not None
+    ps1_available = _ps1_script_path(service_id).exists()
+
+    if devin_available:
+        engine = "devin"
+    elif ps1_available:
+        engine = "ps1_script"
+    else:
+        engine = None
+
+    restore.restore_method = engine
+
+    if engine is None:
+        restore.status = RestoreStatus.FAILED
+        restore.finished_at = datetime.utcnow()
+        restore.result_message = "Devin CLI no encontrado y no hay script PS1 de fallback."
+        await _persist_update(restore)
+        await _send_simple_message(
+            f"❌ No hay método de restauración disponible para *{restore.service_name}*. "
+            f"Instalar Devin CLI o crear restore_{service_id}.ps1."
+        )
+        return
+
+    method_msg = "Devin" if engine == "devin" else "script PowerShell"
+    await _send_simple_message(
+        f"🤖 Restaurando *{restore.service_name}* usando {method_msg}...\n"
+        f"_Puede tomar unos minutos. Te avisaré cuando termine._"
+    )
+    logger.info(f"[RESTORE] Launching {engine} for {service_id}")
+
+    success, output_tail = (False, "")
+    if engine == "devin":
+        success, output_tail = await _run_devin(service_id, restore.service_name)
+        if not success and output_tail == "DEVIN_NOT_FOUND" and ps1_available:
+            engine = "ps1_script"
+            restore.restore_method = engine
+            success, output_tail = await _run_ps1(service_id)
+    else:
+        success, output_tail = await _run_ps1(service_id)
+
+    restore.devin_output = output_tail
+
+    # Independent health check to confirm
     cfg = load_config()
     svc_config = next((s for s in cfg.services if s.id == service_id), None)
     came_up = False
@@ -357,37 +495,77 @@ async def _run_restore(service_id: str) -> None:
         diapi_ok = await _check_diapi()
 
     restore.finished_at = datetime.utcnow()
-    elapsed = int((restore.finished_at - restore.confirmed_at).total_seconds())
+    elapsed = int((restore.finished_at - (restore.confirmed_at or restore.requested_at)).total_seconds())
+
+    summary_line = None
+    if output_tail:
+        for line in reversed(output_tail.splitlines()):
+            if line.startswith("RESTORE_SUCCESS:") or line.startswith("RESTORE_FAILED:"):
+                summary_line = line
+                break
 
     if came_up and diapi_ok:
         restore.status = RestoreStatus.SUCCESS
-        summary = summary_line.replace("RESTORE_SUCCESS:", "").strip() if summary_line and "SUCCESS" in summary_line else "Servicio restaurado."
+        summary = (
+            summary_line.replace("RESTORE_SUCCESS:", "").strip()
+            if summary_line and "SUCCESS" in summary_line
+            else "Servicio restaurado."
+        )
         restore.result_message = summary
-        msg = f"✅ *{restore.service_name}* restaurado en {elapsed}s.\n_{summary}_"
+        msg = (
+            f"✅ *{restore.service_name}* restaurado en {elapsed}s ({method_msg}).\n_{summary}_"
+        )
         if service_id in DIAPI_SERVICES:
             msg += "\n✅ Middleware SAP DIAPI respondiendo."
+        await _persist_update(restore)
         await _send_simple_message(msg)
-    elif came_up and not diapi_ok:
+        return
+
+    if came_up and not diapi_ok:
         restore.status = RestoreStatus.FAILED
         restore.result_message = "Servicio levantó pero DIAPI no responde."
+        await _persist_update(restore)
         await _send_simple_message(
             f"⚠️ *{restore.service_name}* levantó pero el middleware SAP DIAPI no responde.\n"
             f"Revisar manualmente."
         )
-    else:
-        restore.status = RestoreStatus.FAILED
-        summary = summary_line.replace("RESTORE_FAILED:", "").strip() if summary_line and "FAILED" in summary_line else "El servicio no respondió al health check."
-        restore.result_message = summary
+        return
+
+    # Failed — consider retrying
+    if restore.retry_count < MAX_RESTORE_RETRIES:
+        next_retry = restore.retry_count + 1
+        backoff = RETRY_BACKOFF_BASE_SECONDS * (2 ** restore.retry_count)
+        restore.retry_count = next_retry
+        await _persist_update(restore)
         await _send_simple_message(
-            f"❌ *{restore.service_name}* no levantó tras {elapsed}s.\n"
-            f"_{summary}_\n"
-            f"Revisar logs manualmente."
+            f"🔄 Reintento {next_retry}/{MAX_RESTORE_RETRIES} para *{restore.service_name}* "
+            f"en {backoff}s..."
         )
-        logger.error(f"[RESTORE] {service_id} failed. Devin summary: {summary}")
+        logger.info(f"[RESTORE] Retry {next_retry}/{MAX_RESTORE_RETRIES} for {service_id} in {backoff}s")
+        await asyncio.sleep(backoff)
+        restore.status = RestoreStatus.CONFIRMED  # so _run_restore proceeds
+        await _persist_update(restore)
+        await _run_restore(service_id)
+        return
+
+    # Out of retries — definitive failure
+    restore.status = RestoreStatus.FAILED
+    summary = (
+        summary_line.replace("RESTORE_FAILED:", "").strip()
+        if summary_line and "FAILED" in summary_line
+        else "El servicio no respondió al health check."
+    )
+    restore.result_message = summary
+    await _persist_update(restore)
+    await _send_simple_message(
+        f"❌ *{restore.service_name}* no levantó tras {elapsed}s y {MAX_RESTORE_RETRIES} reintentos.\n"
+        f"_{summary}_\n"
+        f"Revisar logs manualmente."
+    )
+    logger.error(f"[RESTORE] {service_id} failed after retries. Summary: {summary}")
 
 
 async def _check_diapi() -> bool:
-    """Check if the SAP DIAPI middleware is responding."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(DIAPI_HEALTH_URL)
@@ -397,16 +575,9 @@ async def _check_diapi() -> bool:
 
 
 async def _send_simple_message(text: str) -> None:
-    """Send a plain WhatsApp message to the configured number."""
+    """Send a plain WhatsApp message via whatsapp_service (queues on failure)."""
     cfg = load_config()
     if not cfg.alerts.whatsapp_enabled:
         return
-    phone = cfg.alerts.whatsapp_number.replace("+", "") + "@c.us"
-    url = f"{cfg.alerts.wppconnect_url}/api/{cfg.alerts.wppconnect_session}/send-message"
-    headers = {"Authorization": f"Bearer {cfg.alerts.wppconnect_token}"}
-    payload = {"phone": phone, "message": text, "isGroup": False}
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(url, json=payload, headers=headers)
-    except Exception as exc:
-        logger.error(f"[RESTORE] Failed to send message: {exc}")
+    from app.services import whatsapp_service
+    await whatsapp_service.send_message(cfg.alerts, text)

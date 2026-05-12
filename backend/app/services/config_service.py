@@ -5,7 +5,7 @@ All settings are editable via the UI and persisted here.
 import json
 import os
 from pathlib import Path
-from app.models.config import MonitorConfig, DEFAULT_SERVICES, AlertConfig
+from app.models.config import MonitorConfig, DEFAULT_SERVICES, DEFAULT_ALERT_RULES, AlertConfig
 
 CONFIG_PATH = Path(os.getenv("SOFIA_CONFIG_PATH", "data/config.json"))
 
@@ -24,7 +24,11 @@ def load_config() -> MonitorConfig:
         except Exception:
             pass
     # First run: return defaults
-    cfg = MonitorConfig(services=DEFAULT_SERVICES, alerts=AlertConfig())
+    cfg = MonitorConfig(
+        services=DEFAULT_SERVICES,
+        alerts=AlertConfig(),
+        alert_rules=DEFAULT_ALERT_RULES,
+    )
     save_config(cfg)
     return cfg
 

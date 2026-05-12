@@ -137,6 +137,15 @@ async def check_service(svc: ServiceConfig) -> ServiceStatus:
             )
 
     _status_cache[svc.id] = status
+
+    # Record metric (response time + uptime sample)
+    try:
+        await db_service.record_metric(
+            svc.id, response_ms, status_code, http_ok,
+        )
+    except Exception as exc:
+        logger.debug(f"[HEALTH] record_metric failed for {svc.id}: {exc}")
+
     return status
 
 

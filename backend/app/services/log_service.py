@@ -79,17 +79,18 @@ async def tail_log(service_id: str, service_name: str, log_path: str, tail_lines
             source="passive",
             timestamp=datetime.utcnow(),
         )
-        event_id = await db_service.insert_event(event)
+        issue_id, _is_new, is_regression = await db_service.upsert_event(event)
         events.append(event)
 
         # Alert on ERROR or CRITICAL
         if level in ("ERROR", "CRITICAL"):
+            prefix = "🔄 REGRESIÓN: " if is_regression else ""
             sent = await whatsapp_service.send_alert(
                 cfg.alerts, service_name, service_id,
-                level, line[:200]
+                level, prefix + line[:200]
             )
             if sent:
-                await db_service.mark_notified(event_id)
+                await db_service.mark_notified(issue_id)
 
     return events
 

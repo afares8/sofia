@@ -12,9 +12,13 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
 from app.routers import health, events, ingest, logs, config, webhook, restore
-from app.services.db_service import init_db
+from app.services.alert_queue import alert_queue_loop
+from app.services.analytics_service import spike_detection_loop
+from app.services.config_service import load_config
+from app.services.db_service import init_db, purge_old_events
 from app.services.health_service import poll_loop
 from app.services.log_service import log_poll_loop
+from app.services.rules_engine import rules_loop
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,13 +27,21 @@ logging.basicConfig(
 logger = logging.getLogger("sofia")
 
 
+# Paths exempt from API-key auth (SDKs and WPPConnect can't send a header).
+AUTH_EXEMPT_PREFIXES = (
+    "/api/ping",
+    "/api/ingest/event",
+    "/api/webhook/wppconnect",
+)
+
+
 async def _register_wppconnect_webhook():
     """Register Sofia's webhook URL in WPPConnect so it receives incoming messages."""
-    import asyncio, httpx
-    from app.services.config_service import load_config
+    import httpx
     await asyncio.sleep(5)  # Wait for WPPConnect to be ready
     cfg = load_config()
-    webhook_url = "http://192.168.0.123:5180/api/webhook/wppconnect"
+    sofia_external_url = os.getenv("SOFIA_EXTERNAL_URL", "http://localhost:5180").rstrip("/")
+    webhook_url = f"{sofia_external_url}/api/webhook/wppconnect"
     url = f"{cfg.alerts.wppconnect_url}/api/{cfg.alerts.wppconnect_session}/webhook"
     headers = {"Authorization": f"Bearer {cfg.alerts.wppconnect_token}"}
     payload = {"webhook": webhook_url, "events": ["onMessage", "onAnyMessage"]}
@@ -41,12 +53,31 @@ async def _register_wppconnect_webhook():
         logger.warning(f"[WEBHOOK] Could not register WPPConnect webhook (WPPConnect may not be running): {exc}")
 
 
+async def _auto_purge_loop():
+    """Delete old occurrences/metrics/issues once a day."""
+    PURGE_INTERVAL_SECONDS = 24 * 60 * 60
+    # Wait 5 minutes after startup before first purge
+    await asyncio.sleep(5 * 60)
+    while True:
+        try:
+            cfg = load_config()
+            await purge_old_events(cfg.error_retention_days)
+            logger.info(f"[PURGE] Old events purged (retention={cfg.error_retention_days}d).")
+        except Exception as exc:
+            logger.error(f"[PURGE] failed: {exc}")
+        await asyncio.sleep(PURGE_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     # Start background polling tasks
     asyncio.create_task(poll_loop())
     asyncio.create_task(log_poll_loop())
+    asyncio.create_task(alert_queue_loop())
+    asyncio.create_task(spike_detection_loop())
+    asyncio.create_task(rules_loop())
+    asyncio.create_task(_auto_purge_loop())
     asyncio.create_task(_register_wppconnect_webhook())
     logger.info("Sofia Monitor started.")
     yield
@@ -56,7 +87,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Sofia Monitor",
     description="Sistema de monitoreo centralizado para tus apps",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -66,6 +97,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _api_key_middleware(request: Request, call_next):
+    """
+    Optional API-key auth. Only enforced if SOFIA_API_KEY env var is set.
+    Allows /api/ping, /api/ingest/event and /api/webhook/wppconnect without auth.
+    """
+    api_key = os.getenv("SOFIA_API_KEY")
+    if not api_key:
+        return await call_next(request)
+
+    path = request.url.path
+    if not path.startswith("/api/"):
+        return await call_next(request)
+    if any(path.startswith(p) for p in AUTH_EXEMPT_PREFIXES):
+        return await call_next(request)
+
+    auth_header = request.headers.get("Authorization", "")
+    expected = f"Bearer {api_key}"
+    # Also accept X-API-Key for legacy clients
+    x_key = request.headers.get("X-API-Key", "")
+    if auth_header == expected or x_key == api_key:
+        return await call_next(request)
+    return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
 
 # API routes
 app.include_router(health.router, prefix="/api")
