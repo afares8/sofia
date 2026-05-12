@@ -16,6 +16,10 @@ class ErrorEvent(BaseModel):
     source: str = "active"
     timestamp: Optional[datetime] = None
     notified: bool = False
+    # Sentry-style context
+    tags: Optional[str] = None          # JSON string of key/value pairs
+    environment: Optional[str] = None   # dev / staging / prod
+    release: Optional[str] = None       # release version
 
     class Config:
         from_attributes = True

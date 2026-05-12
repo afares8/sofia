@@ -26,3 +26,7 @@ class PendingRestore(BaseModel):
     finished_at: Optional[datetime] = None
     result_message: Optional[str] = None
     devin_output: Optional[str] = None      # last lines of devin session output
+    retry_count: int = 0
+    trigger_mode: str = "manual"            # "auto" | "manual"
+    restore_method: Optional[str] = None    # "devin" | "ps1_script"
+    db_id: Optional[int] = None             # row id in the restores table

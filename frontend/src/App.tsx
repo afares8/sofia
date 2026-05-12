@@ -1,19 +1,21 @@
 import { Routes, Route, NavLink } from 'react-router-dom'
-import { Activity, AlertTriangle, FileText, Settings, Zap, RotateCcw } from 'lucide-react'
+import { Activity, AlertTriangle, FileText, Settings, Zap, RotateCcw, BarChart3 } from 'lucide-react'
 import DashboardPage from './pages/DashboardPage'
 import EventsPage from './pages/EventsPage'
 import LogsPage from './pages/LogsPage'
 import ConfigPage from './pages/ConfigPage'
 import RestorePage from './pages/RestorePage'
+import PerformancePage from './pages/PerformancePage'
 import clsx from 'clsx'
 import { useState, useEffect } from 'react'
 
 const nav = [
-  { to: '/',        label: 'Dashboard',     icon: Activity },
-  { to: '/events',  label: 'Errores',       icon: AlertTriangle },
-  { to: '/logs',    label: 'Logs',          icon: FileText },
-  { to: '/restore', label: 'Restauraciones',icon: RotateCcw },
-  { to: '/config',  label: 'Configuración', icon: Settings },
+  { to: '/',            label: 'Dashboard',     icon: Activity },
+  { to: '/performance', label: 'Performance',   icon: BarChart3 },
+  { to: '/events',      label: 'Errores',       icon: AlertTriangle },
+  { to: '/logs',        label: 'Logs',          icon: FileText },
+  { to: '/restore',     label: 'Restauraciones',icon: RotateCcw },
+  { to: '/config',      label: 'Configuración', icon: Settings },
 ]
 
 export default function App() {
@@ -59,18 +61,19 @@ export default function App() {
           ))}
         </nav>
         <div className="px-5 py-3 border-t border-gray-800 text-xs text-gray-600">
-          v1.0.0
+          v1.1.0
         </div>
       </aside>
 
       {/* Main */}
       <main className="flex-1 overflow-auto bg-gray-950">
         <Routes>
-          <Route path="/"       element={<DashboardPage />} />
-          <Route path="/events" element={<EventsPage />} />
-          <Route path="/logs"    element={<LogsPage />} />
-          <Route path="/restore" element={<RestorePage />} />
-          <Route path="/config"  element={<ConfigPage />} />
+          <Route path="/"            element={<DashboardPage />} />
+          <Route path="/performance" element={<PerformancePage />} />
+          <Route path="/events"      element={<EventsPage />} />
+          <Route path="/logs"        element={<LogsPage />} />
+          <Route path="/restore"     element={<RestorePage />} />
+          <Route path="/config"      element={<ConfigPage />} />
         </Routes>
       </main>
     </div>
