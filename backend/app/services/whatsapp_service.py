@@ -13,6 +13,7 @@ logger = logging.getLogger("sofia.whatsapp")
 
 # In-memory cooldown tracker: {alert_key: last_sent_datetime}
 _cooldown: Dict[str, datetime] = {}
+_hourly_sent: Dict[str, list[datetime]] = {}
 
 
 def _cooldown_key(service_id: str, level: str) -> str:
@@ -24,6 +25,19 @@ def _is_on_cooldown(key: str, cooldown_minutes: int) -> bool:
     if last is None:
         return False
     return datetime.utcnow() - last < timedelta(minutes=cooldown_minutes)
+
+
+def _is_hourly_limited(phone: str, max_messages_per_hour: int) -> bool:
+    if max_messages_per_hour <= 0:
+        return False
+    cutoff = datetime.utcnow() - timedelta(hours=1)
+    recent = [ts for ts in _hourly_sent.get(phone, []) if ts >= cutoff]
+    _hourly_sent[phone] = recent
+    return len(recent) >= max_messages_per_hour
+
+
+def _mark_hourly_sent(phone: str) -> None:
+    _hourly_sent.setdefault(phone, []).append(datetime.utcnow())
 
 
 def _format_phone(number: str) -> str:
@@ -49,8 +63,12 @@ async def send_message(alert_cfg: AlertConfig, text: str, phone: Optional[str] =
     if not alert_cfg.whatsapp_enabled:
         return False
     target_phone = _format_phone(phone or alert_cfg.whatsapp_number)
+    if _is_hourly_limited(target_phone, alert_cfg.max_messages_per_hour):
+        logger.warning(f"[WA] hourly limit reached for {target_phone}, dropping message.")
+        return False
     try:
         await _post_message(alert_cfg, target_phone, text)
+        _mark_hourly_sent(target_phone)
         return True
     except Exception as exc:
         logger.warning(f"[WA] send_message failed, queueing: {exc}")
@@ -91,8 +109,13 @@ async def send_alert(
     text += f"_🕐 {now}_"
 
     phone = _format_phone(alert_cfg.whatsapp_number)
+    if _is_hourly_limited(phone, alert_cfg.max_messages_per_hour):
+        logger.warning(f"[WA] hourly limit reached for {phone}, dropping alert for {service_id}: {level}")
+        _cooldown[key] = datetime.utcnow()
+        return False
     try:
         await _post_message(alert_cfg, phone, text)
+        _mark_hourly_sent(phone)
         _cooldown[key] = datetime.utcnow()
         logger.info(f"[WA] Alert sent for {service_id}: {level}")
         return True
@@ -120,8 +143,12 @@ async def flush_queue(alert_cfg: AlertConfig, max_attempts: int = 10) -> int:
     pending = await db_service.get_pending_alerts(max_attempts=max_attempts)
     delivered = 0
     for row in pending:
+        if _is_hourly_limited(row["phone"], alert_cfg.max_messages_per_hour):
+            logger.warning(f"[WA] hourly limit reached for {row['phone']}, pausing queue flush.")
+            break
         try:
             await _post_message(alert_cfg, row["phone"], row["message"])
+            _mark_hourly_sent(row["phone"])
             await db_service.mark_alert_sent(row["id"])
             delivered += 1
         except Exception as exc:

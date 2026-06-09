@@ -1,11 +1,13 @@
 import { Routes, Route, NavLink } from 'react-router-dom'
-import { Activity, AlertTriangle, FileText, Settings, Zap, RotateCcw, BarChart3 } from 'lucide-react'
+import { Activity, AlertTriangle, FileText, Settings, Zap, RotateCcw, BarChart3, Moon, Bot } from 'lucide-react'
 import DashboardPage from './pages/DashboardPage'
 import EventsPage from './pages/EventsPage'
 import LogsPage from './pages/LogsPage'
 import ConfigPage from './pages/ConfigPage'
 import RestorePage from './pages/RestorePage'
 import PerformancePage from './pages/PerformancePage'
+import NightlyPage from './pages/NightlyPage'
+import AutonomyPage from './pages/AutonomyPage'
 import clsx from 'clsx'
 import { useState, useEffect } from 'react'
 
@@ -15,6 +17,8 @@ const nav = [
   { to: '/events',      label: 'Errores',       icon: AlertTriangle },
   { to: '/logs',        label: 'Logs',          icon: FileText },
   { to: '/restore',     label: 'Restauraciones',icon: RotateCcw },
+  { to: '/nightly',     label: 'Rev. Nocturna', icon: Moon },
+  { to: '/autonomy',    label: 'AI Engineer',    icon: Bot },
   { to: '/config',      label: 'Configuración', icon: Settings },
 ]
 
@@ -73,6 +77,8 @@ export default function App() {
           <Route path="/events"      element={<EventsPage />} />
           <Route path="/logs"        element={<LogsPage />} />
           <Route path="/restore"     element={<RestorePage />} />
+          <Route path="/nightly"     element={<NightlyPage />} />
+          <Route path="/autonomy"    element={<AutonomyPage />} />
           <Route path="/config"      element={<ConfigPage />} />
         </Routes>
       </main>

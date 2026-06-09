@@ -30,6 +30,7 @@ class AlertConfig(BaseModel):
     wppconnect_token: str = "THISISMYSECURETOKEN"
     wppconnect_session: str = "default"
     cooldown_minutes: int = 10           # don't spam same alert twice
+    max_messages_per_hour: int = 8
 
     # Multi-channel escalation: if a pending restore expires with no response,
     # forward the alert to additional numbers in order.
@@ -56,6 +57,86 @@ class AlertRule(BaseModel):
     window_minutes: int = 60
     service_id: Optional[str] = None
     cooldown_minutes: int = 30
+
+
+class AutonomyConfig(BaseModel):
+    enabled: bool = False
+    kill_switch: bool = False
+    default_level: int = 1
+    sandbox_root: str = "D:/sofia_sandboxes"
+    auto_create_jobs_from_issues: bool = True
+    auto_fix_issue_min_count: int = 10
+    auto_fix_loop_minutes: int = 15
+    max_actions_per_hour: int = 5
+    max_devin_sessions_per_day: int = 10
+    max_autofix_jobs_per_day: int = 3
+    max_failed_jobs_before_pause: int = 3
+    require_verifier: bool = True
+    require_tests_for_code_fixes: bool = True
+    require_human_for_apply: bool = True
+    commit_in_sandbox: bool = True
+    run_smoke_checks: bool = True
+    max_files_changed: int = 5
+    max_lines_changed: int = 300
+    allowed_paths: List[str] = ["backend/app/", "frontend/src/", "sdk/"]
+    blocked_paths: List[str] = [
+        ".env",
+        "backend/data/",
+        "backend/logs/",
+        "__pycache__/",
+        ".pyc",
+        ".pytest_cache/",
+        ".coverage",
+        "node_modules/",
+        "frontend/dist/",
+        ".git/",
+    ]
+    forbidden_actions: List[str] = [
+        "drop_table",
+        "truncate_table",
+        "delete_database",
+        "force_push",
+        "modify_secrets",
+        "disable_auth",
+    ]
+
+
+class AppRepoConfig(BaseModel):
+    id: str
+    name: str
+    path: str
+    enabled: bool = True
+    branch: str = "main"
+    autonomy_level: int = 1
+    autofix_enabled: bool = False
+    test_commands: List[str] = []
+    build_commands: List[str] = []
+    smoke_urls: List[str] = []
+    allowed_paths: List[str] = []
+    blocked_paths: List[str] = []
+
+
+class GithubSyncRepo(BaseModel):
+    id: str
+    path: str
+    enabled: bool = False
+    branch: str = "main"
+
+
+class GithubSyncConfig(BaseModel):
+    enabled: bool = False
+    auto_push_at_midnight: bool = False
+    commit_message_prefix: str = "chore(sync): nightly local sync"
+    require_clean_secret_scan: bool = True
+    max_files_per_repo: int = 50
+    blocked_paths: List[str] = [".env", "data/", "logs/", "__pycache__/", ".pyc", ".pytest_cache/", ".coverage", "node_modules/", "dist/", ".git/"]
+    repos: List[GithubSyncRepo] = [
+        GithubSyncRepo(id="sofia", path="D:/sofia", enabled=False),
+        GithubSyncRepo(id="mayor", path="D:/mayor", enabled=False),
+        GithubSyncRepo(id="packing", path="D:/packing", enabled=False),
+        GithubSyncRepo(id="pantalla", path="D:/Pantalla", enabled=False),
+        GithubSyncRepo(id="cortana", path="D:/Cortana", enabled=False),
+    ]
 
 
 DEFAULT_ALERT_RULES: List[AlertRule] = [
@@ -90,6 +171,9 @@ class MonitorConfig(BaseModel):
     services: List[ServiceConfig] = []
     alerts: AlertConfig = AlertConfig()
     alert_rules: List[AlertRule] = []
+    autonomy: AutonomyConfig = AutonomyConfig()
+    app_repos: List[AppRepoConfig] = []
+    github_sync: GithubSyncConfig = GithubSyncConfig()
 
 
 DEFAULT_SERVICES: List[ServiceConfig] = [
@@ -100,7 +184,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         log_path="D:/mayor/backend/logs/app.log",
         enabled=True,
         restore_enabled=True,
-        auto_restore=False,
+        auto_restore=True,
     ),
     ServiceConfig(
         id="packing",
@@ -109,30 +193,129 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         log_path="D:/packing/backend/logs/app.log",
         enabled=True,
         restore_enabled=True,
-        auto_restore=False,
+        auto_restore=True,
     ),
     ServiceConfig(
         id="pantalla",
         name="Pantalla",
-        url=f"http://{_SOFIA_HOST_IP}:8000/health",
+        url=f"http://{_SOFIA_HOST_IP}:8000/healthz",
         log_path="D:/Pantalla/backend/logs/app.log",
         enabled=True,
         restore_enabled=True,
-        auto_restore=False,
+        auto_restore=True,
     ),
     ServiceConfig(
         id="cortana",
         name="Cortana (WhatsApp AI)",
-        url=f"http://{_SOFIA_HOST_IP}:8200/health",
+        url=f"http://{_SOFIA_HOST_IP}:8200/healthz",
         log_path="D:/Cortana/backend/logs/app.log",
         enabled=True,
-        auto_restore=False,
+        restore_enabled=True,
+        auto_restore=True,
     ),
     ServiceConfig(
         id="wppconnect",
         name="WppConnect",
         url=f"http://{_SOFIA_HOST_IP}:21465/api/default/status-session",
         enabled=True,
-        auto_restore=False,
+        restore_enabled=True,
+        auto_restore=True,
+    ),
+    ServiceConfig(
+        id="mayor_frontend",
+        name="Mayor Frontend",
+        url="https://127.0.0.1:5175",
+        enabled=True,
+        restore_enabled=True,
+        auto_restore=True,
+    ),
+    ServiceConfig(
+        id="packing_frontend",
+        name="Packing Frontend",
+        url="https://127.0.0.1:3000",
+        enabled=True,
+        restore_enabled=True,
+        auto_restore=True,
+    ),
+    ServiceConfig(
+        id="pantalla_frontend",
+        name="Pantalla Frontend",
+        url="http://127.0.0.1:5173",
+        enabled=True,
+        restore_enabled=True,
+        auto_restore=True,
+    ),
+    ServiceConfig(
+        id="cortana_frontend",
+        name="Cortana Frontend",
+        url="http://127.0.0.1:5174",
+        enabled=True,
+        restore_enabled=True,
+        auto_restore=True,
+    ),
+    ServiceConfig(
+        id="sofia_frontend",
+        name="Sofia Frontend",
+        url="http://localhost:5176",
+        enabled=True,
+        restore_enabled=True,
+        auto_restore=True,
+    ),
+    ServiceConfig(
+        id="diapi",
+        name="SAP DIAPI Middleware",
+        url="http://localhost:9000/api/Health/Ping",
+        enabled=True,
+        restore_enabled=True,
+        auto_restore=True,
+    ),
+]
+
+
+DEFAULT_APP_REPOS: List[AppRepoConfig] = [
+    AppRepoConfig(
+        id="sofia",
+        name="Sofia Monitor",
+        path="D:/sofia",
+        autonomy_level=3,
+        test_commands=["python -m compileall -q backend/app", "npm --prefix frontend run build"],
+        smoke_urls=["http://192.168.0.123:5180/api/ping"],
+        allowed_paths=["backend/app/", "frontend/src/", "sdk/"],
+    ),
+    AppRepoConfig(
+        id="mayor",
+        name="Mayor",
+        path="D:/mayor",
+        autonomy_level=3,
+        autofix_enabled=True,
+        smoke_urls=["http://192.168.0.123:8075/health", "http://localhost:9000/api/Health/Ping"],
+        allowed_paths=["backend/", "frontend/src/", "sdk/"],
+    ),
+    AppRepoConfig(
+        id="packing",
+        name="Packing",
+        path="D:/packing",
+        autonomy_level=3,
+        autofix_enabled=True,
+        smoke_urls=["http://192.168.0.123:8100/health", "http://localhost:9000/api/Health/Ping"],
+        allowed_paths=["backend/", "frontend/src/", "sdk/"],
+    ),
+    AppRepoConfig(
+        id="pantalla",
+        name="Pantalla",
+        path="D:/Pantalla",
+        autonomy_level=2,
+        autofix_enabled=True,
+        smoke_urls=["http://192.168.0.123:8000/health"],
+        allowed_paths=["backend/", "frontend/src/", "sdk/"],
+    ),
+    AppRepoConfig(
+        id="cortana",
+        name="Cortana",
+        path="D:/Cortana",
+        autonomy_level=1,
+        autofix_enabled=True,
+        smoke_urls=["http://192.168.0.123:8200/health"],
+        allowed_paths=["backend/", "frontend/src/", "sdk/"],
     ),
 ]

@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 from app.models.event import ErrorEvent
 
-DB_PATH = Path(os.getenv("SOFIA_DB_PATH", "data/sofia.db"))
+DB_PATH = Path(os.getenv("SOFIA_DB_PATH", str(Path(__file__).resolve().parents[2] / "data" / "sofia.db")))
 
 
 def _fingerprint(service_id: str, level: str, message: str) -> str:
@@ -119,6 +119,123 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_restores_service ON restores(service_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_restores_finished ON restores(finished_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_queue_sent ON alert_queue(sent_at)")
+        # Nightly review reports
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS nightly_reports (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at      TEXT NOT NULL,
+                period_start    TEXT NOT NULL,
+                period_end      TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                issues_analyzed INTEGER NOT NULL DEFAULT 0,
+                proposals       TEXT,
+                approved_at     TEXT,
+                rejected_at     TEXT,
+                applied_at      TEXT,
+                apply_output    TEXT,
+                notes           TEXT
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_nightly_created ON nightly_reports(created_at)")
+        # Per-proposal apply runs (one row per proposal per apply attempt)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS proposal_runs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id       INTEGER NOT NULL,
+                proposal_index  INTEGER NOT NULL,
+                issue_id        INTEGER,
+                service_id      TEXT,
+                title           TEXT,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                started_at      TEXT,
+                finished_at     TEXT,
+                duration_s      REAL,
+                devin_output    TEXT,
+                error_msg       TEXT,
+                FOREIGN KEY (report_id) REFERENCES nightly_reports(id)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_prun_report ON proposal_runs(report_id)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ai_jobs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                service_id      TEXT,
+                issue_id        INTEGER,
+                repo_id         TEXT,
+                goal            TEXT NOT NULL,
+                autonomy_level  INTEGER NOT NULL DEFAULT 1,
+                mode            TEXT NOT NULL DEFAULT 'plan',
+                sandbox_path    TEXT,
+                base_branch     TEXT,
+                work_branch     TEXT,
+                branch_name     TEXT,
+                commit_sha      TEXT,
+                devin_output    TEXT,
+                diff_summary    TEXT,
+                tests_output    TEXT,
+                tests_status    TEXT,
+                smoke_output    TEXT,
+                smoke_status    TEXT,
+                verifier_output TEXT,
+                verifier_status TEXT,
+                verifier_decision TEXT,
+                risk            TEXT,
+                blocked_reason  TEXT,
+                pr_url          TEXT,
+                promoted_at     TEXT,
+                result_message  TEXT
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ai_jobs_status ON ai_jobs(status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ai_jobs_created ON ai_jobs(created_at)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS action_runs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at      TEXT NOT NULL,
+                finished_at     TEXT,
+                action_type     TEXT NOT NULL,
+                service_id      TEXT,
+                status          TEXT NOT NULL DEFAULT 'running',
+                autonomy_level  INTEGER NOT NULL DEFAULT 1,
+                trigger_source  TEXT,
+                target          TEXT,
+                output          TEXT,
+                error_msg       TEXT
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_action_runs_created ON action_runs(created_at)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS github_sync_runs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at      TEXT NOT NULL,
+                finished_at     TEXT,
+                repo_id         TEXT NOT NULL,
+                repo_path       TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'running',
+                branch          TEXT,
+                files_changed   INTEGER DEFAULT 0,
+                commit_sha      TEXT,
+                pushed          INTEGER DEFAULT 0,
+                output          TEXT,
+                error_msg       TEXT
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_github_sync_created ON github_sync_runs(created_at)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at      TEXT NOT NULL,
+                entity_type     TEXT NOT NULL,
+                entity_id       INTEGER,
+                event_type      TEXT NOT NULL,
+                message         TEXT,
+                data            TEXT
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_events(entity_type, entity_id)")
         # Migrate old schema if needed
         for stmt in (
             "ALTER TABLE issues ADD COLUMN url TEXT",
@@ -127,6 +244,17 @@ async def init_db():
             "ALTER TABLE issues ADD COLUMN environment TEXT",
             "ALTER TABLE issues ADD COLUMN release TEXT",
             "ALTER TABLE occurrences ADD COLUMN breadcrumbs TEXT",
+            "ALTER TABLE ai_jobs ADD COLUMN repo_id TEXT",
+            "ALTER TABLE ai_jobs ADD COLUMN sandbox_path TEXT",
+            "ALTER TABLE ai_jobs ADD COLUMN base_branch TEXT",
+            "ALTER TABLE ai_jobs ADD COLUMN work_branch TEXT",
+            "ALTER TABLE ai_jobs ADD COLUMN commit_sha TEXT",
+            "ALTER TABLE ai_jobs ADD COLUMN tests_status TEXT",
+            "ALTER TABLE ai_jobs ADD COLUMN smoke_output TEXT",
+            "ALTER TABLE ai_jobs ADD COLUMN smoke_status TEXT",
+            "ALTER TABLE ai_jobs ADD COLUMN verifier_decision TEXT",
+            "ALTER TABLE ai_jobs ADD COLUMN pr_url TEXT",
+            "ALTER TABLE ai_jobs ADD COLUMN promoted_at TEXT",
         ):
             try:
                 await db.execute(stmt)
@@ -495,3 +623,414 @@ async def mark_alert_failed(alert_id: int, error: str) -> None:
             (error[:500], alert_id),
         )
         await db.commit()
+
+
+# ── Nightly reports ──────────────────────────────────────────────────────────
+
+
+async def save_nightly_report(
+    period_start: str,
+    period_end: str,
+    issues_analyzed: int,
+    proposals: str,
+) -> int:
+    ts = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        cursor = await db.execute(
+            """INSERT INTO nightly_reports
+               (created_at, period_start, period_end, status, issues_analyzed, proposals)
+               VALUES (?, ?, ?, 'pending', ?, ?)""",
+            (ts, period_start, period_end, issues_analyzed, proposals),
+        )
+        await db.commit()
+        return int(cursor.lastrowid or 0)
+
+
+async def get_nightly_reports(limit: int = 30) -> List[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            "SELECT * FROM nightly_reports ORDER BY id DESC LIMIT ?", (limit,)
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_nightly_report(report_id: int) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        db.row_factory = aiosqlite.Row
+        row = await (await db.execute(
+            "SELECT * FROM nightly_reports WHERE id = ?", (report_id,)
+        )).fetchone()
+        return dict(row) if row else None
+
+
+async def update_nightly_report(report_id: int, **fields) -> None:
+    allowed = {"status", "approved_at", "rejected_at", "applied_at", "apply_output", "notes"}
+    sets = [f"{k} = ?" for k in fields if k in allowed]
+    if not sets:
+        return
+    params = [fields[k] for k in fields if k in allowed] + [report_id]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute(
+            f"UPDATE nightly_reports SET {', '.join(sets)} WHERE id = ?", params
+        )
+        await db.commit()
+
+
+# ── proposal_runs CRUD ────────────────────────────────────────────────────────
+
+async def create_proposal_run(
+    report_id: int,
+    proposal_index: int,
+    issue_id: Optional[int],
+    service_id: Optional[str],
+    title: Optional[str],
+) -> int:
+    """Create a new proposal_run row in 'running' state. Returns its id."""
+    started = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        cursor = await db.execute(
+            """INSERT INTO proposal_runs
+               (report_id, proposal_index, issue_id, service_id, title, status, started_at)
+               VALUES (?, ?, ?, ?, ?, 'running', ?)""",
+            (report_id, proposal_index, issue_id, service_id, title, started),
+        )
+        await db.commit()
+        return int(cursor.lastrowid or 0)
+
+
+async def finish_proposal_run(
+    run_id: int,
+    success: bool,
+    devin_output: str,
+    error_msg: Optional[str] = None,
+    duration_s: Optional[float] = None,
+) -> None:
+    finished = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute(
+            """UPDATE proposal_runs
+               SET status = ?, finished_at = ?, duration_s = ?,
+                   devin_output = ?, error_msg = ?
+               WHERE id = ?""",
+            (
+                "success" if success else "failed",
+                finished,
+                duration_s,
+                devin_output[:16000] if devin_output else None,
+                error_msg,
+                run_id,
+            ),
+        )
+        await db.commit()
+
+
+async def get_proposal_runs(report_id: int) -> List[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            "SELECT * FROM proposal_runs WHERE report_id = ? ORDER BY id DESC",
+            (report_id,),
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+
+async def resolve_issue(issue_id: int) -> None:
+    """Mark an issue as resolved."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute(
+            "UPDATE issues SET resolved = 1 WHERE id = ?", (issue_id,)
+        )
+        await db.commit()
+
+
+async def create_ai_job(
+    goal: str,
+    service_id: Optional[str] = None,
+    issue_id: Optional[int] = None,
+    autonomy_level: int = 1,
+    mode: str = "plan",
+    repo_id: Optional[str] = None,
+) -> int:
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        cursor = await db.execute(
+            """INSERT INTO ai_jobs
+               (created_at, updated_at, status, service_id, issue_id, repo_id, goal, autonomy_level, mode)
+               VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?)""",
+            (now, now, service_id, issue_id, repo_id, goal, autonomy_level, mode),
+        )
+        await db.commit()
+        return int(cursor.lastrowid or 0)
+
+
+async def get_ai_jobs(limit: int = 50) -> List[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            "SELECT * FROM ai_jobs ORDER BY id DESC LIMIT ?", (limit,)
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_ai_job(job_id: int) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        db.row_factory = aiosqlite.Row
+        row = await (await db.execute(
+            "SELECT * FROM ai_jobs WHERE id = ?", (job_id,)
+        )).fetchone()
+        return dict(row) if row else None
+
+
+async def update_ai_job(job_id: int, **fields) -> None:
+    allowed = {
+        "status", "repo_id", "sandbox_path", "base_branch", "work_branch", "branch_name",
+        "commit_sha", "devin_output", "diff_summary", "tests_output", "tests_status",
+        "smoke_output", "smoke_status", "verifier_output", "verifier_status",
+        "verifier_decision", "risk", "blocked_reason", "pr_url", "promoted_at",
+        "result_message",
+    }
+    clean = {k: v for k, v in fields.items() if k in allowed}
+    if not clean:
+        return
+    clean["updated_at"] = datetime.utcnow().isoformat()
+    sets = [f"{k} = ?" for k in clean]
+    params = [clean[k] for k in clean] + [job_id]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute(f"UPDATE ai_jobs SET {', '.join(sets)} WHERE id = ?", params)
+        await db.commit()
+
+
+async def get_open_ai_job_for_issue(issue_id: int) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        db.row_factory = aiosqlite.Row
+        row = await (await db.execute(
+            """SELECT * FROM ai_jobs
+               WHERE issue_id = ? AND status IN ('pending', 'running', 'verified', 'completed')
+               ORDER BY id DESC LIMIT 1""",
+            (issue_id,),
+        )).fetchone()
+        return dict(row) if row else None
+
+
+async def create_action_run(
+    action_type: str,
+    service_id: Optional[str] = None,
+    autonomy_level: int = 1,
+    trigger_source: Optional[str] = None,
+    target: Optional[str] = None,
+) -> int:
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        cursor = await db.execute(
+            """INSERT INTO action_runs
+               (created_at, action_type, service_id, status, autonomy_level, trigger_source, target)
+               VALUES (?, ?, ?, 'running', ?, ?, ?)""",
+            (now, action_type, service_id, autonomy_level, trigger_source, target),
+        )
+        await db.commit()
+        return int(cursor.lastrowid or 0)
+
+
+async def finish_action_run(
+    run_id: int,
+    status: str,
+    output: Optional[str] = None,
+    error_msg: Optional[str] = None,
+) -> None:
+    finished = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute(
+            """UPDATE action_runs
+               SET status = ?, finished_at = ?, output = ?, error_msg = ?
+               WHERE id = ?""",
+            (status, finished, output[:16000] if output else None, error_msg, run_id),
+        )
+        await db.commit()
+
+
+async def get_action_runs(limit: int = 50) -> List[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            "SELECT * FROM action_runs ORDER BY id DESC LIMIT ?", (limit,)
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+
+async def create_github_sync_run(repo_id: str, repo_path: str, branch: str) -> int:
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        cursor = await db.execute(
+            """INSERT INTO github_sync_runs
+               (created_at, repo_id, repo_path, status, branch)
+               VALUES (?, ?, ?, 'running', ?)""",
+            (now, repo_id, repo_path, branch),
+        )
+        await db.commit()
+        return int(cursor.lastrowid or 0)
+
+
+async def finish_github_sync_run(
+    run_id: int,
+    status: str,
+    files_changed: int = 0,
+    commit_sha: Optional[str] = None,
+    pushed: bool = False,
+    output: Optional[str] = None,
+    error_msg: Optional[str] = None,
+) -> None:
+    finished = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute(
+            """UPDATE github_sync_runs
+               SET status = ?, finished_at = ?, files_changed = ?, commit_sha = ?,
+                   pushed = ?, output = ?, error_msg = ?
+               WHERE id = ?""",
+            (
+                status,
+                finished,
+                files_changed,
+                commit_sha,
+                int(pushed),
+                output[:16000] if output else None,
+                error_msg,
+                run_id,
+            ),
+        )
+        await db.commit()
+
+
+async def get_github_sync_runs(limit: int = 50) -> List[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            "SELECT * FROM github_sync_runs ORDER BY id DESC LIMIT ?", (limit,)
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+
+async def add_audit_event(
+    entity_type: str,
+    event_type: str,
+    entity_id: Optional[int] = None,
+    message: Optional[str] = None,
+    data: Optional[str] = None,
+) -> int:
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        cursor = await db.execute(
+            """INSERT INTO audit_events
+               (created_at, entity_type, entity_id, event_type, message, data)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (now, entity_type, entity_id, event_type, message, data),
+        )
+        await db.commit()
+        return int(cursor.lastrowid or 0)
+
+
+async def get_audit_events(
+    entity_type: Optional[str] = None,
+    entity_id: Optional[int] = None,
+    limit: int = 100,
+) -> List[dict]:
+    query = "SELECT * FROM audit_events WHERE 1=1"
+    params: list = []
+    if entity_type:
+        query += " AND entity_type = ?"
+        params.append(entity_type)
+    if entity_id is not None:
+        query += " AND entity_id = ?"
+        params.append(entity_id)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(query, params)).fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_activity_counts(since_hours: int = 24) -> dict:
+    since = (datetime.utcnow() - timedelta(hours=since_hours)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        db.row_factory = aiosqlite.Row
+
+        def scalar(query: str, params: tuple = ()) -> int:
+            raise RuntimeError("sync placeholder")
+
+        async def count(query: str, params: tuple = ()) -> int:
+            row = await (await db.execute(query, params)).fetchone()
+            return int(row[0] or 0) if row else 0
+
+        issue_rows = await (await db.execute(
+            """SELECT service_id, level, COUNT(*) AS issues, COALESCE(SUM(count), 0) AS occurrences
+               FROM issues WHERE last_seen >= ?
+               GROUP BY service_id, level ORDER BY occurrences DESC""",
+            (since,),
+        )).fetchall()
+        restore_rows = await (await db.execute(
+            """SELECT status, COUNT(*) AS count FROM restores
+               WHERE requested_at >= ? GROUP BY status""",
+            (since,),
+        )).fetchall()
+        job_rows = await (await db.execute(
+            """SELECT status, COUNT(*) AS count FROM ai_jobs
+               WHERE created_at >= ? GROUP BY status""",
+            (since,),
+        )).fetchall()
+        action_rows = await (await db.execute(
+            """SELECT status, action_type, COUNT(*) AS count FROM action_runs
+               WHERE created_at >= ? GROUP BY status, action_type""",
+            (since,),
+        )).fetchall()
+        sync_rows = await (await db.execute(
+            """SELECT status, COUNT(*) AS count FROM github_sync_runs
+               WHERE created_at >= ? GROUP BY status""",
+            (since,),
+        )).fetchall()
+        audit_rows = await (await db.execute(
+            """SELECT event_type, COUNT(*) AS count FROM audit_events
+               WHERE created_at >= ? GROUP BY event_type ORDER BY count DESC LIMIT 10""",
+            (since,),
+        )).fetchall()
+
+        return {
+            "since": since,
+            "issues_total": await count("SELECT COUNT(*) FROM issues WHERE last_seen >= ?", (since,)),
+            "occurrences_total": await count("SELECT COALESCE(SUM(count), 0) FROM issues WHERE last_seen >= ?", (since,)),
+            "unresolved_total": await count("SELECT COUNT(*) FROM issues WHERE resolved = 0"),
+            "critical_open": await count("SELECT COUNT(*) FROM issues WHERE resolved = 0 AND level = 'CRITICAL'"),
+            "error_open": await count("SELECT COUNT(*) FROM issues WHERE resolved = 0 AND level = 'ERROR'"),
+            "metrics_total": await count("SELECT COUNT(*) FROM metrics WHERE timestamp >= ?", (since,)),
+            "queued_alerts_pending": await count("SELECT COUNT(*) FROM alert_queue WHERE sent_at IS NULL"),
+            "nightly_reports": await count("SELECT COUNT(*) FROM nightly_reports WHERE created_at >= ?", (since,)),
+            "proposal_runs": await count("SELECT COUNT(*) FROM proposal_runs WHERE started_at >= ?", (since,)),
+            "issues_by_service": [dict(r) for r in issue_rows],
+            "restores_by_status": [dict(r) for r in restore_rows],
+            "jobs_by_status": [dict(r) for r in job_rows],
+            "actions_by_status": [dict(r) for r in action_rows],
+            "github_sync_by_status": [dict(r) for r in sync_rows],
+            "audit_events": [dict(r) for r in audit_rows],
+        }

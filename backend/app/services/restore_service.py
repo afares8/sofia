@@ -24,9 +24,11 @@ import asyncio
 import logging
 import httpx
 import shutil
+import socket
 from datetime import datetime
 from typing import Dict, Optional
 from pathlib import Path
+from urllib.parse import urlparse
 
 from app.models.restore import PendingRestore, RestoreStatus
 from app.services import db_service
@@ -44,6 +46,8 @@ CONFIRM_TIMEOUT_MINUTES = 5
 # How long to wait for Devin / PS1 to finish
 DEVIN_TIMEOUT_SECONDS = 600   # 10 minutes
 PS1_TIMEOUT_SECONDS = 300
+RECOVERY_STARTUP_WAIT_SECONDS = 180
+RECENT_CHANGE_WINDOW_SECONDS = 300
 
 # Retry policy
 MAX_RESTORE_RETRIES = 3
@@ -83,10 +87,66 @@ SERVICE_CONTEXT = {
     },
     "pantalla": {
         "port": 8000,
-        "health_url": "http://192.168.0.123:8000/health",
+        "health_url": "http://192.168.0.123:8000/healthz",
         "work_dir": r"D:\Pantalla\backend",
         "start_cmd": "poetry run python run.py",
         "extra": "Pantalla is a display/dashboard service. No special middleware required.",
+    },
+    "cortana": {
+        "port": 8200,
+        "health_url": "http://192.168.0.123:8200/healthz",
+        "work_dir": r"D:\Cortana\backend",
+        "start_cmd": "poetry run uvicorn app.main:app --host 0.0.0.0 --port 8200 --reload",
+        "extra": "Cortana backend.",
+    },
+    "mayor_frontend": {
+        "port": 5175,
+        "health_url": "https://127.0.0.1:5175",
+        "work_dir": r"D:\mayor\frontend",
+        "start_cmd": "npm run dev",
+        "extra": "Mayor frontend Vite dev server.",
+    },
+    "packing_frontend": {
+        "port": 3000,
+        "health_url": "https://127.0.0.1:3000",
+        "work_dir": r"D:\packing\frontend",
+        "start_cmd": "npm start",
+        "extra": "Packing frontend React dev server.",
+    },
+    "pantalla_frontend": {
+        "port": 5173,
+        "health_url": "http://127.0.0.1:5173",
+        "work_dir": r"D:\Pantalla\frontend",
+        "start_cmd": "npm run dev",
+        "extra": "Pantalla frontend Vite dev server.",
+    },
+    "cortana_frontend": {
+        "port": 5174,
+        "health_url": "http://127.0.0.1:5174",
+        "work_dir": r"D:\Cortana\frontend",
+        "start_cmd": "npm run dev",
+        "extra": "Cortana frontend Vite dev server.",
+    },
+    "sofia_frontend": {
+        "port": 5176,
+        "health_url": "http://localhost:5176",
+        "work_dir": r"D:\sofia\frontend",
+        "start_cmd": "npm run dev",
+        "extra": "Sofia frontend Vite dev server.",
+    },
+    "wppconnect": {
+        "port": 21465,
+        "health_url": "http://192.168.0.123:21465/api/default/status-session",
+        "work_dir": r"D:\wppconnect-server",
+        "start_cmd": "npm run dev",
+        "extra": "WPPConnect server with WhatsApp browser session.",
+    },
+    "diapi": {
+        "port": 9000,
+        "health_url": "http://localhost:9000/api/Health/Ping",
+        "work_dir": r"D:\mayor\sap-diapi-middleware\SapDiApiMiddleware\bin\x86\Release\net48",
+        "start_cmd": r".\SapDiApiMiddleware.exe",
+        "extra": "SAP DIAPI middleware shared by Mayor and Packing.",
     },
 }
 
@@ -172,7 +232,9 @@ async def notify_down_with_restore_prompt(service_id: str, service_name: str) ->
 
     if svc_cfg.auto_restore:
         # Auto mode — skip the WhatsApp confirmation dance
-        await _send_simple_message(f"🤖 Auto-restaurando *{service_name}*...")
+        await _send_simple_message(
+            f"🤖 *{service_name}* no responde. Primero revisaré si solo está reiniciando por reload/cambio."
+        )
         restore = PendingRestore(
             service_id=service_id,
             service_name=service_name,
@@ -427,6 +489,133 @@ async def _run_ps1(service_id: str) -> tuple[bool, str]:
         return False, f"PS1 error: {exc}"
 
 
+async def _health_url_ok(url: str) -> bool:
+    try:
+        headers = {}
+        if "21465" in url:
+            cfg = load_config()
+            headers["Authorization"] = f"Bearer {cfg.alerts.wppconnect_token}"
+        async with httpx.AsyncClient(timeout=5, verify=False, follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers)
+            return resp.status_code < 500
+    except Exception:
+        return False
+
+
+async def _port_accepting(url: str) -> bool:
+    parsed = urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=2)
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except Exception:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=2):
+                return True
+        except Exception:
+            return False
+
+
+def _recent_source_change(work_dir: Optional[str]) -> bool:
+    if not work_dir:
+        return False
+    root = Path(work_dir)
+    if not root.exists():
+        return False
+    cutoff = datetime.utcnow().timestamp() - RECENT_CHANGE_WINDOW_SECONDS
+    suffixes = {".py", ".env", ".json", ".toml", ".yaml", ".yml", ".js", ".ts", ".tsx"}
+    skip = {"__pycache__", ".git", "node_modules", ".venv", "venv", "dist", "build"}
+    checked = 0
+    try:
+        for path in root.rglob("*"):
+            if checked > 2000:
+                break
+            if any(part in skip for part in path.parts):
+                continue
+            if not path.is_file() or path.suffix.lower() not in suffixes:
+                continue
+            checked += 1
+            if path.stat().st_mtime >= cutoff:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _ps_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+async def _wait_for_existing_restart(service_id: str, service_name: str) -> bool:
+    ctx = SERVICE_CONTEXT.get(service_id, {})
+    health_url = ctx.get("health_url")
+    work_dir = ctx.get("work_dir")
+    if not health_url:
+        return False
+    if await _health_url_ok(health_url):
+        return True
+    likely_restarting = await _port_accepting(health_url) or _recent_source_change(work_dir)
+    if not likely_restarting:
+        return False
+    logger.info(f"[RESTORE] {service_id} appears to be restarting; waiting before launching recovery.")
+    deadline = asyncio.get_event_loop().time() + RECOVERY_STARTUP_WAIT_SECONDS
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(5)
+        if await _health_url_ok(health_url):
+            logger.info(f"[RESTORE] {service_id} recovered during restart wait.")
+            return True
+    logger.warning(f"[RESTORE] {service_id} did not recover after restart wait; proceeding with recovery.")
+    return False
+
+
+async def _run_start_command(service_id: str) -> tuple[bool, str]:
+    ctx = SERVICE_CONTEXT.get(service_id, {})
+    work_dir = ctx.get("work_dir")
+    start_cmd = ctx.get("start_cmd")
+    health_url = ctx.get("health_url")
+    if not work_dir or not start_cmd:
+        return False, "START_COMMAND_NOT_CONFIGURED"
+    if not Path(work_dir).exists():
+        return False, f"WORK_DIR_NOT_FOUND: {work_dir}"
+    try:
+        log_dir = Path(work_dir) / "logs"
+        log_dir.mkdir(exist_ok=True)
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_file = log_dir / f"sofia_recovery_{stamp}.log"
+        script_file = log_dir / f"sofia_recovery_{stamp}.ps1"
+        script_file.write_text(
+            "$ErrorActionPreference = 'Continue'\n"
+            f"Set-Location -LiteralPath {_ps_quote(str(work_dir))}\n"
+            f"{start_cmd} *>&1 | Tee-Object -FilePath {_ps_quote(str(log_file))}\n",
+            encoding="utf-8",
+        )
+        proc = await asyncio.create_subprocess_exec(
+            "cmd", "/c", "start", "", "powershell",
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_file),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+        output = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+        if proc.returncode != 0:
+            return False, output[-2000:] or f"Start-Process failed rc={proc.returncode}"
+        if health_url:
+            deadline = asyncio.get_event_loop().time() + RECOVERY_STARTUP_WAIT_SECONDS
+            while asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(5)
+                if await _health_url_ok(health_url):
+                    return True, f"STARTED_OK log={log_file}"
+            return False, f"STARTED_BUT_HEALTH_TIMEOUT log={log_file}"
+        return True, f"STARTED log={log_file}"
+    except Exception as exc:
+        return False, f"START_COMMAND_ERROR: {exc}"
+
+
 async def _run_restore(service_id: str) -> None:
     """Run the restore engine — Devin first, PS1 fallback, retry with backoff."""
     restore = _pending.get(service_id)
@@ -436,11 +625,43 @@ async def _run_restore(service_id: str) -> None:
     restore.status = RestoreStatus.RUNNING
     await _persist_update(restore)
 
-    # Pick engine: prefer Devin, fall back to PS1 if Devin not available
+    if await _wait_for_existing_restart(service_id, restore.service_name):
+        restore.status = RestoreStatus.SUCCESS
+        restore.finished_at = datetime.utcnow()
+        restore.result_message = "El servicio volvió a responder durante el reinicio; no se lanzó otro proceso."
+        restore.restore_method = "wait_existing_restart"
+        await _persist_update(restore)
+        await _send_simple_message(
+            f"✅ *{restore.service_name}* volvió a responder.\n"
+            f"No lancé otro proceso porque parecía estar reiniciando por reload/cambio."
+        )
+        return
+
+    action_run_id = None
+    try:
+        action_run_id = await db_service.create_action_run(
+            "restore_service",
+            service_id=service_id,
+            autonomy_level=4 if restore.trigger_mode == "auto" else 2,
+            trigger_source=restore.trigger_mode,
+            target=restore.service_name,
+        )
+    except Exception as exc:
+        logger.debug(f"[RESTORE] create_action_run failed: {exc}")
+
+    direct_start_available = bool(SERVICE_CONTEXT.get(service_id, {}).get("start_cmd"))
+    if direct_start_available:
+        engine = "start_command"
+    else:
+        engine = None
+
+    # Pick engine: prefer direct known command, then Devin, then PS1
     devin_available = shutil.which("devin") is not None or shutil.which("devin.exe") is not None
     ps1_available = _ps1_script_path(service_id).exists()
 
-    if devin_available:
+    if engine:
+        pass
+    elif devin_available:
         engine = "devin"
     elif ps1_available:
         engine = "ps1_script"
@@ -452,15 +673,17 @@ async def _run_restore(service_id: str) -> None:
     if engine is None:
         restore.status = RestoreStatus.FAILED
         restore.finished_at = datetime.utcnow()
-        restore.result_message = "Devin CLI no encontrado y no hay script PS1 de fallback."
+        restore.result_message = "No hay comando de arranque, Devin CLI ni script PS1 de fallback."
         await _persist_update(restore)
+        if action_run_id:
+            await db_service.finish_action_run(action_run_id, "failed", error_msg=restore.result_message)
         await _send_simple_message(
             f"❌ No hay método de restauración disponible para *{restore.service_name}*. "
-            f"Instalar Devin CLI o crear restore_{service_id}.ps1."
+            f"Configurar comando de arranque, instalar Devin CLI o crear restore_{service_id}.ps1."
         )
         return
 
-    method_msg = "Devin" if engine == "devin" else "script PowerShell"
+    method_msg = "comando directo" if engine == "start_command" else "Devin" if engine == "devin" else "script PowerShell"
     await _send_simple_message(
         f"🤖 Restaurando *{restore.service_name}* usando {method_msg}...\n"
         f"_Puede tomar unos minutos. Te avisaré cuando termine._"
@@ -468,7 +691,9 @@ async def _run_restore(service_id: str) -> None:
     logger.info(f"[RESTORE] Launching {engine} for {service_id}")
 
     success, output_tail = (False, "")
-    if engine == "devin":
+    if engine == "start_command":
+        success, output_tail = await _run_start_command(service_id)
+    elif engine == "devin":
         success, output_tail = await _run_devin(service_id, restore.service_name)
         if not success and output_tail == "DEVIN_NOT_FOUND" and ps1_available:
             engine = "ps1_script"
@@ -518,6 +743,8 @@ async def _run_restore(service_id: str) -> None:
         if service_id in DIAPI_SERVICES:
             msg += "\n✅ Middleware SAP DIAPI respondiendo."
         await _persist_update(restore)
+        if action_run_id:
+            await db_service.finish_action_run(action_run_id, "success", output=summary)
         await _send_simple_message(msg)
         return
 
@@ -525,6 +752,8 @@ async def _run_restore(service_id: str) -> None:
         restore.status = RestoreStatus.FAILED
         restore.result_message = "Servicio levantó pero DIAPI no responde."
         await _persist_update(restore)
+        if action_run_id:
+            await db_service.finish_action_run(action_run_id, "failed", error_msg=restore.result_message)
         await _send_simple_message(
             f"⚠️ *{restore.service_name}* levantó pero el middleware SAP DIAPI no responde.\n"
             f"Revisar manualmente."
@@ -541,6 +770,8 @@ async def _run_restore(service_id: str) -> None:
             f"🔄 Reintento {next_retry}/{MAX_RESTORE_RETRIES} para *{restore.service_name}* "
             f"en {backoff}s..."
         )
+        if action_run_id:
+            await db_service.finish_action_run(action_run_id, "retrying", output=output_tail)
         logger.info(f"[RESTORE] Retry {next_retry}/{MAX_RESTORE_RETRIES} for {service_id} in {backoff}s")
         await asyncio.sleep(backoff)
         restore.status = RestoreStatus.CONFIRMED  # so _run_restore proceeds
@@ -557,6 +788,8 @@ async def _run_restore(service_id: str) -> None:
     )
     restore.result_message = summary
     await _persist_update(restore)
+    if action_run_id:
+        await db_service.finish_action_run(action_run_id, "failed", output=output_tail, error_msg=summary)
     await _send_simple_message(
         f"❌ *{restore.service_name}* no levantó tras {elapsed}s y {MAX_RESTORE_RETRIES} reintentos.\n"
         f"_{summary}_\n"
@@ -567,7 +800,7 @@ async def _run_restore(service_id: str) -> None:
 
 async def _check_diapi() -> bool:
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10, verify=False, follow_redirects=True) as client:
             resp = await client.get(DIAPI_HEALTH_URL)
             return resp.status_code < 500
     except Exception:

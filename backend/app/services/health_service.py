@@ -47,12 +47,17 @@ async def check_service(svc: ServiceConfig) -> ServiceStatus:
     response_ms = None
     try:
         start = asyncio.get_event_loop().time()
-        async with httpx.AsyncClient(timeout=svc.timeout_seconds) as client:
+        async with httpx.AsyncClient(timeout=svc.timeout_seconds, verify=False, follow_redirects=True) as client:
             headers = {}
             if "21465" in svc.url or "wppconnect" in svc.id:
                 cfg = load_config()
                 headers["Authorization"] = f"Bearer {cfg.alerts.wppconnect_token}"
             resp = await client.get(svc.url, headers=headers)
+            if resp.status_code == 404 and svc.url.rstrip("/").endswith("/health"):
+                fallback_url = svc.url.rstrip("/") + "z"
+                fallback_resp = await client.get(fallback_url, headers=headers)
+                if fallback_resp.status_code < 500:
+                    resp = fallback_resp
         response_ms = round((asyncio.get_event_loop().time() - start) * 1000, 1)
         status_code = resp.status_code
         http_ok = resp.status_code == svc.expected_status or resp.status_code < 500

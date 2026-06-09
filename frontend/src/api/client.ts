@@ -80,11 +80,70 @@ export interface AlertRule {
   cooldown_minutes: number
 }
 
+export interface AutonomyConfig {
+  enabled: boolean
+  kill_switch: boolean
+  default_level: number
+  sandbox_root: string
+  auto_create_jobs_from_issues: boolean
+  auto_fix_issue_min_count: number
+  auto_fix_loop_minutes: number
+  max_actions_per_hour: number
+  max_devin_sessions_per_day: number
+  max_autofix_jobs_per_day: number
+  max_failed_jobs_before_pause: number
+  require_verifier: boolean
+  require_tests_for_code_fixes: boolean
+  require_human_for_apply: boolean
+  commit_in_sandbox: boolean
+  run_smoke_checks: boolean
+  max_files_changed: number
+  max_lines_changed: number
+  allowed_paths: string[]
+  blocked_paths: string[]
+  forbidden_actions: string[]
+}
+
+export interface AppRepoConfig {
+  id: string
+  name: string
+  path: string
+  enabled: boolean
+  branch: string
+  autonomy_level: number
+  autofix_enabled: boolean
+  test_commands: string[]
+  build_commands: string[]
+  smoke_urls: string[]
+  allowed_paths: string[]
+  blocked_paths: string[]
+}
+
+export interface GithubSyncRepo {
+  id: string
+  path: string
+  enabled: boolean
+  branch: string
+}
+
+export interface GithubSyncConfig {
+  enabled: boolean
+  auto_push_at_midnight: boolean
+  commit_message_prefix: string
+  require_clean_secret_scan: boolean
+  max_files_per_repo: number
+  blocked_paths: string[]
+  repos: GithubSyncRepo[]
+}
+
 export interface MonitorConfig {
   poll_interval_seconds: number; log_tail_lines: number
   error_retention_days: number
   services: ServiceConfig[]; alerts: AlertConfig
   alert_rules: AlertRule[]
+  autonomy: AutonomyConfig
+  app_repos: AppRepoConfig[]
+  github_sync: GithubSyncConfig
 }
 
 export interface MetricPoint {
@@ -207,3 +266,158 @@ export const getRestoreHistory = (limit = 50) =>
   req<RestoreEntry[]>(`/restore/history?limit=${limit}`)
 export const triggerRestore    = (serviceId: string) =>
   req<RestoreEntry>(`/restore/trigger/${serviceId}`, { method: 'POST' })
+
+// --- Nightly review ---
+export interface Proposal {
+  issue_id: number | null
+  service_id: string
+  title: string
+  root_cause: string
+  proposal: string
+  file_path: string | null
+  line_hint: number | null
+  confidence: 'high' | 'medium' | 'low'
+  risk: 'low' | 'medium' | 'high'
+  source?: string
+}
+
+export interface NightlyReport {
+  id: number
+  created_at: string
+  period_start: string
+  period_end: string
+  status: 'pending' | 'approved' | 'rejected' | 'applied' | 'apply_failed'
+  issues_analyzed: number
+  proposals: Proposal[]
+  approved_at: string | null
+  rejected_at: string | null
+  applied_at: string | null
+  apply_output: string | null
+  notes: string | null
+}
+
+/** One apply-run per proposal attempt */
+export interface ProposalRun {
+  id: number
+  report_id: number
+  proposal_index: number
+  issue_id: number | null
+  service_id: string | null
+  title: string | null
+  status: 'running' | 'success' | 'failed'
+  started_at: string | null
+  finished_at: string | null
+  duration_s: number | null
+  devin_output: string | null
+  error_msg: string | null
+}
+
+export const getNightlyReports  = (limit = 30) =>
+  req<NightlyReport[]>(`/nightly/?limit=${limit}`)
+export const getNightlyReport   = (id: number) =>
+  req<NightlyReport>(`/nightly/${id}`)
+export const getProposalRuns    = (reportId: number) =>
+  req<ProposalRun[]>(`/nightly/${reportId}/runs`)
+export const triggerNightlyRun  = (params = { force: true, since_hours: 24 }) =>
+  req<{ ok: boolean; message: string }>('/nightly/run', { method: 'POST', body: JSON.stringify(params) })
+export const approveNightlyReport = (id: number, notes = '') =>
+  req<{ ok: boolean }>(`/nightly/${id}/approve`, { method: 'POST', body: JSON.stringify({ notes }) })
+export const rejectNightlyReport  = (id: number, notes = '') =>
+  req<{ ok: boolean }>(`/nightly/${id}/reject`, { method: 'POST', body: JSON.stringify({ notes }) })
+export const approveAndApplyProposal = (reportId: number, proposalIndex: number) =>
+  req<{ ok: boolean; message: string }>(`/nightly/${reportId}/approve/${proposalIndex}`, { method: 'POST' })
+
+export const applyBatchProposal = (reportId: number, proposalIndex: number) =>
+  req<{ ok: boolean; message: string; batch: boolean; service_id: string }>(`/nightly/${reportId}/apply-batch/${proposalIndex}`, { method: 'POST' })
+
+// --- Autonomy / AI Engineer ---
+export interface AIJob {
+  id: number
+  created_at: string
+  updated_at: string
+  status: string
+  service_id: string | null
+  issue_id: number | null
+  repo_id: string | null
+  goal: string
+  autonomy_level: number
+  mode: string
+  sandbox_path: string | null
+  base_branch: string | null
+  work_branch: string | null
+  branch_name: string | null
+  commit_sha: string | null
+  devin_output: string | null
+  diff_summary: string | null
+  tests_output: string | null
+  tests_status: string | null
+  smoke_output: string | null
+  smoke_status: string | null
+  verifier_output: string | null
+  verifier_status: string | null
+  verifier_decision: string | null
+  risk: string | null
+  blocked_reason: string | null
+  pr_url: string | null
+  promoted_at: string | null
+  result_message: string | null
+}
+
+export interface AuditEvent {
+  id: number
+  created_at: string
+  entity_type: string
+  entity_id: number | null
+  event_type: string
+  message: string | null
+  data: string | null
+}
+
+export interface ActionRun {
+  id: number
+  created_at: string
+  finished_at: string | null
+  action_type: string
+  service_id: string | null
+  status: string
+  autonomy_level: number
+  trigger_source: string | null
+  target: string | null
+  output: string | null
+  error_msg: string | null
+}
+
+export interface GithubSyncRun {
+  id: number
+  created_at: string
+  finished_at: string | null
+  repo_id: string
+  repo_path: string
+  status: string
+  branch: string | null
+  files_changed: number
+  commit_sha: string | null
+  pushed: 0 | 1
+  output: string | null
+  error_msg: string | null
+}
+
+export const getAutonomyConfig = () =>
+  req<{ autonomy: AutonomyConfig; app_repos: AppRepoConfig[]; github_sync: GithubSyncConfig }>('/autonomy/config')
+export const updateAutonomyConfig = (cfg: AutonomyConfig) =>
+  req<AutonomyConfig>('/autonomy/config/autonomy', { method: 'PUT', body: JSON.stringify(cfg) })
+export const updateAppRepos = (repos: AppRepoConfig[]) =>
+  req<AppRepoConfig[]>('/autonomy/config/app-repos', { method: 'PUT', body: JSON.stringify(repos) })
+export const updateGithubSyncConfig = (cfg: GithubSyncConfig) =>
+  req<GithubSyncConfig>('/autonomy/config/github-sync', { method: 'PUT', body: JSON.stringify(cfg) })
+export const setKillSwitch = (enabled: boolean) =>
+  req<{ ok: boolean; kill_switch: boolean }>('/autonomy/kill-switch', { method: 'POST', body: JSON.stringify({ enabled }) })
+export const getAIJobs = (limit = 50) => req<AIJob[]>(`/autonomy/jobs?limit=${limit}`)
+export const createAIJob = (body: { goal: string; service_id?: string; issue_id?: number; repo_id?: string; autonomy_level?: number; mode: 'plan' | 'fix' }) =>
+  req<{ ok: boolean; job_id: number }>('/autonomy/jobs', { method: 'POST', body: JSON.stringify(body) })
+export const getActionRuns = (limit = 50) => req<ActionRun[]>(`/autonomy/actions?limit=${limit}`)
+export const getAuditEvents = (limit = 100) => req<AuditEvent[]>(`/autonomy/audit?limit=${limit}`)
+export const getGithubSyncRuns = (limit = 50) => req<GithubSyncRun[]>(`/autonomy/github-sync/runs?limit=${limit}`)
+export const triggerGithubSync = (background = true) =>
+  req<{ ok: boolean; message?: string; results?: unknown[] }>(`/autonomy/github-sync/run?background=${background}`, { method: 'POST' })
+export const runPolicyScan = () => req('/autonomy/policy-scan')
