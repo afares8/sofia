@@ -783,6 +783,17 @@ async def get_ai_jobs(limit: int = 50) -> List[dict]:
         return [dict(r) for r in rows]
 
 
+async def get_ai_jobs_by_status(status: str, limit: int = 500) -> List[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            "SELECT * FROM ai_jobs WHERE status = ? ORDER BY id DESC LIMIT ?",
+            (status, limit),
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+
 async def get_ai_job(job_id: int) -> Optional[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL")

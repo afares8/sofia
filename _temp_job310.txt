@@ -1,0 +1,20 @@
+--- col 0 ---
+blocked
+--- col 1 ---
+Policy scan falló después de tests/build.
+--- col 2 ---
+{"approved": false, "risk": "high", "files": ["backend/app/schedulers/collections_scheduler.py", "backend/app/wms_service.py", "backend/tests/test_collections_retry.py", "backend/tests/test_wms_retry.py"], "changed_lines": 122, "reasons": ["Posible secreto detectado en el diff"]}
+--- col 3 ---
+skipped
+--- col 4 ---
+No hay test_commands/build_commands configurados para este repo.
+--- col 5 ---
+NULL
+--- col 6 ---
+NULL
+--- col 7 ---
+NULL
+--- col 8 ---
+high
+--- col 9 ---
+Cambio bloqueado por artefactos o riesgos generados durante la verificación.

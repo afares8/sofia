@@ -78,6 +78,19 @@ class AutonomyConfig(BaseModel):
     run_smoke_checks: bool = True
     max_files_changed: int = 5
     max_lines_changed: int = 300
+    # Number of changed lines counted only on non-test source files. Test files
+    # are excluded from this count so adding thorough tests never blocks a fix.
+    count_test_files_in_limit: bool = False
+    # Promotion: how to push a verified sandbox fix to the real repo.
+    #   "pr"     → push the work branch to origin and open a GitHub PR (gh CLI)
+    #   "branch" → push the work branch to origin, no PR
+    #   "manual" → do nothing automatically; promote only via the UI button
+    promotion_mode: str = "pr"
+    # Auto-promote verified fixes when the verifier marks them as low risk.
+    # medium/high-risk fixes always wait for manual promotion from the UI.
+    auto_promote_low_risk: bool = True
+    # A job stuck in 'running' longer than this is force-failed by the watchdog.
+    job_timeout_minutes: int = 30
     allowed_paths: List[str] = ["backend/app/", "frontend/src/", "sdk/"]
     blocked_paths: List[str] = [
         ".env",
@@ -256,7 +269,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
     ServiceConfig(
         id="sofia_frontend",
         name="Sofia Frontend",
-        url="http://localhost:5176",
+        url="http://127.0.0.1:5179",
         enabled=True,
         restore_enabled=True,
         auto_restore=True,

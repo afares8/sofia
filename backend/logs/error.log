@@ -48,3 +48,68 @@
 2026-05-10 23:14:45: INFO:     Waiting for application shutdown.
 2026-05-10 23:14:45: 2026-05-10 23:14:45,044 [INFO] sofia: Sofia Monitor shutting down.
 2026-05-10 23:14:45: INFO:     Application shutdown complete.
+2026-05-22 16:28:59: INFO:     Started server process [90496]
+2026-05-22 16:28:59: INFO:     Waiting for application startup.
+2026-05-22 16:28:59: 2026-05-22 16:28:59,285 [INFO] sofia: Sofia Monitor started.
+2026-05-22 16:28:59: 2026-05-22 16:28:59,285 [INFO] sofia.health: [HEALTH] Poll loop started.
+2026-05-22 16:28:59: 2026-05-22 16:28:59,639 [INFO] sofia.logs: [LOGS] Log poll loop started.
+2026-05-22 16:28:59: 2026-05-22 16:28:59,639 [INFO] sofia.alert_queue: [QUEUE] Alert queue loop started.
+2026-05-22 16:28:59: 2026-05-22 16:28:59,641 [INFO] sofia.analytics: [ANALYTICS] Spike detection loop started.
+2026-05-22 16:28:59: 2026-05-22 16:28:59,641 [INFO] sofia.rules: [RULES] Rules engine loop started.
+2026-05-22 16:28:59: INFO:     Application startup complete.
+2026-05-22 16:28:59: ERROR:    [Errno 10048] error while attempting to bind on address ('0.0.0.0', 5180): only one usage of each socket address (protocol/network address/port) is normally permitted
+2026-05-22 16:28:59: INFO:     Waiting for application shutdown.
+2026-05-22 16:28:59: 2026-05-22 16:28:59,643 [INFO] sofia: Sofia Monitor shutting down.
+2026-05-22 16:28:59: INFO:     Application shutdown complete.
+2026-05-22 16:29:00: INFO:     Started server process [91732]
+2026-05-22 16:29:00: INFO:     Waiting for application startup.
+2026-05-22 16:29:00: 2026-05-22 16:29:00,859 [INFO] sofia: Sofia Monitor started.
+2026-05-22 16:29:00: 2026-05-22 16:29:00,859 [INFO] sofia.health: [HEALTH] Poll loop started.
+2026-05-22 16:29:01: 2026-05-22 16:29:01,141 [INFO] sofia.logs: [LOGS] Log poll loop started.
+2026-05-22 16:29:01: 2026-05-22 16:29:01,142 [INFO] sofia.alert_queue: [QUEUE] Alert queue loop started.
+2026-05-22 16:29:01: 2026-05-22 16:29:01,143 [INFO] sofia.analytics: [ANALYTICS] Spike detection loop started.
+2026-05-22 16:29:01: 2026-05-22 16:29:01,143 [INFO] sofia.rules: [RULES] Rules engine loop started.
+2026-05-22 16:29:01: INFO:     Application startup complete.
+2026-05-22 16:29:01: ERROR:    [Errno 10048] error while attempting to bind on address ('0.0.0.0', 5180): only one usage of each socket address (protocol/network address/port) is normally permitted
+2026-05-22 16:29:01: INFO:     Waiting for application shutdown.
+2026-05-22 16:29:01: 2026-05-22 16:29:01,145 [INFO] sofia: Sofia Monitor shutting down.
+2026-05-22 16:29:01: INFO:     Application shutdown complete.
+2026-05-22 16:29:02: INFO:     Started server process [85300]
+2026-05-22 16:29:02: INFO:     Waiting for application startup.
+2026-05-22 16:29:02: 2026-05-22 16:29:02,348 [INFO] sofia: Sofia Monitor started.
+2026-05-22 16:29:02: 2026-05-22 16:29:02,348 [INFO] sofia.health: [HEALTH] Poll loop started.
+2026-05-22 16:29:02: 2026-05-22 16:29:02,611 [INFO] sofia.logs: [LOGS] Log poll loop started.
+2026-05-22 16:29:02: 2026-05-22 16:29:02,612 [INFO] sofia.alert_queue: [QUEUE] Alert queue loop started.
+2026-05-22 16:29:02: 2026-05-22 16:29:02,612 [INFO] sofia.analytics: [ANALYTICS] Spike detection loop started.
+2026-05-22 16:29:02: 2026-05-22 16:29:02,612 [INFO] sofia.rules: [RULES] Rules engine loop started.
+2026-05-22 16:29:02: INFO:     Application startup complete.
+2026-05-22 16:29:02: ERROR:    [Errno 10048] error while attempting to bind on address ('0.0.0.0', 5180): only one usage of each socket address (protocol/network address/port) is normally permitted
+2026-05-22 16:29:02: INFO:     Waiting for application shutdown.
+2026-05-22 16:29:02: 2026-05-22 16:29:02,614 [INFO] sofia: Sofia Monitor shutting down.
+2026-05-22 16:29:02: INFO:     Application shutdown complete.
+2026-05-22 16:29:03: INFO:     Started server process [75936]
+2026-05-22 16:29:03: INFO:     Waiting for application startup.
+2026-05-22 16:29:03: 2026-05-22 16:29:03,820 [INFO] sofia: Sofia Monitor started.
+2026-05-22 16:29:03: 2026-05-22 16:29:03,820 [INFO] sofia.health: [HEALTH] Poll loop started.
+2026-05-22 16:29:04: 2026-05-22 16:29:04,079 [INFO] sofia.logs: [LOGS] Log poll loop started.
+2026-05-22 16:29:04: 2026-05-22 16:29:04,079 [INFO] sofia.alert_queue: [QUEUE] Alert queue loop started.
+2026-05-22 16:29:04: 2026-05-22 16:29:04,080 [INFO] sofia.analytics: [ANALYTICS] Spike detection loop started.
+2026-05-22 16:29:04: 2026-05-22 16:29:04,081 [INFO] sofia.rules: [RULES] Rules engine loop started.
+2026-05-22 16:29:04: INFO:     Application startup complete.
+2026-05-22 16:29:04: ERROR:    [Errno 10048] error while attempting to bind on address ('0.0.0.0', 5180): only one usage of each socket address (protocol/network address/port) is normally permitted
+2026-05-22 16:29:04: INFO:     Waiting for application shutdown.
+2026-05-22 16:29:04: 2026-05-22 16:29:04,083 [INFO] sofia: Sofia Monitor shutting down.
+2026-05-22 16:29:04: INFO:     Application shutdown complete.
+2026-05-22 16:29:05: INFO:     Started server process [93832]
+2026-05-22 16:29:05: INFO:     Waiting for application startup.
+2026-05-22 16:29:05: 2026-05-22 16:29:05,416 [INFO] sofia: Sofia Monitor started.
+2026-05-22 16:29:05: 2026-05-22 16:29:05,416 [INFO] sofia.health: [HEALTH] Poll loop started.
+2026-05-22 16:29:05: 2026-05-22 16:29:05,680 [INFO] sofia.logs: [LOGS] Log poll loop started.
+2026-05-22 16:29:05: 2026-05-22 16:29:05,681 [INFO] sofia.alert_queue: [QUEUE] Alert queue loop started.
+2026-05-22 16:29:05: 2026-05-22 16:29:05,682 [INFO] sofia.analytics: [ANALYTICS] Spike detection loop started.
+2026-05-22 16:29:05: 2026-05-22 16:29:05,682 [INFO] sofia.rules: [RULES] Rules engine loop started.
+2026-05-22 16:29:05: INFO:     Application startup complete.
+2026-05-22 16:29:05: ERROR:    [Errno 10048] error while attempting to bind on address ('0.0.0.0', 5180): only one usage of each socket address (protocol/network address/port) is normally permitted
+2026-05-22 16:29:05: INFO:     Waiting for application shutdown.
+2026-05-22 16:29:05: 2026-05-22 16:29:05,684 [INFO] sofia: Sofia Monitor shutting down.
+2026-05-22 16:29:05: INFO:     Application shutdown complete.

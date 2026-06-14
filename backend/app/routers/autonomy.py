@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from app.models.config import AppRepoConfig, AutonomyConfig, GithubSyncConfig
 from app.services import db_service
-from app.services.autonomy_service import create_job, policy_scan, set_kill_switch
+from app.services.autonomy_service import create_job, policy_scan, promote_job, set_kill_switch
 from app.services.config_service import load_config, save_config
 from app.services.github_sync_service import sync_all_repos, sync_all_repos_background
 
@@ -90,6 +90,17 @@ async def start_job(body: JobBody):
         mode=body.mode,
     )
     return {"ok": True, "job_id": job_id}
+
+
+@router.post("/jobs/{job_id}/promote")
+async def promote_job_endpoint(job_id: int):
+    """Promote a verified sandbox fix to the real repo (push branch + open PR)."""
+    try:
+        return await promote_job(job_id)
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"Promoción falló: {exc}")
 
 
 @router.get("/actions")

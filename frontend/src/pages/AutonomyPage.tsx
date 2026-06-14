@@ -6,13 +6,13 @@ import {
 } from 'lucide-react'
 import {
   AIJob, GithubSyncRun, getAIJobs, getAutonomyConfig, getGithubSyncRuns,
-  setKillSwitch, createAIJob, triggerGithubSync, AutonomyConfig, GithubSyncConfig,
+  setKillSwitch, createAIJob, promoteAIJob, triggerGithubSync, AutonomyConfig, GithubSyncConfig,
   updateAutonomyConfig, updateGithubSyncConfig, AuditEvent, getAuditEvents, AppRepoConfig,
 } from '../api/client'
 
 function badge(status: string) {
   const cls =
-    ['success', 'completed', 'verified'].includes(status) ? 'text-green-300 bg-green-900/30 border-green-700/30' :
+    ['success', 'completed', 'verified', 'promoted'].includes(status) ? 'text-green-300 bg-green-900/30 border-green-700/30' :
     ['blocked', 'failed', 'apply_failed'].includes(status) ? 'text-red-300 bg-red-900/30 border-red-700/30' :
     ['running', 'pending'].includes(status) ? 'text-sky-300 bg-sky-900/30 border-sky-700/30' :
     'text-gray-300 bg-gray-800 border-gray-700'
@@ -153,8 +153,24 @@ export default function AutonomyPage() {
               <Toggle label="Solo aplicar con humano" value={autonomy.require_human_for_apply} onChange={v => saveAutonomy({ require_human_for_apply: v })} />
               <Toggle label="Autofix desde issues" value={autonomy.auto_create_jobs_from_issues} onChange={v => saveAutonomy({ auto_create_jobs_from_issues: v })} />
               <Toggle label="Smoke checks" value={autonomy.run_smoke_checks} onChange={v => saveAutonomy({ run_smoke_checks: v })} />
+              <Toggle label="Auto-promover riesgo bajo" value={autonomy.auto_promote_low_risk} onChange={v => saveAutonomy({ auto_promote_low_risk: v })} />
+              <label className="flex items-center justify-between gap-3 bg-gray-950/60 border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-300">
+                <span>Modo de promoción</span>
+                <select
+                  value={autonomy.promotion_mode}
+                  onChange={e => saveAutonomy({ promotion_mode: e.target.value })}
+                  className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200"
+                >
+                  <option value="pr">PR (GitHub)</option>
+                  <option value="branch">Solo rama</option>
+                  <option value="manual">Manual</option>
+                </select>
+              </label>
               <div className="text-xs text-gray-500">
-                Límite: {autonomy.max_files_changed} archivos / {autonomy.max_lines_changed} líneas.
+                Límite: {autonomy.max_files_changed} archivos / {autonomy.max_lines_changed} líneas (tests no cuentan).
+              </div>
+              <div className="text-xs text-gray-500">
+                Watchdog: jobs colgados &gt; {autonomy.job_timeout_minutes} min se marcan failed.
               </div>
               <div className="text-xs text-gray-500">
                 Sandbox: <span className="font-mono">{autonomy.sandbox_root}</span>
@@ -229,7 +245,7 @@ export default function AutonomyPage() {
       </div>
 
       <Section title="Jobs AI Engineer">
-        {jobs.length === 0 ? <Empty text="Sin jobs todavía." /> : jobs.map(j => <JobCard key={j.id} job={j} />)}
+        {jobs.length === 0 ? <Empty text="Sin jobs todavía." /> : jobs.map(j => <JobCard key={j.id} job={j} onChange={load} />)}
       </Section>
 
       <Section title="Auditoría">
@@ -265,13 +281,45 @@ function Empty({ text }: { text: string }) {
   return <div className="bg-gray-900 border border-gray-800 rounded-xl p-8 text-center text-sm text-gray-600">{text}</div>
 }
 
-function JobCard({ job }: { job: AIJob }) {
+function JobCard({ job, onChange }: { job: AIJob; onChange: () => void }) {
+  const [promoting, setPromoting] = useState(false)
+  const [promoteMsg, setPromoteMsg] = useState<string | null>(null)
+
+  const promote = async () => {
+    setPromoting(true)
+    setPromoteMsg(null)
+    try {
+      const r = await promoteAIJob(job.id)
+      setPromoteMsg(r.message)
+      await onChange()
+    } catch (e: any) {
+      setPromoteMsg(`Error: ${e.message}`)
+    } finally {
+      setPromoting(false)
+    }
+  }
+
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-2">
       <div className="flex items-center justify-between gap-2">
         <div className="text-white font-medium">Job #{job.id} · {job.mode} · {job.repo_id ?? 'repo?'}</div>
-        <div className="flex items-center gap-2">{job.risk && badge(job.risk)} {badge(job.status)}</div>
+        <div className="flex items-center gap-2">
+          {job.status === 'verified' && (
+            <button
+              onClick={promote}
+              disabled={promoting}
+              className="flex items-center gap-1 px-2 py-1 bg-green-700 hover:bg-green-600 disabled:opacity-40 rounded text-xs font-bold text-white"
+            >
+              {promoting ? <Loader2 size={12} className="animate-spin" /> : <GitBranch size={12} />} Promover
+            </button>
+          )}
+          {job.pr_url && (
+            <a href={job.pr_url} target="_blank" rel="noreferrer" className="text-xs text-sky-400 hover:underline">Ver PR</a>
+          )}
+          {job.risk && badge(job.risk)} {badge(job.status)}
+        </div>
       </div>
+      {promoteMsg && <div className="text-xs text-sky-300 bg-sky-900/20 border border-sky-700/30 rounded px-2 py-1">{promoteMsg}</div>}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs text-gray-500">
         <span>Sandbox: <span className="font-mono">{job.sandbox_path ? job.sandbox_path.split(/[\\/]/).slice(-2).join('/') : '—'}</span></span>
         <span>Branch: <span className="font-mono">{job.work_branch ?? job.branch_name ?? '—'}</span></span>

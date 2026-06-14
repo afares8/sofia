@@ -1,0 +1,56 @@
+[
+  [
+    1837,
+    "2026-06-11T15:07:53.657183",
+    "ai_job",
+    310,
+    "created",
+    "Job creado en modo fix.",
+    null
+  ],
+  [
+    1838,
+    "2026-06-11T15:07:53.672789",
+    "ai_job",
+    310,
+    "safe_mode",
+    "Fix se ejecutará en sandbox; no se aplicará al repo principal.",
+    null
+  ],
+  [
+    1840,
+    "2026-06-11T15:07:54.746433",
+    "ai_job",
+    310,
+    "sandbox_created",
+    "D:\\sofia_sandboxes\\mayor-job-310-1781190473",
+    null
+  ],
+  [
+    1841,
+    "2026-06-11T15:12:41.896717",
+    "ai_job",
+    310,
+    "devin_finished",
+    "rc=0",
+    null
+  ],
+  [
+    1842,
+    "2026-06-11T15:12:42.338533",
+    "ai_job",
+    310,
+    "tests_finished",
+    "skipped",
+    null
+  ],
+  [
+    1843,
+    "2026-06-11T15:12:42.472463",
+    "ai_job",
+    310,
+    "blocked",
+    "Policy post-tests falló.",
+    null
+  ]
+]

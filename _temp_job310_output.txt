@@ -1,0 +1,24 @@
+Corrigi ambos issues con cambios mínimos y verificación completa.
+
+### Issue #248 – WMS API timeout
+**Archivo:** `backend/app/wms_service.py`
+- **Timeout:** aumentado de 10 s a 20 s en `_make_api_request`.
+- **Retry:** agregados hasta 2 reintentos con backoff incremental (1 s, 2 s) para errores transitorios: `socket.timeout`, `TimeoutError` y `urllib.error.URLError`.
+- Los errores HTTP (4xx/5xx) fallan inmediatamente sin retry, preservando el comportamiento existente.
+
+### Issue #206 – [COLLECTIONS] Failed to send
+**Archivo:** `backend/app/schedulers/collections_scheduler.py`
+- **Retry:** agregados hasta 2 reintentos con backoff incremental (1 s, 2 s) en `_cortana_send_collection` para errores transitorios de red: `httpx.TimeoutException`, `httpx.ConnectError` y `httpx.NetworkError`.
+- Los errores HTTP (4xx/5xx) se propagan inmediatamente sin retry.
+
+### Tests
+- `backend/tests/test_wms_retry.py` – 5 tests unitarios (timeout retry, success on retry, URLError retry, HTTP no-retry, default timeout).
+- `backend/tests/test_collections_retry.py` – 4 tests unitarios async (timeout retry, ConnectError retry, success on retry, HTTP no-retry).
+- **Todos pasan:** 24/24 tests verificados.
+
+---
+
+SOFIA_RESULT:
+status=success
+risk=low
+summary=Fixes aplicados con retry+backoff para errores transitorios en WMS (timeout 10s→20s, 2 retries) y COLLECTIONS Cortana (2 retries). Tests unitarios agregados y pasando. Sin modificar .env, secrets, data, logs, node_modules ni dist.

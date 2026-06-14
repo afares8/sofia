@@ -99,6 +99,10 @@ export interface AutonomyConfig {
   run_smoke_checks: boolean
   max_files_changed: number
   max_lines_changed: number
+  count_test_files_in_limit: boolean
+  promotion_mode: string
+  auto_promote_low_risk: boolean
+  job_timeout_minutes: number
   allowed_paths: string[]
   blocked_paths: string[]
   forbidden_actions: string[]
@@ -415,6 +419,8 @@ export const setKillSwitch = (enabled: boolean) =>
 export const getAIJobs = (limit = 50) => req<AIJob[]>(`/autonomy/jobs?limit=${limit}`)
 export const createAIJob = (body: { goal: string; service_id?: string; issue_id?: number; repo_id?: string; autonomy_level?: number; mode: 'plan' | 'fix' }) =>
   req<{ ok: boolean; job_id: number }>('/autonomy/jobs', { method: 'POST', body: JSON.stringify(body) })
+export const promoteAIJob = (jobId: number) =>
+  req<{ ok: boolean; job_id: number; pr_url: string | null; message: string }>(`/autonomy/jobs/${jobId}/promote`, { method: 'POST' })
 export const getActionRuns = (limit = 50) => req<ActionRun[]>(`/autonomy/actions?limit=${limit}`)
 export const getAuditEvents = (limit = 100) => req<AuditEvent[]>(`/autonomy/audit?limit=${limit}`)
 export const getGithubSyncRuns = (limit = 50) => req<GithubSyncRun[]>(`/autonomy/github-sync/runs?limit=${limit}`)

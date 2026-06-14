@@ -128,8 +128,8 @@ SERVICE_CONTEXT = {
         "extra": "Cortana frontend Vite dev server.",
     },
     "sofia_frontend": {
-        "port": 5176,
-        "health_url": "http://localhost:5176",
+        "port": 5179,
+        "health_url": "http://127.0.0.1:5179",
         "work_dir": r"D:\sofia\frontend",
         "start_cmd": "npm run dev",
         "extra": "Sofia frontend Vite dev server.",

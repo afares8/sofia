@@ -1,0 +1,8 @@
+--- col 0 ---
+running
+--- col 1 ---
+NULL
+--- col 2 ---
+NULL
+--- col 3 ---
+NULL

@@ -20,7 +20,7 @@ from app.services.health_service import poll_loop
 from app.services.log_service import log_poll_loop
 from app.services.nightly_review_service import nightly_loop
 from app.services.rules_engine import rules_loop
-from app.services.autonomy_service import autofix_loop
+from app.services.autonomy_service import autofix_loop, job_watchdog_loop
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,6 +81,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(rules_loop())
     asyncio.create_task(nightly_loop())
     asyncio.create_task(autofix_loop())
+    asyncio.create_task(job_watchdog_loop())
     asyncio.create_task(_auto_purge_loop())
     asyncio.create_task(_register_wppconnect_webhook())
     logger.info("Sofia Monitor started.")
