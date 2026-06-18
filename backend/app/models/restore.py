@@ -1,4 +1,4 @@
-"""
+﻿"""
 Models for the WhatsApp-triggered restore workflow.
 """
 from pydantic import BaseModel
@@ -25,8 +25,9 @@ class PendingRestore(BaseModel):
     confirmed_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     result_message: Optional[str] = None
-    devin_output: Optional[str] = None      # last lines of devin session output
+    devin_output: Optional[str] = None      # last lines of AI restore session output
     retry_count: int = 0
     trigger_mode: str = "manual"            # "auto" | "manual"
-    restore_method: Optional[str] = None    # "devin" | "ps1_script"
+    restore_method: Optional[str] = None    # "codex" | "ps1_script"
     db_id: Optional[int] = None             # row id in the restores table
+

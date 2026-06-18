@@ -110,7 +110,7 @@ function ProposalRow({
   const isApplying = run?.status === 'running' || applying
 
   const handleApply = async () => {
-    if (!confirm(`Aplicar fix individual: "${proposal.title}"?\n\nDevin editará SOLO este archivo.`)) return
+    if (!confirm(`Aplicar fix individual: "${proposal.title}"?\n\nCodex editará SOLO este archivo.`)) return
     setApplying(true)
     setErrMsg(null)
     try {
@@ -124,7 +124,7 @@ function ProposalRow({
   }
 
   const handleBatchApply = async () => {
-    if (!confirm(`Aplicar BATCH para "${proposal.service_id}"?\n\nEsto puede agrupar hasta 3 fixes del mismo servicio en una sola sesión de Devin.`)) return
+    if (!confirm(`Aplicar BATCH para "${proposal.service_id}"?\n\nEsto puede agrupar hasta 3 fixes del mismo servicio en una sola sesión de Codex.`)) return
     setApplying(true)
     setErrMsg(null)
     try {
@@ -277,7 +277,7 @@ function ProposalRow({
                     onClick={() => setOutputOpen(o => !o)}
                   >
                     <Terminal size={12} />
-                    Output de Devin
+                    Output de Codex
                     {run.duration_s != null && (
                       <span className="text-gray-600 flex items-center gap-1">
                         <Timer size={11} /> {dur(run.duration_s)}
@@ -402,7 +402,7 @@ function ReportDetail({ reportId, onBack }: { reportId: number; onBack: () => vo
           { icon: null,                    label: 'Alta confianza',      val: byConf.high?.toString() ?? '0', dim: false },
           { icon: <CheckCircle size={14} />, label: 'Aplicados',         val: applied.toString(), dim: applied === 0 },
           { icon: <XCircle size={14} />,   label: 'Fallidos',            val: failed.toString(), dim: failed === 0 },
-          { icon: <Timer size={14} />,     label: 'Tiempo total Devin',  val: totalDur > 0 ? dur(totalDur) : '—', dim: totalDur === 0 },
+          { icon: <Timer size={14} />,     label: 'Tiempo total Codex',  val: totalDur > 0 ? dur(totalDur) : '—', dim: totalDur === 0 },
         ].map(({ icon, label, val, dim }) => (
           <div key={label} className="bg-gray-900 border border-gray-800 rounded-xl p-3">
             <div className="flex items-center gap-1.5 text-xs text-gray-500 mb-1">
@@ -593,7 +593,7 @@ export default function NightlyPage() {
   useEffect(() => { load() }, [load])
 
   const handleRun = async () => {
-    if (!confirm('Ejecutar la revisión nocturna ahora?\n\nDevin analizará los errores (solo lectura). Tarda ~2–5 min.')) return
+    if (!confirm('Ejecutar la revisión nocturna ahora?\n\nCodex analizará los errores (solo lectura). Tarda ~2–5 min.')) return
     setRunning(true)
     setRunMsg(null)
     try {
@@ -624,7 +624,7 @@ export default function NightlyPage() {
             <Moon size={22} className="text-sky-400" /> Revisión Nocturna
           </h1>
           <p className="text-gray-400 text-sm mt-1">
-            Devin analiza los errores del día, identifica causas raíz y propone fixes — vos aprobás cada uno individualmente
+            Codex analiza los errores del día, identifica causas raíz y propone fixes — vos aprobás cada uno individualmente
           </p>
         </div>
         <div className="flex gap-2">
@@ -671,13 +671,13 @@ export default function NightlyPage() {
         </summary>
         <div className="px-4 pb-4 space-y-1.5 text-sm text-gray-400 border-t border-gray-800">
           <p className="pt-3">
-            <strong className="text-gray-200">1. Análisis (solo lectura)</strong> — cada medianoche Sofia recolecta errores y lanza Devin. Devin lee el código, identifica causas raíz y genera propuestas en JSON sin tocar nada.
+            <strong className="text-gray-200">1. Análisis (solo lectura)</strong> — cada medianoche Sofia recolecta errores y lanza Codex. Codex lee el código, identifica causas raíz y genera propuestas en JSON sin tocar nada.
           </p>
           <p>
             <strong className="text-gray-200">2. Revisión</strong> — ves cada propuesta con: causa raíz, cambio sugerido, archivo, confianza y riesgo. Las de baja confianza son informativas.
           </p>
           <p>
-            <strong className="text-gray-200">3. Aplicación individual</strong> — al presionar "Aplicar" en una propuesta, Devin abre una sesión con permisos de escritura y hace exactamente ese cambio. Podés ver el output completo y la duración.
+            <strong className="text-gray-200">3. Aplicación individual</strong> — al presionar "Aplicar" en una propuesta, Codex abre una sesión con permisos de escritura y hace exactamente ese cambio. Podés ver el output completo y la duración.
           </p>
           <p>
             <strong className="text-gray-200">4. Resolución automática</strong> — si el fix se aplica con éxito, el issue vinculado se marca como resuelto automáticamente.

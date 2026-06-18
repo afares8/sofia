@@ -117,7 +117,7 @@ async def approve_report(report_id: int, body: ApproveBody):
 @router.post("/{report_id}/approve/{proposal_index}")
 async def approve_and_apply_proposal(report_id: int, proposal_index: int):
     """
-    Approve and immediately apply a SINGLE proposal via Devin CLI.
+    Approve and immediately apply a SINGLE proposal via Codex CLI.
     Only applies the proposal at proposal_index, nothing else.
     The apply runs in the background; poll /runs to watch progress.
     """
@@ -154,7 +154,7 @@ async def approve_and_apply_proposal(report_id: int, proposal_index: int):
 async def apply_batch_for_service(report_id: int, proposal_index: int):
     """
     Apply the selected proposal PLUS other unapplied proposals for the SAME
-    service, grouped into a single Devin session (max 3 per session).
+    service, grouped into a single Codex session (max 3 per session).
     More efficient but applies multiple fixes at once.
     """
     row = await db_service.get_nightly_report(report_id)

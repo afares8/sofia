@@ -1,17 +1,17 @@
-import asyncio
+﻿import asyncio
 import json
 import logging
 import os
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 from app.services import db_service
+from app.services.codex_cli_service import codex_available, run_codex
 from app.services.config_service import load_config, save_config
 
 logger = logging.getLogger("sofia.autonomy")
@@ -33,8 +33,8 @@ DANGEROUS_DIFF_PATTERNS = [
 ]
 
 
-def _devin_available() -> bool:
-    return shutil.which("devin") is not None or shutil.which("devin.exe") is not None
+def _codex_available() -> bool:
+    return codex_available()
 
 
 def _run(cmd: list[str], cwd: Optional[str] = None, timeout: int = 120) -> tuple[int, str]:
@@ -64,37 +64,8 @@ def _run_shell(command: str, cwd: str, timeout: int = 300) -> tuple[int, str]:
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
-def _run_devin(prompt: str, read_only: bool, cwd: Optional[str], timeout: int = 900) -> tuple[int, str]:
-    if not _devin_available():
-        return -2, "Devin CLI no encontrado en PATH."
-    mode = "auto" if read_only else "dangerous"
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-            f.write(prompt)
-            tmp_path = f.name
-        devin_bin = shutil.which("devin") or shutil.which("devin.exe") or "devin"
-        cmd = [devin_bin, "--permission-mode", mode, "--prompt-file", tmp_path, "--print"]
-        proc = subprocess.run(
-            cmd,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-        )
-        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
-    except subprocess.TimeoutExpired:
-        return -1, f"TIMEOUT: Devin no terminó en {timeout}s."
-    except Exception as exc:
-        return -3, f"ERROR: {exc}"
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+def _run_codex(prompt: str, read_only: bool, cwd: Optional[str], timeout: int = 900) -> tuple[int, str]:
+    return run_codex(prompt, read_only=read_only, cwd=cwd, timeout=timeout)
 
 
 def _changed_files(repo_path: str) -> list[str]:
@@ -270,7 +241,7 @@ def policy_scan(repo_path: str, diff_text: Optional[str] = None, repo_cfg=None, 
         diff, include_tests=cfg.count_test_files_in_limit
     )
     if changed_lines > cfg.max_lines_changed:
-        blocked.append(f"Diff demasiado grande: {changed_lines} líneas > {cfg.max_lines_changed}")
+        blocked.append(f"Diff demasiado grande: {changed_lines} lÃ­neas > {cfg.max_lines_changed}")
 
     # NOTE: secret scanning is intentionally NOT done here. It produced too many
     # false positives and blocked legitimate fixes. Secrets are still scanned by
@@ -279,7 +250,7 @@ def policy_scan(repo_path: str, diff_text: Optional[str] = None, repo_cfg=None, 
 
     for pattern in DANGEROUS_DIFF_PATTERNS:
         if pattern.search(diff) or pattern.search(file_text):
-            blocked.append(f"Patrón peligroso detectado: {pattern.pattern}")
+            blocked.append(f"PatrÃ³n peligroso detectado: {pattern.pattern}")
 
     return {
         "approved": not blocked,
@@ -340,7 +311,7 @@ async def verify_current_diff(
         return result
     job = {"id": "external", "goal": goal}
     rc, raw = await asyncio.get_event_loop().run_in_executor(
-        None, _run_devin, _verifier_prompt(job, diff, policy), True, target_repo, 600,
+        None, _run_codex, _verifier_prompt(job, diff, policy), True, target_repo, 600,
     )
     decision = _parse_verifier_decision(raw)
     result["ai"] = {"rc": rc, "decision": decision, "output": raw[-12000:]}
@@ -351,7 +322,7 @@ async def verify_current_diff(
 
 def _engineer_prompt(job: dict) -> str:
     mode = job.get("mode") or "plan"
-    return f"""Eres el Engineer AI de Sofia. Trabaja con autonomía controlada.
+    return f"""Eres el Engineer AI de Sofia. Trabaja con autonomÃ­a controlada.
 
 Job #{job['id']}
 Servicio: {job.get('service_id') or 'n/a'}
@@ -364,8 +335,8 @@ Reglas:
 - No hagas push.
 - No modifiques .env, secrets, backend/data, backend/logs, node_modules ni dist.
 - Si el modo es plan, solo investiga y devuelve un plan concreto.
-- Si el modo es fix, aplica el cambio mínimo, agrega/ajusta tests si corresponde y corre la verificación disponible.
-- Termina con una sección exacta:
+- Si el modo es fix, aplica el cambio mÃ­nimo, agrega/ajusta tests si corresponde y corre la verificaciÃ³n disponible.
+- Termina con una secciÃ³n exacta:
 SOFIA_RESULT:
 status=<success|blocked|failed>
 risk=<low|medium|high>
@@ -374,7 +345,7 @@ summary=<resumen corto>
 
 
 def _verifier_prompt(job: dict, diff: str, policy: dict) -> str:
-    return f"""Eres el Verifier AI de Sofia. No confíes en el Engineer AI.
+    return f"""Eres el Verifier AI de Sofia. No confÃ­es en el Engineer AI.
 
 Revisa el Job #{job['id']} y decide si el cambio es seguro.
 
@@ -402,7 +373,7 @@ Devuelve JSON estricto:
 def _parse_verifier_decision(raw: str) -> dict:
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
-        return {"approved": False, "risk": "high", "reasons": ["Verifier no devolvió JSON."], "required_actions": []}
+        return {"approved": False, "risk": "high", "reasons": ["Verifier no devolviÃ³ JSON."], "required_actions": []}
     try:
         data = json.loads(match.group(0))
         return {
@@ -412,7 +383,7 @@ def _parse_verifier_decision(raw: str) -> dict:
             "required_actions": data.get("required_actions") if isinstance(data.get("required_actions"), list) else [],
         }
     except Exception as exc:
-        return {"approved": False, "risk": "high", "reasons": [f"JSON inválido: {exc}"], "required_actions": []}
+        return {"approved": False, "risk": "high", "reasons": [f"JSON invÃ¡lido: {exc}"], "required_actions": []}
 
 
 async def set_kill_switch(enabled: bool) -> None:
@@ -456,9 +427,9 @@ async def run_job(job_id: int) -> None:
             job_id,
             status="blocked",
             risk="high",
-            blocked_reason="Autonomía apagada o kill switch activo.",
+            blocked_reason="AutonomÃ­a apagada o kill switch activo.",
         )
-        await db_service.add_audit_event("ai_job", "blocked", job_id, "Autonomía apagada o kill switch activo.")
+        await db_service.add_audit_event("ai_job", "blocked", job_id, "AutonomÃ­a apagada o kill switch activo.")
         return
 
     if (job.get("mode") == "fix") and int(job.get("autonomy_level") or 1) < 3:
@@ -472,7 +443,7 @@ async def run_job(job_id: int) -> None:
         return
 
     if (job.get("mode") == "fix") and load_config().autonomy.require_human_for_apply:
-        await db_service.add_audit_event("ai_job", "safe_mode", job_id, "Fix se ejecutará en sandbox; no se aplicará al repo principal.")
+        await db_service.add_audit_event("ai_job", "safe_mode", job_id, "Fix se ejecutarÃ¡ en sandbox; no se aplicarÃ¡ al repo principal.")
 
     if job.get("mode") == "fix":
         try:
@@ -494,17 +465,17 @@ async def run_job(job_id: int) -> None:
     await db_service.update_ai_job(job_id, status="running", repo_id=repo_cfg.id)
     prompt = _engineer_prompt(job)
     rc, output = await asyncio.get_event_loop().run_in_executor(
-        None, _run_devin, prompt, job.get("mode") != "fix", repo_path, 900,
+        None, _run_codex, prompt, job.get("mode") != "fix", repo_path, 900,
     )
     await db_service.update_ai_job(job_id, devin_output=output[-16000:])
-    await db_service.add_audit_event("ai_job", "devin_finished", job_id, f"rc={rc}")
+    await db_service.add_audit_event("ai_job", "codex_finished", job_id, f"rc={rc}")
 
     if rc != 0:
         await db_service.update_ai_job(
             job_id,
             status="failed",
             risk="medium",
-            result_message=f"Engineer AI falló con rc={rc}.",
+            result_message=f"Engineer AI fallÃ³ con rc={rc}.",
         )
         return
 
@@ -518,7 +489,7 @@ async def run_job(job_id: int) -> None:
             status="completed",
             risk="low",
             verifier_status="not_required",
-            result_message="Plan generado por Devin.",
+            result_message="Plan generado por Codex.",
         )
         await db_service.add_audit_event("ai_job", "completed", job_id, "Plan generado.")
         return
@@ -528,10 +499,10 @@ async def run_job(job_id: int) -> None:
             job_id,
             status="blocked",
             risk="medium",
-            blocked_reason="Devin no produjo cambios en modo fix.",
+            blocked_reason="Codex no produjo cambios en modo fix.",
             result_message="Cambio bloqueado porque no hubo diff que auditar.",
         )
-        await db_service.add_audit_event("ai_job", "blocked", job_id, "Sin cambios después de Devin.")
+        await db_service.add_audit_event("ai_job", "blocked", job_id, "Sin cambios después de Codex.")
         return
 
     tests_status, tests_output = _run_quality_commands(repo_path, repo_cfg)
@@ -544,10 +515,10 @@ async def run_job(job_id: int) -> None:
             status="blocked",
             risk="high",
             diff_summary=json.dumps(post_test_policy, ensure_ascii=False),
-            blocked_reason="Policy scan falló después de tests/build.",
-            result_message="Cambio bloqueado por artefactos o riesgos generados durante la verificación.",
+            blocked_reason="Policy scan fallÃ³ despuÃ©s de tests/build.",
+            result_message="Cambio bloqueado por artefactos o riesgos generados durante la verificaciÃ³n.",
         )
-        await db_service.add_audit_event("ai_job", "blocked", job_id, "Policy post-tests falló.")
+        await db_service.add_audit_event("ai_job", "blocked", job_id, "Policy post-tests fallÃ³.")
         return
     await db_service.update_ai_job(job_id, diff_summary=json.dumps(post_test_policy, ensure_ascii=False))
     if cfg.require_tests_for_code_fixes and tests_status == "failed":
@@ -556,7 +527,7 @@ async def run_job(job_id: int) -> None:
             status="blocked",
             risk="high",
             blocked_reason="Tests/build fallaron.",
-            result_message="Cambio bloqueado porque la verificación local falló.",
+            result_message="Cambio bloqueado porque la verificaciÃ³n local fallÃ³.",
         )
         return
 
@@ -573,7 +544,7 @@ async def run_job(job_id: int) -> None:
 
     if cfg.require_verifier and policy["approved"]:
         rc2, verifier_raw = await asyncio.get_event_loop().run_in_executor(
-            None, _run_devin, _verifier_prompt(job, diff, policy), True, repo_path, 600,
+            None, _run_codex, _verifier_prompt(job, diff, policy), True, repo_path, 600,
         )
         decision = _parse_verifier_decision(verifier_raw)
         verifier_output = verifier_raw[-12000:] + "\n\nSOFIA_VERIFIER_DECISION:\n" + json.dumps(decision, ensure_ascii=False)
@@ -586,7 +557,7 @@ async def run_job(job_id: int) -> None:
     if verifier_status == "approved" and cfg.commit_in_sandbox:
         rc_add, out_add = _run(["git", "add", "--"] + _changed_files(repo_path), cwd=repo_path, timeout=180)
         rc_commit, out_commit = _run(
-            ["git", "commit", "-m", f"fix({repo_cfg.id}): AI job {job_id}\n\nGenerated with [Devin](https://cli.devin.ai/docs)\n\nCo-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>"],
+            ["git", "commit", "-m", f"fix({repo_cfg.id}): AI job {job_id}\n\nGenerated with Codex CLI"],
             cwd=repo_path,
             timeout=180,
         )
@@ -606,24 +577,24 @@ async def run_job(job_id: int) -> None:
         verifier_output=verifier_output,
         risk=risk,
         commit_sha=commit_sha,
-        blocked_reason=None if verifier_status == "approved" else "Verifier/policy no aprobó el cambio.",
+        blocked_reason=None if verifier_status == "approved" else "Verifier/policy no aprobÃ³ el cambio.",
         result_message="Cambio verificado." if verifier_status == "approved" else "Cambio bloqueado por guardrails.",
     )
     await db_service.add_audit_event("ai_job", verifier_status, job_id, "Job finalizado.")
 
-    # ── Promotion: push the verified fix to the real repo ─────────────────────
+    # â”€â”€ Promotion: push the verified fix to the real repo â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if verifier_status == "approved":
         if cfg.auto_promote_low_risk and risk == "low" and cfg.promotion_mode != "manual":
             try:
                 result = await promote_job(job_id)
                 logger.info(f"[AUTONOMY] Job #{job_id} auto-promovido: {result.get('message')}")
             except Exception as exc:
-                logger.error(f"[AUTONOMY] Auto-promote del job #{job_id} falló: {exc}", exc_info=True)
+                logger.error(f"[AUTONOMY] Auto-promote del job #{job_id} fallÃ³: {exc}", exc_info=True)
                 await db_service.add_audit_event("ai_job", "promote_failed", job_id, str(exc))
         else:
             await db_service.add_audit_event(
                 "ai_job", "awaiting_promotion", job_id,
-                f"Verificado (risk={risk}). Esperando promoción manual desde la UI.",
+                f"Verificado (risk={risk}). Esperando promociÃ³n manual desde la UI.",
             )
 
 
@@ -638,9 +609,9 @@ async def promote_job(job_id: int) -> dict:
     Flow (promotion_mode):
       - Fetch the sandbox work branch into the real repo.
       - Push that branch to origin (GitHub).
-      - "pr"     → open a GitHub PR with `gh pr create`.
-      - "branch" → leave the pushed branch for manual review (no PR).
-      - "manual" → only runs when called explicitly from the UI; behaves like "pr".
+      - "pr"     â†’ open a GitHub PR with `gh pr create`.
+      - "branch" â†’ leave the pushed branch for manual review (no PR).
+      - "manual" â†’ only runs when called explicitly from the UI; behaves like "pr".
 
     On success, marks the job as 'promoted', records pr_url and promoted_at,
     and resolves the associated issue.
@@ -649,7 +620,7 @@ async def promote_job(job_id: int) -> dict:
     if not job:
         raise RuntimeError(f"Job #{job_id} no existe.")
     if job.get("status") != "verified":
-        raise RuntimeError(f"Job #{job_id} está en estado '{job.get('status')}', no 'verified'.")
+        raise RuntimeError(f"Job #{job_id} estÃ¡ en estado '{job.get('status')}', no 'verified'.")
     if not job.get("commit_sha"):
         raise RuntimeError(f"Job #{job_id} no tiene commit en el sandbox.")
 
@@ -674,12 +645,12 @@ async def promote_job(job_id: int) -> dict:
         cwd=real_repo, timeout=300,
     )
     if rc != 0:
-        raise RuntimeError(f"git fetch del sandbox falló: {out}")
+        raise RuntimeError(f"git fetch del sandbox fallÃ³: {out}")
 
     # 2. Push the branch to origin (GitHub).
     rc, out_push = _run(["git", "push", "-u", "origin", work_branch], cwd=real_repo, timeout=300)
     if rc != 0:
-        raise RuntimeError(f"git push a origin falló: {out_push}")
+        raise RuntimeError(f"git push a origin fallÃ³: {out_push}")
 
     pr_url = None
     message = f"Rama '{work_branch}' pusheada a origin."
@@ -687,17 +658,17 @@ async def promote_job(job_id: int) -> dict:
     # 3. Open a PR if requested.
     if mode in ("pr", "manual"):
         if not _gh_available():
-            message += " gh CLI no encontrado: no se abrió PR (rama disponible para PR manual)."
+            message += " gh CLI no encontrado: no se abriÃ³ PR (rama disponible para PR manual)."
         else:
-            title = f"fix({repo_cfg.id}): AI job {job_id} — {(job.get('result_message') or 'fix automático').strip()[:60]}"
+            title = f"fix({repo_cfg.id}): AI job {job_id} â€” {(job.get('result_message') or 'fix automÃ¡tico').strip()[:60]}"
             body = (
-                f"Fix automático generado por Sofia (AI job #{job_id}).\n\n"
+                f"Fix automÃ¡tico generado por Sofia (AI job #{job_id}).\n\n"
                 f"- Servicio: {job.get('service_id') or repo_cfg.id}\n"
                 f"- Issue: #{job.get('issue_id') or 'n/a'}\n"
                 f"- Riesgo: {job.get('risk')}\n"
                 f"- Tests: {job.get('tests_status')}\n"
                 f"- Verificador: {job.get('verifier_status')}\n\n"
-                f"Generado con [Devin](https://cli.devin.ai/docs)"
+                f"Generado con Codex CLI"
             )
             gh_bin = shutil.which("gh") or shutil.which("gh.exe") or "gh"
             rc, out_pr = _run(
@@ -710,7 +681,7 @@ async def promote_job(job_id: int) -> dict:
                 pr_url = m.group(0) if m else None
                 message = f"PR creado: {pr_url or out_pr.strip()}"
             else:
-                message += f" gh pr create falló: {out_pr.strip()[:300]}"
+                message += f" gh pr create fallÃ³: {out_pr.strip()[:300]}"
 
     await db_service.update_ai_job(
         job_id,
@@ -744,7 +715,7 @@ async def recover_stale_jobs() -> int:
             blocked_reason="Job interrumpido por reinicio de Sofia.",
             result_message="Marcado como fallido al arrancar (estaba 'running').",
         )
-        await db_service.add_audit_event("ai_job", "recovered_stale", job["id"], "running → failed al arrancar.")
+        await db_service.add_audit_event("ai_job", "recovered_stale", job["id"], "running â†’ failed al arrancar.")
     if stale:
         logger.info(f"[AUTONOMY] {len(stale)} job(s) 'running' marcados como failed al arrancar.")
     return len(stale)
@@ -775,7 +746,7 @@ async def job_watchdog_loop() -> None:
                     await db_service.add_audit_event("ai_job", "watchdog_timeout", job["id"], f"> {timeout_min} min")
                     logger.warning(f"[AUTONOMY] Job #{job['id']} forzado a failed por timeout.")
         except Exception as exc:
-            logger.error(f"[AUTONOMY] watchdog falló: {exc}", exc_info=True)
+            logger.error(f"[AUTONOMY] watchdog fallÃ³: {exc}", exc_info=True)
         await asyncio.sleep(300)  # check every 5 minutes
 
 
@@ -783,7 +754,7 @@ async def autofix_loop() -> None:
     """
     Background task that periodically creates AI jobs from unresolved issues.
     Groups up to 3 issues from the same service into a single job to avoid
-    spawning dozens of parallel Devin sessions.
+    spawning dozens of parallel Codex sessions.
     """
     logger.info("[AUTONOMY] Autofix loop started.")
     await asyncio.sleep(180)
@@ -832,7 +803,7 @@ async def autofix_loop() -> None:
                     if len(batch) == 1:
                         issue = batch[0]["issue"]
                         goal = (
-                            f"Investiga y {'corrige en sandbox' if mode == 'fix' else 'propón un plan para'} "
+                            f"Investiga y {'corrige en sandbox' if mode == 'fix' else 'propÃ³n un plan para'} "
                             f"el issue #{issue['id']} de {service_id}.\n"
                             f"Nivel: {issue['level']}. Ocurrencias: {issue['count']}.\n"
                             f"Mensaje: {issue['message']}\n"
@@ -842,7 +813,7 @@ async def autofix_loop() -> None:
                         primary_issue_id = int(issue["id"])
                     else:
                         lines = [
-                            f"Investiga y {'corrige en sandbox' if mode == 'fix' else 'propón un plan para'} "
+                            f"Investiga y {'corrige en sandbox' if mode == 'fix' else 'propÃ³n un plan para'} "
                             f"{len(batch)} issues de {service_id}.",
                             "",
                             "## Issues:",
@@ -872,3 +843,5 @@ async def autofix_loop() -> None:
         except Exception as exc:
             logger.error(f"[AUTONOMY] autofix loop failed: {exc}", exc_info=True)
         await asyncio.sleep(wait_seconds)
+
+

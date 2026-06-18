@@ -151,7 +151,7 @@ export default function RestorePage() {
         <div>1. Sofia detecta que un servicio lleva 3 chequeos fallidos consecutivos (≈90s)</div>
         <div>2. Si <strong className="text-white">auto-restore</strong> está activo: restaura sin preguntar.</div>
         <div>3. Si está OFF: envía WhatsApp <span className="text-yellow-400 font-mono">"🔴 Mayor caído. Responde SI MAYOR..."</span></div>
-        <div>4. Sofia ejecuta Devin (si está instalado) o cae a un script PowerShell de fallback.</div>
+        <div>4. Sofia ejecuta Codex (si está instalado) o cae a un script PowerShell de fallback.</div>
         <div>5. Si falla, reintenta hasta 3 veces con backoff exponencial.</div>
         <div>6. Para Mayor/Packing también verifica que el middleware SAP DIAPI responda.</div>
         <div className="text-gray-500 text-xs mt-2">
@@ -216,7 +216,8 @@ function RestoreCard({ entry }: { entry: RestoreEntry }) {
         <div className="flex items-center gap-1.5">
           {entry.trigger_mode === 'auto' && <Badge tone="green"><Bot size={10} /> AUTO</Badge>}
           {entry.trigger_mode === 'manual' && <Badge tone="blue"><User size={10} /> MANUAL</Badge>}
-          {entry.restore_method === 'devin'      && <Badge tone="purple">DEVIN</Badge>}
+          {entry.restore_method === 'codex'      && <Badge tone="purple">CODEX</Badge>}
+          {entry.restore_method === 'devin'      && <Badge tone="purple">AI LEGACY</Badge>}
           {entry.restore_method === 'ps1_script' && <Badge tone="gray">PS1</Badge>}
           {entry.retry_count != null && entry.retry_count > 0 && (
             <Badge tone="gray">retry {entry.retry_count}</Badge>

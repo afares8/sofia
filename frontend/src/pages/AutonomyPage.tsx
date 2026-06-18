@@ -109,7 +109,7 @@ export default function AutonomyPage() {
             <Bot className="text-sky-400" /> AI Engineer
           </h1>
           <p className="text-gray-400 text-sm mt-1">
-            Devin ejecuta, Sofia verifica con policy + AI verifier antes de confiar.
+            Codex ejecuta, Sofia verifica con policy + AI verifier antes de confiar.
           </p>
         </div>
         <button onClick={load} className="flex items-center gap-2 px-3 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm text-gray-300">
@@ -192,7 +192,7 @@ export default function AutonomyPage() {
 
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3 lg:col-span-2">
           <div className="flex items-center gap-2 text-white font-semibold">
-            <Play size={16} className="text-sky-400" /> Nueva sesión Devin
+            <Play size={16} className="text-sky-400" /> Nueva sesión Codex
           </div>
           <textarea
             value={goal}

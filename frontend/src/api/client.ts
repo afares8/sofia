@@ -202,7 +202,7 @@ export interface RestoreEntry {
   devin_output: string | null
   retry_count?: number
   trigger_mode?: 'auto' | 'manual'
-  restore_method?: 'devin' | 'ps1_script' | null
+  restore_method?: 'codex' | 'devin' | 'ps1_script' | 'start_command' | 'wait_existing_restart' | null
 }
 
 // --- Health ---

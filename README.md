@@ -64,7 +64,7 @@ sofia/
 │       │   ├── EventsPage.tsx       # Historial de errores con filtros + breadcrumbs + tags
 │       │   ├── LogsPage.tsx         # Visor de logs en vivo
 │       │   ├── PerformancePage.tsx  # P50/P95/P99, uptime 24h/7d, heatmap por hora
-│       │   ├── RestorePage.tsx      # Restauraciones (auto/manual, Devin/PS1, historial)
+│       │   ├── RestorePage.tsx      # Restauraciones (auto/manual, Codex/PS1, historial)
 │       │   └── ConfigPage.tsx       # Servicios + auto_restore + reglas de alerta + escalation
 │       └── api/client.ts            # Todas las llamadas al backend
 └── sdk/
@@ -221,7 +221,7 @@ Configuración desde la UI → **Configuración → Alertas WhatsApp**:
 - **Frontend:** React 18, TypeScript, Vite, Tailwind CSS, Lucide icons, Recharts
 - **DB:** SQLite (sin setup, archivo local)
 - **Alertas:** WppConnect (tu servidor local de WhatsApp) con queue persistente para tolerar caídas
-- **Restauración:** Devin CLI como método primario, fallback a scripts PowerShell por servicio
+- **Restauración:** Codex CLI como método primario, fallback a scripts PowerShell por servicio
 
 ---
 
@@ -234,7 +234,7 @@ Cada servicio tiene dos checkboxes en **Configuración**:
 
 Por defecto **ambos están OFF**. Active primero solo `Restauración habilitada` y use la restauración manual (botón en la página **Restauraciones** o comando `SI {SERVICIO}` por WhatsApp). Cuando confíe en el sistema, active el toggle de auto-restore por servicio.
 
-El restore intenta primero la integración con el CLI de Devin. Si Devin no está instalado, busca un script PowerShell en `backend/app/scripts/restore_{service_id}.ps1`. Si falla, reintenta hasta 3 veces con backoff exponencial (30s, 60s, 120s).
+El restore intenta primero la integración con el CLI de Codex. Si Codex no está instalado, busca un script PowerShell en `backend/app/scripts/restore_{service_id}.ps1`. Si falla, reintenta hasta 3 veces con backoff exponencial (30s, 60s, 120s).
 
 ## Watchdog externo
 

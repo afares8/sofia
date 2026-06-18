@@ -7,34 +7,33 @@ Flow:
   1. Collect all unresolved ERROR/CRITICAL issues from the last 24 h.
   2. Build a structured analysis prompt with every issue, its count,
      file/line detail and traceback.
-  3. Invoke  `devin -p --permission-mode read-only "<prompt>"`  so that
-     Devin reads the code, understands each error and writes fix proposals
-     as a JSON block.  Devin is told NOT to edit any file.
-  4. If Devin is unavailable or returns no parseable proposals, retry up to
+  3. Invoke `codex exec` in a read-only sandbox so that
+     Codex reads the code, understands each error and writes fix proposals
+     as a JSON block.  Codex is told NOT to edit any file.
+  4. If Codex is unavailable or returns no parseable proposals, retry up to
      MAX_ANALYSIS_RETRIES times (with backoff).  No heuristic fallback.
   5. Save a NightlyReport in DB and send a WhatsApp summary.
 
 When you approve a proposal from the UI:
-  - Sofia invokes Devin again with write permissions to apply that one fix.
+  - Sofia invokes Codex again with write permissions to apply that one fix.
 """
 import asyncio
 import json
 import logging
 import re
-import subprocess
-import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
 from app.services import db_service, whatsapp_service
+from app.services.codex_cli_service import codex_available, run_codex
 from app.services.config_service import load_config
 
 logger = logging.getLogger("sofia.nightly")
 
-# How long to wait for Devin to finish the analysis pass
+# How long to wait for Codex to finish the analysis pass
 ANALYSIS_TIMEOUT_SECONDS = 600   # 10 min
-# How long to wait for Devin to apply a single fix
+# How long to wait for Codex to apply a single fix
 APPLY_TIMEOUT_SECONDS = 480      # 8 min
 
 # Retry policy for the analysis step
@@ -45,8 +44,8 @@ RETRY_BACKOFF_SECONDS = [30, 60, 120]   # waits between retries
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _devin_available() -> bool:
-    return shutil.which("devin") is not None or shutil.which("devin.exe") is not None
+def _codex_available() -> bool:
+    return codex_available()
 
 
 def _repo_path_for_service(service_id: str) -> Optional[str]:
@@ -58,64 +57,10 @@ def _repo_path_for_service(service_id: str) -> Optional[str]:
     return None
 
 
-def _run_devin(prompt: str, read_only: bool, timeout: int, cwd: Optional[str] = None) -> tuple[str, int]:
-    """
-    Run Devin via a temp prompt file (avoids shell arg-length limits on Windows).
-    Returns (combined_output, returncode).
-    read_only=True  → permission-mode auto      (auto-approves read-only tools)
-    read_only=False → permission-mode dangerous  (auto-approves all tools, for applying fixes)
-
-    Output is streamed line-by-line to the Sofia logger in real time.
-    """
-    import tempfile, os
-    mode = "auto" if read_only else "dangerous"
-    collected: list[str] = []
-    tmp_path = None
-    work_dir = cwd or os.getcwd()
-    try:
-        # Write prompt to a temp file — avoids truncation with long prompts on Windows
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, encoding="utf-8"
-        ) as f:
-            f.write(prompt)
-            tmp_path = f.name
-
-        cmd = ["devin", "--permission-mode", mode, "--prompt-file", tmp_path, "--print"]
-        proc = subprocess.Popen(
-            cmd,
-            cwd=work_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,   # merge stderr into stdout
-            stdin=subprocess.DEVNULL,   # no TTY — prevents console takeover on Windows
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW,  # Windows: no new console window
-        )
-        # Stream every line to the logger in real time
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line_stripped = line.rstrip()
-            collected.append(line_stripped)
-            logger.info(f"[DEVIN] {line_stripped}")
-
-        proc.wait(timeout=timeout)
-        return "\n".join(collected), proc.returncode
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        msg = f"[TIMEOUT] Devin did not finish within {timeout}s."
-        logger.error(f"[DEVIN] {msg}")
-        return "\n".join(collected) + "\n" + msg, -1
-    except Exception as exc:
-        msg = f"[ERROR] Could not run Devin: {exc}"
-        logger.error(f"[DEVIN] {msg}")
-        return msg, -2
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+def _run_codex(prompt: str, read_only: bool, timeout: int, cwd: Optional[str] = None) -> tuple[str, int]:
+    """Run Codex non-interactively and return (combined_output, returncode)."""
+    rc, output = run_codex(prompt, read_only=read_only, cwd=cwd, timeout=timeout)
+    return output, rc
 
 
 def _build_analysis_prompt(issues: list, period_start: str, period_end: str) -> str:
@@ -193,14 +138,14 @@ def _build_apply_prompt(proposal: dict) -> str:
     )
 
 
-def _extract_proposals(devin_output: str) -> List[dict]:
-    """Parse the JSON proposals block from Devin's output."""
+def _extract_proposals(codex_output: str) -> List[dict]:
+    """Parse the JSON proposals block from Codex's output."""
     # Primary: our custom fenced marker
     pattern = r"```json_proposals\s*(.*?)\s*```json_proposals"
-    match = re.search(pattern, devin_output, re.DOTALL)
+    match = re.search(pattern, codex_output, re.DOTALL)
     if not match:
         # Secondary: plain ```json block containing an array
-        match = re.search(r"```json\s*(\[.*?\])\s*```", devin_output, re.DOTALL)
+        match = re.search(r"```json\s*(\[.*?\])\s*```", codex_output, re.DOTALL)
     if not match:
         return []
     try:
@@ -212,7 +157,7 @@ def _extract_proposals(devin_output: str) -> List[dict]:
     return []
 
 
-# ── Core analysis (with retries, Devin only) ──────────────────────────────────
+# ── Core analysis (with retries, Codex only) ──────────────────────────────────
 
 
 async def _run_analysis_with_retries(
@@ -221,26 +166,26 @@ async def _run_analysis_with_retries(
     period_end: str,
 ) -> tuple[List[dict], str]:
     """
-    Try up to MAX_ANALYSIS_RETRIES times to get parseable proposals from Devin.
-    Returns (proposals, devin_raw_output).
+    Try up to MAX_ANALYSIS_RETRIES times to get parseable proposals from Codex.
+    Returns (proposals, Codex_raw_output).
     Raises RuntimeError if all attempts fail.
     """
-    if not _devin_available():
+    if not _codex_available():
         raise RuntimeError(
-            "Devin CLI no encontrado en PATH. "
-            "Asegúrate de que 'devin' esté instalado y accesible."
+            "Codex CLI no encontrado en PATH. "
+            "Asegúrate de que 'codex' esté instalado y accesible."
         )
 
     prompt = _build_analysis_prompt(issues, period_start, period_end)
     last_output = ""
 
     for attempt in range(1, MAX_ANALYSIS_RETRIES + 1):
-        logger.info(f"[NIGHTLY] Devin analysis attempt {attempt}/{MAX_ANALYSIS_RETRIES}…")
+        logger.info(f"[NIGHTLY] Codex analysis attempt {attempt}/{MAX_ANALYSIS_RETRIES}…")
         output, rc = await asyncio.get_event_loop().run_in_executor(
-            None, _run_devin, prompt, True, ANALYSIS_TIMEOUT_SECONDS,
+            None, _run_codex, prompt, True, ANALYSIS_TIMEOUT_SECONDS,
         )
         last_output = output
-        logger.info(f"[NIGHTLY] Devin finished (rc={rc}, output_len={len(output)}).")
+        logger.info(f"[NIGHTLY] Codex finished (rc={rc}, output_len={len(output)}).")
 
         proposals = _extract_proposals(output)
         if proposals:
@@ -261,7 +206,7 @@ async def _run_analysis_with_retries(
             )
 
     raise RuntimeError(
-        f"Devin no generó propuestas válidas después de {MAX_ANALYSIS_RETRIES} intentos. "
+        f"Codex no generó propuestas válidas después de {MAX_ANALYSIS_RETRIES} intentos. "
         f"Último output:\n{last_output[:1000]}"
     )
 
@@ -276,7 +221,7 @@ async def run_nightly_review(
     """
     Analyse errors from the last `since_hours` and save a NightlyReport.
     Returns the new report ID, or None if there was nothing to analyse.
-    Raises on unrecoverable error (Devin unavailable / all retries exhausted).
+    Raises on unrecoverable error (Codex unavailable / all retries exhausted).
 
     `force=True` skips the "already ran today" guard.
     """
@@ -305,12 +250,12 @@ async def run_nightly_review(
 
     logger.info(f"[NIGHTLY] Analysing {len(issues)} issues ({period_start} → {period_end})")
 
-    # Run Devin analysis (with retries, no fallback)
+    # Run Codex analysis (with retries, no fallback)
     proposals, _raw_output = await _run_analysis_with_retries(issues, period_start, period_end)
 
     # Tag source
     for p in proposals:
-        p.setdefault("source", "devin")
+        p.setdefault("source", "codex")
 
     proposals_json = json.dumps(proposals, ensure_ascii=False, indent=2)
     report_id = await db_service.save_nightly_report(
@@ -379,11 +324,11 @@ async def apply_proposal(
     batch: bool = False,
 ) -> tuple[bool, str]:
     """
-    Apply an approved proposal using Devin CLI (write mode).
+    Apply an approved proposal using Codex CLI (write mode).
 
     - batch=False (default): applies ONLY the proposal at proposal_index.
     - batch=True: groups up to 3 unapplied proposals for the SAME service
-      into a single Devin session for efficiency.
+      into a single Codex session for efficiency.
 
     Creates proposal_run rows to track status/output/duration.
     Returns (success, output).
@@ -392,8 +337,8 @@ async def apply_proposal(
 
     MAX_PROPOSALS_PER_SESSION = 3
 
-    if not _devin_available():
-        return False, "Devin CLI no encontrado en PATH. Instala 'devin' para aplicar fixes automáticamente."
+    if not _codex_available():
+        return False, "Codex CLI no encontrado en PATH. Instala 'codex' para aplicar fixes automáticamente."
 
     report = await db_service.get_nightly_report(report_id)
     if not report:
@@ -440,7 +385,7 @@ async def apply_proposal(
             prompt = _build_grouped_apply_prompt(grouped)
             logger.info(
                 f"[NIGHTLY] BATCH: Grouping {len(grouped)} proposals for service '{target_service}' "
-                f"(indices {grouped_indices}) into one Devin session."
+                f"(indices {grouped_indices}) into one Codex session."
             )
         else:
             prompt = _build_apply_prompt(target_proposal)
@@ -452,7 +397,7 @@ async def apply_proposal(
         grouped = [target_proposal]
         grouped_indices = [proposal_index]
 
-    # Create run records for ALL proposals before launching Devin
+    # Create run records for ALL proposals before launching Codex
     run_ids: list[int] = []
     for p, idx in zip(grouped, grouped_indices):
         issue_id = p.get("issue_id")
@@ -470,20 +415,20 @@ async def apply_proposal(
         f"in repo {repo_path} (run_ids={run_ids})…"
     )
 
-    # Capture file hashes BEFORE Devin runs (to detect actual content changes)
+    # Capture file hashes BEFORE Codex runs (to detect actual content changes)
     from app.services.autonomy_service import _get_file_hashes
     hashes_before = _get_file_hashes(repo_path)
-    logger.info(f"[NIGHTLY] Files already modified in repo before Devin: {len(hashes_before)}")
+    logger.info(f"[NIGHTLY] Files already modified in repo before Codex: {len(hashes_before)}")
 
     t0 = time.monotonic()
     output, rc = await asyncio.get_event_loop().run_in_executor(
-        None, _run_devin, prompt, False, APPLY_TIMEOUT_SECONDS, repo_path,
+        None, _run_codex, prompt, False, APPLY_TIMEOUT_SECONDS, repo_path,
     )
     duration_s = time.monotonic() - t0
     success = rc == 0
     verifier_note = ""
 
-    # Detect if Devin reported the fix was already applied (no changes needed)
+    # Detect if Codex reported the fix was already applied (no changes needed)
     output_lower = output.lower()
     already_applied_indicators = [
         "already been applied",
@@ -497,23 +442,23 @@ async def apply_proposal(
         "no edit is needed",
         "no modification needed",
     ]
-    devin_says_already_applied = any(ind in output_lower for ind in already_applied_indicators)
+    codex_says_already_applied = any(ind in output_lower for ind in already_applied_indicators)
 
-    # Compute files that Devin ACTUALLY modified during this session (by hash)
+    # Compute files that Codex ACTUALLY modified during this session (by hash)
     hashes_after = _get_file_hashes(repo_path)
     new_files: list[str] = []
     for f, h in hashes_after.items():
         if f not in hashes_before or hashes_before[f] != h:
             new_files.append(f)
     new_files.sort()
-    logger.info(f"[NIGHTLY] New files modified by Devin: {new_files}")
+    logger.info(f"[NIGHTLY] New files modified by Codex: {new_files}")
 
-    if success and devin_says_already_applied:
+    if success and codex_says_already_applied:
         logger.info(
-            f"[NIGHTLY] Devin reported fix already applied (no new edits). "
+            f"[NIGHTLY] Codex reported fix already applied (no new edits). "
             f"Skipping verifier and marking as success."
         )
-        verifier_note = "\n\nSOFIA_VERIFICATION: skipped — Devin reported fix already present in codebase."
+        verifier_note = "\n\nSOFIA_VERIFICATION: skipped — Codex reported fix already present in codebase."
     elif success:
         try:
             from app.services.autonomy_service import verify_current_diff
@@ -538,7 +483,7 @@ async def apply_proposal(
             run_id=run_id,
             success=success,
             devin_output=output + verifier_note,
-            error_msg=None if success else f"Devin exit code {rc}; verifier/policy blocked" if rc == 0 else f"Devin exit code {rc}",
+            error_msg=None if success else f"Codex exit code {rc}; verifier/policy blocked" if rc == 0 else f"Codex exit code {rc}",
             duration_s=round(duration_s / len(grouped), 1),
         )
 
@@ -596,3 +541,5 @@ async def nightly_loop():
             await send_daily_report(since_hours=24)
         except Exception as exc:
             logger.error(f"[NIGHTLY] Daily activity report failed: {exc}", exc_info=True)
+
+

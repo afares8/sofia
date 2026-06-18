@@ -4,11 +4,11 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 from datetime import datetime
 from pathlib import Path
 
 from app.services import db_service
+from app.services.codex_cli_service import codex_available, run_codex
 from app.services.config_service import load_config
 
 logger = logging.getLogger("sofia.github_sync")
@@ -78,7 +78,7 @@ def _status_files(repo_path: str) -> list[str]:
 def _extract_sofia_modified_files(repo_id: str, since_hours: int = 24) -> list[str]:
     """
     Look at recent successful proposal runs and AI jobs for this repo
-    and extract which files Devin actually modified, by parsing Devin output.
+    and extract which files Codex/AI actually modified, by parsing Codex output.
     """
     files: set[str] = set()
     try:
@@ -96,7 +96,7 @@ def _extract_sofia_modified_files(repo_id: str, since_hours: int = 24) -> list[s
             (repo_id,)
         )
         for row in cur.fetchall():
-            files.update(_parse_files_from_devin_output(row["devin_output"] or ""))
+            files.update(_parse_files_from_ai_output(row["devin_output"] or ""))
 
         # From ai_jobs (autofix loop)
         cur2 = conn.execute(
@@ -106,7 +106,7 @@ def _extract_sofia_modified_files(repo_id: str, since_hours: int = 24) -> list[s
             (repo_id,)
         )
         for row in cur2.fetchall():
-            files.update(_parse_files_from_devin_output(row["result_message"] or ""))
+            files.update(_parse_files_from_ai_output(row["result_message"] or ""))
 
         conn.close()
     except Exception as exc:
@@ -114,8 +114,8 @@ def _extract_sofia_modified_files(repo_id: str, since_hours: int = 24) -> list[s
     return sorted(files)
 
 
-def _parse_files_from_devin_output(text: str) -> set[str]:
-    """Parse Devin output to find files it claims to have modified."""
+def _parse_files_from_ai_output(text: str) -> set[str]:
+    """Parse AI output to find files it claims to have modified."""
     files: set[str] = set()
     if not text:
         return files
@@ -198,13 +198,13 @@ def _secret_scan(repo_path: str, files: list[str]) -> list[str]:
     return hits
 
 
-def _devin_available() -> bool:
-    return shutil.which("devin") is not None or shutil.which("devin.exe") is not None
+def _codex_available() -> bool:
+    return codex_available()
 
 
 def _build_conflict_prompt(repo_path: str, conflict_files: list[str], branch: str) -> str:
     """
-    Build a prompt for Devin to resolve merge conflicts.
+    Build a prompt for Codex to resolve merge conflicts.
 
     THE FIXED RULE (siempre la misma orden):
       Montá los cambios locales sin que se pierda nada de la nube,
@@ -249,66 +249,9 @@ def _build_conflict_prompt(repo_path: str, conflict_files: list[str], branch: st
     return "\n".join(lines)
 
 
-def _run_devin(prompt: str, cwd: str, timeout: int = 300) -> tuple[int, str]:
-    """
-    Run Devin CLI to resolve conflicts. Returns (rc, output).
-
-    Output is streamed line-by-line to the Sofia logger in real time so you
-    can watch what Devin is doing in the Sofia logs/UI instead of a black
-    console window. No new console window is opened on Windows.
-    """
-    if not _devin_available():
-        return -1, "Devin CLI not found."
-    devin_bin = shutil.which("devin") or shutil.which("devin.exe") or "devin"
-    tmp_path = None
-    collected: list[str] = []
-    proc = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-            f.write(prompt)
-            tmp_path = f.name
-        cmd = [devin_bin, "--permission-mode", "dangerous", "--prompt-file", tmp_path, "--print"]
-
-        popen_kwargs = dict(
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,   # merge stderr into stdout
-            stdin=subprocess.DEVNULL,   # no TTY — prevents console takeover
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        # Windows: don't open a new black console window
-        if hasattr(subprocess, "CREATE_NO_WINDOW"):
-            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-        proc = subprocess.Popen(cmd, **popen_kwargs)
-
-        # Stream every line to the Sofia logger in real time
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line_stripped = line.rstrip()
-            collected.append(line_stripped)
-            logger.info(f"[DEVIN] {line_stripped}")
-
-        proc.wait(timeout=timeout)
-        return proc.returncode, "\n".join(collected)
-    except subprocess.TimeoutExpired:
-        if proc:
-            proc.kill()
-        msg = f"Devin timeout after {timeout}s"
-        logger.error(f"[DEVIN] {msg}")
-        return -1, "\n".join(collected) + "\n" + msg
-    except Exception as exc:
-        msg = f"Devin error: {exc}"
-        logger.error(f"[DEVIN] {msg}")
-        return -1, "\n".join(collected) + "\n" + msg
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+def _run_codex(prompt: str, cwd: str, timeout: int = 300) -> tuple[int, str]:
+    """Run Codex CLI to resolve conflicts. Returns (rc, output)."""
+    return run_codex(prompt, read_only=False, cwd=cwd, timeout=timeout, log_prefix="CODEX_SYNC")
 
 
 async def sync_repo(repo_cfg) -> dict:
@@ -375,7 +318,7 @@ async def sync_repo(repo_cfg) -> dict:
         # ORDEN CORRECTO (lo que el usuario pidió):
         #   1. Montar cambios LOCALES primero (add + commit) → quedan seguros
         #   2. Traer cambios de la NUBE (pull/merge) → sin perder local
-        #   3. Si hay conflicto → Devin mergea preservando AMBOS lados
+        #   3. Si hay conflicto → Codex mergea preservando AMBOS lados
         #   4. Push → sube el resultado completo
         # ─────────────────────────────────────────────────────────────────────
 
@@ -400,8 +343,7 @@ async def sync_repo(repo_cfg) -> dict:
                 msg = f"{cfg.commit_message_prefix} ({datetime.now().strftime('%Y-%m-%d')})"
                 commit_body = (
                     msg
-                    + "\n\nGenerated with [Devin](https://cli.devin.ai/docs)\n\n"
-                    + "Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>\n"
+                    + "\n\nGenerated with Codex CLI\n"
                 )
                 rc, out = _run(["git", "commit", "-m", commit_body], repo_path, timeout=180)
                 output_parts.append(f"[COMMIT] {out}")
@@ -445,26 +387,26 @@ async def sync_repo(repo_cfg) -> dict:
                 if rc_conf == 0 and out_conf.strip():
                     conflict_files = [f.strip() for f in out_conf.strip().splitlines() if f.strip()]
                     logger.warning(
-                        f"[GITHUB_SYNC] Conflictos en {repo_cfg.id}: {conflict_files}. Llamando a Devin..."
+                        f"[GITHUB_SYNC] Conflictos en {repo_cfg.id}: {conflict_files}. Llamando a Codex..."
                     )
-                    # Devin resuelve EN MEDIO del rebase (no abortamos — preservamos ambos)
+                    # Codex resuelve EN MEDIO del rebase (no abortamos — preservamos ambos)
                     prompt = _build_conflict_prompt(repo_path, conflict_files, current_branch)
-                    devin_rc, devin_out = _run_devin(prompt, repo_path, timeout=480)
-                    output_parts.append(f"[DEVIN] rc={devin_rc}\n{devin_out}")
-                    if devin_rc != 0:
+                    codex_rc, codex_out = _run_codex(prompt, repo_path, timeout=480)
+                    output_parts.append(f"[CODEX] rc={codex_rc}\n{codex_out}")
+                    if codex_rc != 0:
                         _run(["git", "rebase", "--abort"], repo_path, timeout=60)
                         raise RuntimeError(
-                            f"Devin no pudo resolver conflictos. Archivos: {', '.join(conflict_files)}. "
-                            f"Rebase abortado, nada se perdió. Output: {devin_out[:400]}"
+                            f"Codex no pudo resolver conflictos. Archivos: {', '.join(conflict_files)}. "
+                            f"Rebase abortado, nada se perdió. Output: {codex_out[:400]}"
                         )
                     # Verificar que no queden marcadores de conflicto
                     rc_v, out_v = _run(["git", "diff", "--name-only", "--diff-filter=U"], repo_path)
                     if rc_v == 0 and out_v.strip():
                         _run(["git", "rebase", "--abort"], repo_path, timeout=60)
                         raise RuntimeError(
-                            f"Devin dijo resolver pero quedan conflictos: {out_v.strip()}. Rebase abortado."
+                            f"Codex dijo resolver pero quedan conflictos: {out_v.strip()}. Rebase abortado."
                         )
-                    # Continuar el rebase con los archivos resueltos por Devin
+                    # Continuar el rebase con los archivos resueltos por Codex
                     rc_cont, out_cont = _run(["git", "rebase", "--continue"], repo_path, timeout=180)
                     output_parts.append(f"[REBASE --continue] {out_cont}")
                     if rc_cont != 0:
@@ -523,3 +465,4 @@ async def sync_all_repos_background() -> None:
         logger.info(f"[GITHUB_SYNC] completed: {results}")
     except Exception as exc:
         logger.error(f"[GITHUB_SYNC] failed: {exc}", exc_info=True)
+

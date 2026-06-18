@@ -197,7 +197,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         log_path="D:/mayor/backend/logs/app.log",
         enabled=True,
         restore_enabled=True,
-        auto_restore=True,
+        auto_restore=False,
     ),
     ServiceConfig(
         id="packing",
@@ -206,7 +206,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         log_path="D:/packing/backend/logs/app.log",
         enabled=True,
         restore_enabled=True,
-        auto_restore=True,
+        auto_restore=False,
     ),
     ServiceConfig(
         id="pantalla",
@@ -215,7 +215,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         log_path="D:/Pantalla/backend/logs/app.log",
         enabled=True,
         restore_enabled=True,
-        auto_restore=True,
+        auto_restore=False,
     ),
     ServiceConfig(
         id="cortana",
@@ -224,7 +224,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         log_path="D:/Cortana/backend/logs/app.log",
         enabled=True,
         restore_enabled=True,
-        auto_restore=True,
+        auto_restore=False,
     ),
     ServiceConfig(
         id="wppconnect",
@@ -232,7 +232,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         url=f"http://{_SOFIA_HOST_IP}:21465/api/default/status-session",
         enabled=True,
         restore_enabled=True,
-        auto_restore=True,
+        auto_restore=False,
     ),
     ServiceConfig(
         id="mayor_frontend",
@@ -240,7 +240,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         url="https://127.0.0.1:5175",
         enabled=True,
         restore_enabled=True,
-        auto_restore=True,
+        auto_restore=False,
     ),
     ServiceConfig(
         id="packing_frontend",
@@ -248,7 +248,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         url="https://127.0.0.1:3000",
         enabled=True,
         restore_enabled=True,
-        auto_restore=True,
+        auto_restore=False,
     ),
     ServiceConfig(
         id="pantalla_frontend",
@@ -256,7 +256,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         url="http://127.0.0.1:5173",
         enabled=True,
         restore_enabled=True,
-        auto_restore=True,
+        auto_restore=False,
     ),
     ServiceConfig(
         id="cortana_frontend",
@@ -264,7 +264,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         url="http://127.0.0.1:5174",
         enabled=True,
         restore_enabled=True,
-        auto_restore=True,
+        auto_restore=False,
     ),
     ServiceConfig(
         id="sofia_frontend",
@@ -272,7 +272,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         url="http://127.0.0.1:5179",
         enabled=True,
         restore_enabled=True,
-        auto_restore=True,
+        auto_restore=False,
     ),
     ServiceConfig(
         id="diapi",
@@ -280,7 +280,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         url="http://localhost:9000/api/Health/Ping",
         enabled=True,
         restore_enabled=True,
-        auto_restore=True,
+        auto_restore=False,
     ),
 ]
 

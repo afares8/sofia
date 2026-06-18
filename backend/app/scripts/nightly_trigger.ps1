@@ -43,7 +43,7 @@ if ($Install) {
         -Trigger    $trigger `
         -Settings   $settings `
         -Principal  $principal `
-        -Description "Sofia Monitor: ejecuta la revision nocturna de errores con Devin CLI." `
+        -Description "Sofia Monitor: ejecuta la revision nocturna de errores con Codex CLI." `
         -Force | Out-Null
 
     Write-Host "Tarea '$TASK_NAME' registrada correctamente." -ForegroundColor Green
