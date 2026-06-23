@@ -12,7 +12,10 @@ logger = logging.getLogger("sofia.codex")
 
 CODEX_NOT_FOUND = "CODEX_NOT_FOUND"
 CODEX_MODEL_ENV = "SOFIA_CODEX_MODEL"
-DEFAULT_CODEX_MODEL = "codex-5.3"
+# Default to None so we don't pass -m and let Codex use the model from
+# ~/.codex/config.toml (currently gpt-5.5).  Passing an unsupported model
+# (e.g. "glm-5.2") causes Codex to fail with HTTP 400.
+DEFAULT_CODEX_MODEL = ""
 
 
 def codex_available() -> bool:
@@ -24,7 +27,7 @@ def codex_bin() -> Optional[str]:
 
 
 def codex_model() -> str:
-    return os.getenv(CODEX_MODEL_ENV, DEFAULT_CODEX_MODEL).strip() or DEFAULT_CODEX_MODEL
+    return os.getenv(CODEX_MODEL_ENV, DEFAULT_CODEX_MODEL).strip()
 
 
 def build_codex_cmd(read_only: bool, cwd: Optional[str] = None) -> list[str]:
@@ -34,21 +37,26 @@ def build_codex_cmd(read_only: bool, cwd: Optional[str] = None) -> list[str]:
 
     work_dir = str(Path(cwd).expanduser()) if cwd else os.getcwd()
     sandbox = "read-only" if read_only else "danger-full-access"
-    return [
+    # NOTE: The old `-a never` (approval-policy) flag was removed from
+    # `codex exec` in a recent version.  In non-interactive `exec` mode
+    # approvals are not prompted, so the flag is no longer needed.
+    cmd: list[str] = [
         bin_path,
         "exec",
-        "-m",
-        codex_model(),
         "--skip-git-repo-check",
         "--ephemeral",
         "-C",
         work_dir,
         "-s",
         sandbox,
-        "-a",
-        "never",
-        "-",
     ]
+    # Only pass -m if an explicit model override is configured.
+    # Otherwise let Codex use the model from ~/.codex/config.toml.
+    model = codex_model()
+    if model:
+        cmd.extend(["-m", model])
+    cmd.append("-")
+    return cmd
 
 
 def run_codex(
