@@ -13,7 +13,7 @@
  *
  * Or as a plain <script> tag (no bundler):
  *   <script src="/sofia-browser.js"></script>
- *   <script>SofiaSDK.init({ serviceId: 'pantalla', serviceName: 'Pantalla' })</script>
+ *   <script>SofiaSDK.init({ serviceId: 'mayor', serviceName: 'Mayor' })</script>
  */
 
 const DEFAULT_URL = 'http://localhost:5180/api/ingest/event'

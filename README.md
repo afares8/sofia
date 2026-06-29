@@ -8,7 +8,7 @@ Sistema de monitoreo centralizado para todas tus aplicaciones. Inspirado en Sent
 
 | Feature | Descripción |
 |---|---|
-| **Health checks** | Verifica cada N segundos si tus servicios (Mayor, Packing, Pantalla, Cortana, WppConnect) están vivos |
+| **Health checks** | Verifica cada N segundos si tus servicios (Mayor, Packing, WppConnect) están vivos |
 | **Monitor pasivo** | Lee los archivos de log de cada app y detecta líneas `ERROR` / `CRITICAL` automáticamente |
 | **Monitor activo (SDK)** | Un middleware de una línea que puedes agregar a cualquier app FastAPI para reportar errores en tiempo real |
 | **Dashboard** | Vista en tiempo real del estado de cada servicio con tiempo de respuesta y último error |
@@ -112,8 +112,6 @@ La primera vez que arranca, Sofia crea `backend/data/config.json` con los servic
 
 - **Mayor** → `http://localhost:8075/health`
 - **Packing** → `http://localhost:8100/health`
-- **Pantalla** → `http://localhost:8000/health`
-- **Cortana** → `http://localhost:8200/health`
 - **WppConnect** → `http://localhost:21465/api/default/status-session`
 
 Todo se puede modificar desde la UI en **Configuración**.
@@ -125,7 +123,7 @@ Todo se puede modificar desde la UI en **Configuración**.
 Copia `sdk/sofia_sdk.py` a tu proyecto y agrega **una línea** a tu `main.py`:
 
 ```python
-# En main.py de mayor / packing / pantalla
+# En main.py de mayor / packing
 from sofia_sdk import SofiaMiddleware
 
 app.add_middleware(

@@ -5,7 +5,7 @@ Flow:
   1. health_service detects DOWN â†’ calls notify_down_with_restore_prompt()
   2. If the service has auto_restore=True, Sofia restarts it without asking.
      Otherwise Sofia sends WA: "ðŸ”´ <name> caÃ­do. Responde *SI <ID>* para restaurar."
-  3. User replies "SI MAYOR" (or SI PACKING, SI PANTALLA)
+  3. User replies "SI MAYOR" (or SI PACKING)
   4. wpp_webhook router calls handle_incoming_message(sender, text)
   5. If valid: launches Codex in write mode with
      full context about the service, how it starts, what to check, etc.
@@ -85,20 +85,6 @@ SERVICE_CONTEXT = {
             "If not responding, check if Mayor already started it (they share the same DIAPI process)."
         ),
     },
-    "pantalla": {
-        "port": 8000,
-        "health_url": "http://192.168.0.123:8000/healthz",
-        "work_dir": r"D:\Pantalla\backend",
-        "start_cmd": "poetry run python run.py",
-        "extra": "Pantalla is a display/dashboard service. No special middleware required.",
-    },
-    "cortana": {
-        "port": 8200,
-        "health_url": "http://192.168.0.123:8200/healthz",
-        "work_dir": r"D:\Cortana\backend",
-        "start_cmd": "poetry run uvicorn app.main:app --host 0.0.0.0 --port 8200 --reload",
-        "extra": "Cortana backend.",
-    },
     "mayor_frontend": {
         "port": 5175,
         "health_url": "https://127.0.0.1:5175",
@@ -112,20 +98,6 @@ SERVICE_CONTEXT = {
         "work_dir": r"D:\packing\frontend",
         "start_cmd": "npm start",
         "extra": "Packing frontend React dev server.",
-    },
-    "pantalla_frontend": {
-        "port": 5173,
-        "health_url": "http://127.0.0.1:5173",
-        "work_dir": r"D:\Pantalla\frontend",
-        "start_cmd": "npm run dev",
-        "extra": "Pantalla frontend Vite dev server.",
-    },
-    "cortana_frontend": {
-        "port": 5174,
-        "health_url": "http://127.0.0.1:5174",
-        "work_dir": r"D:\Cortana\frontend",
-        "start_cmd": "npm run dev",
-        "extra": "Cortana frontend Vite dev server.",
     },
     "sofia_frontend": {
         "port": 5179,
