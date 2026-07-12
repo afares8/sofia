@@ -61,10 +61,10 @@ class AlertRule(BaseModel):
 
 class AutonomyConfig(BaseModel):
     enabled: bool = False
-    kill_switch: bool = False
-    default_level: int = 1
+    kill_switch: bool = True
+    default_level: int = 0
     sandbox_root: str = "D:/sofia_sandboxes"
-    auto_create_jobs_from_issues: bool = True
+    auto_create_jobs_from_issues: bool = False
     auto_fix_issue_min_count: int = 10
     auto_fix_loop_minutes: int = 15
     max_actions_per_hour: int = 5
@@ -85,10 +85,10 @@ class AutonomyConfig(BaseModel):
     #   "pr"     → push the work branch to origin and open a GitHub PR (gh CLI)
     #   "branch" → push the work branch to origin, no PR
     #   "manual" → do nothing automatically; promote only via the UI button
-    promotion_mode: str = "pr"
+    promotion_mode: str = "manual"
     # Auto-promote verified fixes when the verifier marks them as low risk.
     # medium/high-risk fixes always wait for manual promotion from the UI.
-    auto_promote_low_risk: bool = True
+    auto_promote_low_risk: bool = False
     # A job stuck in 'running' longer than this is force-failed by the watchdog.
     job_timeout_minutes: int = 30
     allowed_paths: List[str] = ["backend/app/", "frontend/src/", "sdk/"]
@@ -120,7 +120,7 @@ class AppRepoConfig(BaseModel):
     path: str
     enabled: bool = True
     branch: str = "main"
-    autonomy_level: int = 1
+    autonomy_level: int = 0
     autofix_enabled: bool = False
     test_commands: List[str] = []
     build_commands: List[str] = []
@@ -254,7 +254,8 @@ DEFAULT_APP_REPOS: List[AppRepoConfig] = [
         id="sofia",
         name="Sofia Monitor",
         path="D:/sofia",
-        autonomy_level=3,
+        autonomy_level=0,
+        autofix_enabled=False,
         test_commands=["python -m compileall -q backend/app", "npm --prefix frontend run build"],
         smoke_urls=["http://192.168.0.123:5180/api/ping"],
         allowed_paths=["backend/app/", "frontend/src/", "sdk/"],
@@ -263,8 +264,8 @@ DEFAULT_APP_REPOS: List[AppRepoConfig] = [
         id="mayor",
         name="Mayor",
         path="D:/mayor",
-        autonomy_level=3,
-        autofix_enabled=True,
+        autonomy_level=0,
+        autofix_enabled=False,
         smoke_urls=["http://192.168.0.123:8075/health", "http://localhost:9000/api/Health/Ping"],
         allowed_paths=["backend/", "frontend/src/", "sdk/"],
     ),
@@ -272,8 +273,8 @@ DEFAULT_APP_REPOS: List[AppRepoConfig] = [
         id="packing",
         name="Packing",
         path="D:/packing",
-        autonomy_level=3,
-        autofix_enabled=True,
+        autonomy_level=0,
+        autofix_enabled=False,
         smoke_urls=["http://192.168.0.123:8100/health", "http://localhost:9000/api/Health/Ping"],
         allowed_paths=["backend/", "frontend/src/", "sdk/"],
     ),
