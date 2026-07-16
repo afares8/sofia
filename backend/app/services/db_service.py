@@ -433,6 +433,52 @@ async def get_error_count(service_id: Optional[str] = None, window_minutes: int 
         return int(row["n"]) if row else 0
 
 
+async def get_recent_error_summary(
+    service_id: Optional[str] = None,
+    window_minutes: int = 60,
+    max_issues: int = 5,
+) -> List[dict]:
+    """Return a summary of recent ERROR/CRITICAL issues for spike alerts.
+
+    Groups occurrences by issue (fingerprint) and returns the top issues by
+    occurrence count in the time window. Each dict has:
+        message, level, count, last_seen, detail
+    """
+    since = (datetime.utcnow() - timedelta(minutes=window_minutes)).isoformat()
+    query = (
+        "SELECT i.message, i.level, i.detail, "
+        "  COUNT(o.id) AS occ_count, "
+        "  MAX(o.timestamp) AS last_seen "
+        "FROM occurrences o "
+        "JOIN issues i ON o.issue_id = i.id "
+        "WHERE o.timestamp >= ? AND i.level IN ('ERROR','CRITICAL')"
+    )
+    params: list = [since]
+    if service_id:
+        query += " AND i.service_id = ?"
+        params.append(service_id)
+    query += (
+        " GROUP BY i.id "
+        " ORDER BY occ_count DESC, last_seen DESC "
+        " LIMIT ?"
+    )
+    params.append(max_issues)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(query, params)).fetchall()
+        return [
+            {
+                "message": r["message"],
+                "level": r["level"],
+                "count": int(r["occ_count"]),
+                "last_seen": r["last_seen"],
+                "detail": r["detail"] or "",
+            }
+            for r in rows
+        ]
+
+
 # ── Metrics ──────────────────────────────────────────────────────────────────
 
 

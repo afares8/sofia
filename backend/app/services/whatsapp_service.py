@@ -105,7 +105,7 @@ async def send_alert(
         f"*Mensaje:* {message}\n"
     )
     if detail:
-        text += f"*Detalle:* {detail[:300]}\n"
+        text += f"*Detalle:* {detail[:1500]}\n"
     text += f"_🕐 {now}_"
 
     phone = _format_phone(alert_cfg.whatsapp_number)

@@ -78,11 +78,32 @@ async def spike_detection_loop():
                     continue
                 _spike_cooldown[svc.id] = datetime.utcnow()
                 count = await get_error_rate(svc.id, 60)
+
+                # Fetch the actual error messages so the alert is actionable
+                # instead of just saying "4 errors in 1h" with no details.
+                try:
+                    recent_errors = await db_service.get_recent_error_summary(
+                        svc.id, window_minutes=60, max_issues=5,
+                    )
+                except Exception as exc:
+                    logger.warning(f"[ANALYTICS] Could not fetch error summary for spike alert: {exc}")
+                    recent_errors = []
+
+                detail_lines = [f"{count} errores en la última hora (>3x del promedio)."]
+                if recent_errors:
+                    detail_lines.append("")
+                    detail_lines.append("Errores detectados:")
+                    for err in recent_errors:
+                        msg = err["message"][:120]
+                        occ = err["count"]
+                        detail_lines.append(f"  - ({occ}x) {msg}")
+                detail = "\n".join(detail_lines)
+
                 logger.warning(f"[ANALYTICS] Spike detected for {svc.id}: {count} errors in 1h")
                 await whatsapp_service.send_alert(
                     cfg.alerts, svc.name, svc.id, "WARNING",
                     f"📈 Spike de errores en {svc.name}",
-                    f"{count} errores en la última hora (>3x del promedio).",
+                    detail,
                 )
         except Exception as exc:
             logger.error(f"[ANALYTICS] loop iteration failed: {exc}")

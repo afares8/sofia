@@ -77,7 +77,20 @@ async def _evaluate_for_service(rule: AlertRule, svc: ServiceConfig) -> Optional
         spiked = await analytics_service.detect_spike(svc.id, multiplier=rule.threshold or 3.0)
         if spiked:
             count = await analytics_service.get_error_rate(svc.id, 60)
-            return f"Spike de errores: {count} en 1h (>{rule.threshold}x baseline)."
+            # Include the actual error messages so the alert is actionable
+            try:
+                recent_errors = await db_service.get_recent_error_summary(
+                    svc.id, window_minutes=60, max_issues=5,
+                )
+            except Exception:
+                recent_errors = []
+            lines = [f"Spike de errores: {count} en 1h (>{rule.threshold}x baseline)."]
+            if recent_errors:
+                lines.append("")
+                lines.append("Errores detectados:")
+                for err in recent_errors:
+                    lines.append(f"  - ({err['count']}x) {err['message'][:120]}")
+            return "\n".join(lines)
         return None
 
     logger.warning(f"[RULES] Unknown condition_type: {rule.condition_type}")
