@@ -279,14 +279,35 @@ async def upsert_event(event: ErrorEvent) -> Tuple[int, bool, bool]:
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=5000")
         db.row_factory = aiosqlite.Row
-        row = await (await db.execute(
-            "SELECT id, count, notified, resolved FROM issues WHERE fingerprint = ?", (fp,)
-        )).fetchone()
 
-        is_regression = False
-        if row:
-            # Update existing issue
+        # Atomic upsert: INSERT OR IGNORE acquires the write lock, serializing
+        # concurrent requests for the same fingerprint. This prevents the race
+        # condition where two requests both SELECT (no row), then both INSERT
+        # (UNIQUE constraint violation).
+        cursor = await db.execute(
+            """INSERT OR IGNORE INTO issues
+               (fingerprint, service_id, service_name, level, message,
+                detail, traceback, url, user_info, source,
+                first_seen, last_seen, tags, environment, release)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (fp, event.service_id, event.service_name, event.level,
+             event.message, event.detail, event.traceback,
+             event.url, event.user_info, event.source, ts, ts,
+             event.tags, event.environment, event.release),
+        )
+        is_new = cursor.rowcount > 0
+
+        if is_new:
+            issue_id = cursor.lastrowid
+            is_regression = False
+        else:
+            # Row already existed (either just now or from before) — read and update
+            row = await (await db.execute(
+                "SELECT id, resolved FROM issues WHERE fingerprint = ?", (fp,)
+            )).fetchone()
+            issue_id = row["id"]
             is_regression = bool(row["resolved"])
             await db.execute(
                 """UPDATE issues SET
@@ -304,23 +325,6 @@ async def upsert_event(event: ErrorEvent) -> Tuple[int, bool, bool]:
                 (ts, event.detail, event.traceback, event.url, event.user_info,
                  event.tags, event.environment, event.release, fp),
             )
-            issue_id = row["id"]
-            is_new = False
-        else:
-            # New issue
-            cursor = await db.execute(
-                """INSERT INTO issues
-                   (fingerprint, service_id, service_name, level, message,
-                    detail, traceback, url, user_info, source,
-                    first_seen, last_seen, tags, environment, release)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (fp, event.service_id, event.service_name, event.level,
-                 event.message, event.detail, event.traceback,
-                 event.url, event.user_info, event.source, ts, ts,
-                 event.tags, event.environment, event.release),
-            )
-            issue_id = cursor.lastrowid
-            is_new = True
 
         # Always log raw occurrence (breadcrumbs passed separately via insert_occurrence)
         await db.execute(
