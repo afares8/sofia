@@ -64,6 +64,9 @@ SERVICE_CONTEXT = {
         "health_url": "http://192.168.0.123:8075/health",
         "work_dir": r"D:\mayor\backend",
         "start_cmd": r"C:\Users\ahmed\AppData\Local\Programs\Python\Python312\python.exe run.py",
+        # Mayor also manages the SAP DIAPI middleware on port 9000 — kill orphans
+        # there too so a stale DIAPI process doesn't block Mayor's startup.
+        "extra_kill_ports": [9000],
         "extra": (
             "Mayor also manages a SAP DI API middleware (.NET) that starts automatically "
             "when the backend starts. After Mayor is up, verify the DIAPI middleware at "
@@ -534,6 +537,7 @@ async def _run_start_command(service_id: str) -> tuple[bool, str]:
     work_dir = ctx.get("work_dir")
     start_cmd = ctx.get("start_cmd")
     health_url = ctx.get("health_url")
+    port = ctx.get("port")
     if not work_dir or not start_cmd:
         return False, "START_COMMAND_NOT_CONFIGURED"
     if not Path(work_dir).exists():
@@ -544,9 +548,34 @@ async def _run_start_command(service_id: str) -> tuple[bool, str]:
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         log_file = log_dir / f"sofia_recovery_{stamp}.log"
         script_file = log_dir / f"sofia_recovery_{stamp}.ps1"
+
+        # Build port-cleanup block so a stale/orphan process holding the port
+        # doesn't cause WinError 10013 (socket access forbidden) on startup.
+        # This mirrors the logic in app/scripts/restore_<service>.ps1.
+        kill_ports = []
+        if port:
+            kill_ports.append(port)
+        kill_ports.extend(ctx.get("extra_kill_ports", []))
+        cleanup_lines = []
+        for kp in kill_ports:
+            cleanup_lines.append(
+                f"# Kill orphans on port {kp}\n"
+                f"$pids_{kp} = (netstat -ano | Select-String \":{kp}\\s\") |\n"
+                f"    ForEach-Object {{ ($_ -split '\\s+')[-1] }} | Sort-Object -Unique\n"
+                f"foreach ($procId in $pids_{kp}) {{\n"
+                f"    if ($procId -match '^\\d+$') {{\n"
+                f"        Write-Host \"  Terminando PID $procId (puerto {kp})...\"\n"
+                f"        taskkill /F /PID $procId 2>$null\n"
+                f"    }}\n"
+                f"}}\n"
+            )
+        cleanup_block = "".join(cleanup_lines)
+
         script_file.write_text(
             "$ErrorActionPreference = 'Continue'\n"
             f"Set-Location -LiteralPath {_ps_quote(str(work_dir))}\n"
+            f"{cleanup_block}"
+            "Start-Sleep -Seconds 3\n"
             f"{start_cmd} *>&1 | Tee-Object -FilePath {_ps_quote(str(log_file))}\n",
             encoding="utf-8",
         )
