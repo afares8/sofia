@@ -15,7 +15,7 @@ from app.routers import health, events, ingest, logs, config, webhook, restore, 
 from app.services.alert_queue import alert_queue_loop
 from app.services.analytics_service import spike_detection_loop
 from app.services.config_service import load_config
-from app.services.db_service import init_db, purge_old_events
+from app.services.db_service import init_db, purge_old_events, purge_failed_alerts
 from app.services.health_service import poll_loop
 from app.services.log_service import log_poll_loop
 from app.services.nightly_review_service import nightly_loop
@@ -40,23 +40,35 @@ AUTH_EXEMPT_PREFIXES = (
 async def _register_wppconnect_webhook():
     """Register Sofia's webhook URL in WPPConnect so it receives incoming messages."""
     import httpx
+    from app.services.whatsapp_service import get_auth_headers
     await asyncio.sleep(5)  # Wait for WPPConnect to be ready
     cfg = load_config()
     sofia_external_url = os.getenv("SOFIA_EXTERNAL_URL", "http://localhost:5180").rstrip("/")
     webhook_url = f"{sofia_external_url}/api/webhook/wppconnect"
     url = f"{cfg.alerts.wppconnect_url}/api/{cfg.alerts.wppconnect_session}/webhook"
-    headers = {"Authorization": f"Bearer {cfg.alerts.wppconnect_token}"}
     payload = {"webhook": webhook_url, "events": ["onMessage", "onAnyMessage"]}
     try:
+        # Use get_auth_headers which generates a fresh token via generate-token,
+        # instead of the static (often empty) wppconnect_token config field.
+        # The old code built "Bearer " with an empty token, producing an illegal
+        # header value error and a 401/404 from WPPConnect that was logged as
+        # "registered" — masking the failure.
+        headers = await get_auth_headers(cfg.alerts)
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(url, json=payload, headers=headers)
-            logger.info(f"[WEBHOOK] WPPConnect webhook registered: {resp.status_code} — {webhook_url}")
+            if resp.status_code < 300:
+                logger.info(f"[WEBHOOK] WPPConnect webhook registered: {resp.status_code} — {webhook_url}")
+            else:
+                logger.warning(
+                    f"[WEBHOOK] WPPConnect webhook registration FAILED: "
+                    f"status={resp.status_code} body={resp.text[:200]} — {webhook_url}"
+                )
     except Exception as exc:
         logger.warning(f"[WEBHOOK] Could not register WPPConnect webhook (WPPConnect may not be running): {exc}")
 
 
 async def _auto_purge_loop():
-    """Delete old occurrences/metrics/issues once a day."""
+    """Delete old occurrences/metrics/issues and failed alert_queue rows once a day."""
     PURGE_INTERVAL_SECONDS = 24 * 60 * 60
     # Wait 5 minutes after startup before first purge
     await asyncio.sleep(5 * 60)
@@ -67,6 +79,12 @@ async def _auto_purge_loop():
             logger.info(f"[PURGE] Old events purged (retention={cfg.error_retention_days}d).")
         except Exception as exc:
             logger.error(f"[PURGE] failed: {exc}")
+        try:
+            deleted = await purge_failed_alerts()
+            if deleted:
+                logger.info(f"[PURGE] Purged {deleted} failed alert_queue rows (attempts>=10).")
+        except Exception as exc:
+            logger.error(f"[PURGE] alert_queue purge failed: {exc}")
         await asyncio.sleep(PURGE_INTERVAL_SECONDS)
 
 
@@ -83,7 +101,6 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(autofix_loop())
     asyncio.create_task(job_watchdog_loop())
     asyncio.create_task(_auto_purge_loop())
-    asyncio.create_task(_register_wppconnect_webhook())
     logger.info("Sofia Monitor started.")
     yield
     logger.info("Sofia Monitor shutting down.")

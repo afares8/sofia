@@ -14,7 +14,7 @@ $SOFIA_URL  = $env:SOFIA_URL
 if (-not $SOFIA_URL)  { $SOFIA_URL  = "http://localhost:5180/api/ping" }
 
 $START_BAT  = $env:SOFIA_START_BAT
-if (-not $START_BAT)  { $START_BAT  = "D:\sofia\start.bat" }
+if (-not $START_BAT)  { $START_BAT  = "C:\Users\ahmed\apps\sofia\start.bat" }
 
 $STATE_FILE = $env:SOFIA_WATCHDOG_STATE
 if (-not $STATE_FILE) { $STATE_FILE = Join-Path $env:TEMP "sofia_watchdog.state" }

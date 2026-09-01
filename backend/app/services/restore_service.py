@@ -62,7 +62,7 @@ SERVICE_CONTEXT = {
     "mayor": {
         "port": 8075,
         "health_url": "http://192.168.0.123:8075/health",
-        "work_dir": r"D:\mayor\backend",
+        "work_dir": r"C:\Users\ahmed\apps\mayor\backend",
         "start_cmd": r"C:\Users\ahmed\AppData\Local\Programs\Python\Python312\python.exe run.py",
         # Mayor also manages the SAP DIAPI middleware on port 9000 — kill orphans
         # there too so a stale DIAPI process doesn't block Mayor's startup.
@@ -72,7 +72,7 @@ SERVICE_CONTEXT = {
             "when the backend starts. After Mayor is up, verify the DIAPI middleware at "
             "http://localhost:9000/api/Health/Ping responds with HTTP 200. "
             "The middleware executable is at "
-            r"D:\mayor\sap-diapi-middleware\SapDiApiMiddleware\bin\x86\Release\net48\SapDiApiMiddleware.exe "
+            r"C:\Users\ahmed\apps\mayor\sap-diapi-middleware\SapDiApiMiddleware\bin\x86\Release\net48\SapDiApiMiddleware.exe "
             "(also check Debug path if Release doesn't exist). "
             "If DIAPI is not responding, try starting SapDiApiMiddleware.exe directly."
         ),
@@ -80,7 +80,7 @@ SERVICE_CONTEXT = {
     "packing": {
         "port": 8100,
         "health_url": "http://192.168.0.123:8100/health",
-        "work_dir": r"D:\packing\backend",
+        "work_dir": r"C:\Users\ahmed\apps\Packing\backend",
         "start_cmd": "python run.py",
         "extra": (
             "Packing also uses the SAP DI API middleware. After Packing is up, verify "
@@ -91,35 +91,35 @@ SERVICE_CONTEXT = {
     "mayor_frontend": {
         "port": 5175,
         "health_url": "https://127.0.0.1:5175",
-        "work_dir": r"D:\mayor\frontend",
+        "work_dir": r"C:\Users\ahmed\apps\mayor\frontend",
         "start_cmd": "npm run dev",
         "extra": "Mayor frontend Vite dev server.",
     },
     "packing_frontend": {
         "port": 3000,
         "health_url": "https://127.0.0.1:3000",
-        "work_dir": r"D:\packing\frontend",
+        "work_dir": r"C:\Users\ahmed\apps\Packing\frontend",
         "start_cmd": "npm start",
         "extra": "Packing frontend React dev server.",
     },
     "sofia_frontend": {
         "port": 5179,
         "health_url": "http://127.0.0.1:5179",
-        "work_dir": r"D:\sofia\frontend",
+        "work_dir": r"C:\Users\ahmed\apps\sofia\frontend",
         "start_cmd": "npm run dev",
         "extra": "Sofia frontend Vite dev server.",
     },
     "wppconnect": {
         "port": 21465,
         "health_url": "http://192.168.0.123:21465/api/default/status-session",
-        "work_dir": r"D:\wppconnect-server",
+        "work_dir": r"C:\Users\ahmed\apps\wppconnect-server",
         "start_cmd": "npm run dev",
         "extra": "WPPConnect server with WhatsApp browser session.",
     },
     "diapi": {
         "port": 9000,
         "health_url": "http://localhost:9000/api/Health/Ping",
-        "work_dir": r"D:\mayor\sap-diapi-middleware\SapDiApiMiddleware\bin\x86\Release\net48",
+        "work_dir": r"C:\Users\ahmed\apps\mayor\sap-diapi-middleware\SapDiApiMiddleware\bin\x86\Release\net48",
         "start_cmd": r".\SapDiApiMiddleware.exe",
         "extra": "SAP DIAPI middleware shared by Mayor and Packing.",
     },
@@ -348,7 +348,7 @@ def _build_codex_prompt(service_id: str, service_name: str) -> str:
     ctx = SERVICE_CONTEXT.get(service_id, {})
     port      = ctx.get("port", "unknown")
     health    = ctx.get("health_url", f"http://192.168.0.123:{port}/health")
-    work_dir  = ctx.get("work_dir", f"D:\\{service_id}\\backend")
+    work_dir  = ctx.get("work_dir", f"C:\\Users\\ahmed\\apps\\{service_id}\\backend")
     start_cmd = ctx.get("start_cmd", "python run.py")
     extra     = ctx.get("extra", "")
 

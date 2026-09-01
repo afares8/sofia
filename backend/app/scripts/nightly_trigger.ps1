@@ -3,10 +3,10 @@
 # Registrar en Task Scheduler para ejecutar a medianoche.
 #
 # Para instalar la tarea automáticamente ejecuta como Administrador:
-#   PowerShell -ExecutionPolicy Bypass -File D:\sofia\backend\app\scripts\nightly_trigger.ps1 -Install
+#   PowerShell -ExecutionPolicy Bypass -File C:\Users\ahmed\apps\sofia\backend\app\scripts\nightly_trigger.ps1 -Install
 #
 # Para ejecutar manualmente:
-#   PowerShell -ExecutionPolicy Bypass -File D:\sofia\backend\app\scripts\nightly_trigger.ps1
+#   PowerShell -ExecutionPolicy Bypass -File C:\Users\ahmed\apps\sofia\backend\app\scripts\nightly_trigger.ps1
 
 param(
     [switch]$Install
@@ -52,7 +52,7 @@ if ($Install) {
 }
 
 # ── Run mode: call the API ────────────────────────────────────────────────────
-$log = "D:\sofia\backend\logs\nightly_trigger.log"
+$log = "C:\Users\ahmed\apps\sofia\backend\logs\nightly_trigger.log"
 $ts  = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
 function Log($msg) {

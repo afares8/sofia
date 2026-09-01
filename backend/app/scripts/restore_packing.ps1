@@ -2,7 +2,7 @@
 $ErrorActionPreference = "Stop"
 $Port = 8100
 $HealthUrl = "http://192.168.0.123:8100/health"
-$WorkDir = "D:\packing\backend"
+$WorkDir = "C:\Users\ahmed\apps\Packing\backend"
 $TimeoutSeconds = 180
 $CheckInterval = 5
 

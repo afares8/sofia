@@ -45,13 +45,14 @@ async def check_service(svc: ServiceConfig) -> ServiceStatus:
     http_ok = False
     status_code = None
     response_ms = None
+    is_wppconnect = "21465" in svc.url or "wppconnect" in svc.id
     try:
         start = asyncio.get_event_loop().time()
         async with httpx.AsyncClient(timeout=svc.timeout_seconds, verify=False, follow_redirects=True) as client:
             headers = {}
-            if "21465" in svc.url or "wppconnect" in svc.id:
+            if is_wppconnect:
                 cfg = load_config()
-                headers["Authorization"] = f"Bearer {cfg.alerts.wppconnect_token}"
+                headers = await whatsapp_service.get_auth_headers(cfg.alerts)
             resp = await client.get(svc.url, headers=headers)
             if resp.status_code == 404 and svc.url.rstrip("/").endswith("/health"):
                 fallback_url = svc.url.rstrip("/") + "z"
@@ -61,6 +62,14 @@ async def check_service(svc: ServiceConfig) -> ServiceStatus:
         response_ms = round((asyncio.get_event_loop().time() - start) * 1000, 1)
         status_code = resp.status_code
         http_ok = resp.status_code == svc.expected_status or resp.status_code < 500
+        if is_wppconnect and http_ok:
+            try:
+                raw_status = resp.json().get("status")
+                http_ok = raw_status is True or str(raw_status).upper() in {
+                    "TRUE", "CONNECTED", "1", "YES"
+                }
+            except Exception:
+                http_ok = False
     except Exception as exc:
         logger.warning(f"[HEALTH] {svc.name} unreachable: {exc}")
 

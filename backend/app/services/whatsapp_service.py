@@ -3,6 +3,7 @@ WhatsApp alert service via wppconnect.
 Sends alerts to configured number with cooldown to prevent spam.
 If WPPConnect is unreachable, alerts are queued in SQLite for later delivery.
 """
+import asyncio
 import httpx
 import logging
 from datetime import datetime, timedelta
@@ -14,6 +15,54 @@ logger = logging.getLogger("sofia.whatsapp")
 # In-memory cooldown tracker: {alert_key: last_sent_datetime}
 _cooldown: Dict[str, datetime] = {}
 _hourly_sent: Dict[str, list[datetime]] = {}
+_session_token: Optional[str] = None
+_token_lock: Optional[asyncio.Lock] = None
+
+
+async def get_wppconnect_token(alert_cfg: AlertConfig, force_refresh: bool = False) -> str:
+    global _session_token, _token_lock
+    if _session_token and not force_refresh:
+        return _session_token
+    if _token_lock is None:
+        _token_lock = asyncio.Lock()
+    async with _token_lock:
+        if _session_token and not force_refresh:
+            return _session_token
+        secret_key = alert_cfg.wppconnect_secret_key or alert_cfg.wppconnect_token
+        if not secret_key:
+            raise RuntimeError("WPPConnect secret key is not configured")
+        url = (
+            f"{alert_cfg.wppconnect_url}/api/{alert_cfg.wppconnect_session}/"
+            f"{secret_key}/generate-token"
+        )
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url)
+            resp.raise_for_status()
+            token = str(resp.json().get("token") or "")
+        if not token:
+            raise RuntimeError("WPPConnect generate-token returned no token")
+        _session_token = token
+        return token
+
+
+async def get_auth_headers(alert_cfg: AlertConfig, force_refresh: bool = False) -> dict[str, str]:
+    token = await get_wppconnect_token(alert_cfg, force_refresh=force_refresh)
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def get_connection_status(alert_cfg: AlertConfig) -> dict:
+    url = (
+        f"{alert_cfg.wppconnect_url}/api/{alert_cfg.wppconnect_session}/"
+        "check-connection-session"
+    )
+    headers = await get_auth_headers(alert_cfg)
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url, headers=headers)
+        if resp.status_code == 401:
+            headers = await get_auth_headers(alert_cfg, force_refresh=True)
+            resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
 
 
 def _cooldown_key(service_id: str, level: str) -> str:
@@ -47,10 +96,13 @@ def _format_phone(number: str) -> str:
 async def _post_message(alert_cfg: AlertConfig, phone: str, text: str) -> bool:
     """Single HTTP POST to WPPConnect. Returns True on success."""
     url = f"{alert_cfg.wppconnect_url}/api/{alert_cfg.wppconnect_session}/send-message"
-    headers = {"Authorization": f"Bearer {alert_cfg.wppconnect_token}"}
+    headers = await get_auth_headers(alert_cfg)
     payload = {"phone": phone, "message": text, "isGroup": False}
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code == 401:
+            headers = await get_auth_headers(alert_cfg, force_refresh=True)
+            resp = await client.post(url, json=payload, headers=headers)
         resp.raise_for_status()
     return True
 

@@ -4,10 +4,9 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
-import httpx
 from fastapi import APIRouter, HTTPException, Query
 
-from app.services import db_service
+from app.services import db_service, whatsapp_service
 from app.services.config_service import load_config
 from app.services.health_service import get_all_statuses, check_service
 from app.models.event import ServiceStatus
@@ -67,12 +66,13 @@ async def sofia_self_health() -> Dict:
     wpp_ok = False
     wpp_error: Optional[str] = None
     try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            resp = await client.get(
-                f"{cfg.alerts.wppconnect_url}/api/{cfg.alerts.wppconnect_session}/status-session",
-                headers={"Authorization": f"Bearer {cfg.alerts.wppconnect_token}"},
-            )
-            wpp_ok = resp.status_code < 500
+        wpp_status = await whatsapp_service.get_connection_status(cfg.alerts)
+        raw_status = wpp_status.get("status")
+        wpp_ok = raw_status is True or str(raw_status).upper() in {
+            "TRUE", "CONNECTED", "1", "YES"
+        }
+        if not wpp_ok:
+            wpp_error = str(wpp_status.get("message") or "Disconnected")
     except Exception as exc:
         wpp_error = str(exc)
 

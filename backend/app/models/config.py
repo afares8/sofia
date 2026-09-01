@@ -27,7 +27,8 @@ class AlertConfig(BaseModel):
     whatsapp_enabled: bool = True
     whatsapp_number: str = "50766662916"   # default: your number
     wppconnect_url: str = "http://localhost:21465"
-    wppconnect_token: str = "THISISMYSECURETOKEN"
+    wppconnect_token: str = ""
+    wppconnect_secret_key: str = os.getenv("WPP_SECRET_KEY", "THISISMYSECURETOKEN")
     wppconnect_session: str = "default"
     cooldown_minutes: int = 10           # don't spam same alert twice
     max_messages_per_hour: int = 8
@@ -63,7 +64,7 @@ class AutonomyConfig(BaseModel):
     enabled: bool = False
     kill_switch: bool = True
     default_level: int = 0
-    sandbox_root: str = "D:/sofia_sandboxes"
+    sandbox_root: str = "C:/Users/ahmed/apps/sofia_sandboxes"
     auto_create_jobs_from_issues: bool = False
     auto_fix_issue_min_count: int = 10
     auto_fix_loop_minutes: int = 15
@@ -144,9 +145,9 @@ class GithubSyncConfig(BaseModel):
     max_files_per_repo: int = 50
     blocked_paths: List[str] = [".env", "data/", "logs/", "__pycache__/", ".pyc", ".pytest_cache/", ".coverage", "node_modules/", "dist/", ".git/"]
     repos: List[GithubSyncRepo] = [
-        GithubSyncRepo(id="sofia", path="D:/sofia", enabled=False),
-        GithubSyncRepo(id="mayor", path="D:/mayor", enabled=False),
-        GithubSyncRepo(id="packing", path="D:/packing", enabled=False),
+        GithubSyncRepo(id="sofia", path="C:/Users/ahmed/apps/sofia", enabled=False),
+        GithubSyncRepo(id="mayor", path="C:/Users/ahmed/apps/mayor", enabled=False),
+        GithubSyncRepo(id="packing", path="C:/Users/ahmed/apps/Packing", enabled=False),
     ]
 
 
@@ -192,7 +193,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         id="mayor",
         name="Mayor",
         url=f"http://{_SOFIA_HOST_IP}:8075/health",
-        log_path="D:/mayor/backend/logs/app.log",
+        log_path="C:/Users/ahmed/apps/mayor/backend/logs/app.log",
         enabled=True,
         restore_enabled=True,
         auto_restore=False,
@@ -201,7 +202,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         id="packing",
         name="Packing",
         url=f"http://{_SOFIA_HOST_IP}:8100/health",
-        log_path="D:/packing/backend/logs/app.log",
+        log_path="C:/Users/ahmed/apps/Packing/backend/logs/app.log",
         enabled=True,
         restore_enabled=True,
         auto_restore=False,
@@ -209,7 +210,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
     ServiceConfig(
         id="wppconnect",
         name="WppConnect",
-        url=f"http://{_SOFIA_HOST_IP}:21465/api/default/status-session",
+        url=f"http://{_SOFIA_HOST_IP}:21465/api/default/check-connection-session",
         enabled=True,
         restore_enabled=True,
         auto_restore=False,
@@ -253,7 +254,7 @@ DEFAULT_APP_REPOS: List[AppRepoConfig] = [
     AppRepoConfig(
         id="sofia",
         name="Sofia Monitor",
-        path="D:/sofia",
+        path="C:/Users/ahmed/apps/sofia",
         autonomy_level=0,
         autofix_enabled=False,
         test_commands=["python -m compileall -q backend/app", "npm --prefix frontend run build"],
@@ -263,7 +264,7 @@ DEFAULT_APP_REPOS: List[AppRepoConfig] = [
     AppRepoConfig(
         id="mayor",
         name="Mayor",
-        path="D:/mayor",
+        path="C:/Users/ahmed/apps/mayor",
         autonomy_level=0,
         autofix_enabled=False,
         smoke_urls=["http://192.168.0.123:8075/health", "http://localhost:9000/api/Health/Ping"],
@@ -272,7 +273,7 @@ DEFAULT_APP_REPOS: List[AppRepoConfig] = [
     AppRepoConfig(
         id="packing",
         name="Packing",
-        path="D:/packing",
+        path="C:/Users/ahmed/apps/Packing",
         autonomy_level=0,
         autofix_enabled=False,
         smoke_urls=["http://192.168.0.123:8100/health", "http://localhost:9000/api/Health/Ping"],

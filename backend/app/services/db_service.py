@@ -643,13 +643,19 @@ async def enqueue_alert(phone: str, message: str) -> int:
         return int(cursor.lastrowid or 0)
 
 
-async def get_pending_alerts(max_attempts: int = 10) -> List[dict]:
+async def get_pending_alerts(
+    max_attempts: int = 10,
+    max_age_hours: int = 24,
+) -> List[dict]:
+    cutoff = (datetime.utcnow() - timedelta(hours=max_age_hours)).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL")
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute(
-            "SELECT * FROM alert_queue WHERE sent_at IS NULL AND attempts < ? ORDER BY id ASC",
-            (max_attempts,),
+            "SELECT * FROM alert_queue "
+            "WHERE sent_at IS NULL AND attempts < ? AND created_at >= ? "
+            "ORDER BY id ASC",
+            (max_attempts, cutoff),
         )).fetchall()
         return [dict(r) for r in rows]
 
@@ -673,6 +679,24 @@ async def mark_alert_failed(alert_id: int, error: str) -> None:
             (error[:500], alert_id),
         )
         await db.commit()
+
+
+async def purge_failed_alerts(max_attempts: int = 10) -> int:
+    """Delete alert_queue rows that exceeded max_attempts and were never sent.
+
+    Without this, the queue grows unboundedly while WPPConnect is down: each
+    failed alert stays forever with attempts=max, and flush_queue's `break`
+    on first failure prevents younger alerts from ever being tried.
+    Returns the number of rows deleted.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        cursor = await db.execute(
+            "DELETE FROM alert_queue WHERE sent_at IS NULL AND attempts >= ?",
+            (max_attempts,),
+        )
+        await db.commit()
+        return cursor.rowcount or 0
 
 
 # ── Nightly reports ──────────────────────────────────────────────────────────

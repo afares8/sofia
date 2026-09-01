@@ -8,7 +8,7 @@
 $ErrorActionPreference = "Stop"
 $Port = 8075
 $HealthUrl = "http://192.168.0.123:8075/health"
-$WorkDir = "D:\mayor\backend"
+$WorkDir = "C:\Users\ahmed\apps\mayor\backend"
 $PythonExe = "C:\Users\ahmed\AppData\Local\Programs\Python\Python312\python.exe"
 $TimeoutSeconds = 180
 $CheckInterval = 5
