@@ -129,6 +129,12 @@ async def send_message(alert_cfg: AlertConfig, text: str, phone: Optional[str] =
             await db_service.enqueue_alert(target_phone, text)
         except Exception as enq_exc:
             logger.error(f"[WA] enqueue_alert failed: {enq_exc}")
+        # Fallback: notify via email so the team is aware even when WhatsApp is down.
+        from app.services import email_alert_service
+        email_alert_service.send_fallback_email(
+            subject="[Sofia] Alerta WhatsApp no entregada",
+            body=f"No se pudo enviar el siguiente mensaje por WhatsApp:\n\n{text}\n\nError: {exc}",
+        )
         return False
 
 
@@ -180,6 +186,12 @@ async def send_alert(
             _cooldown[key] = datetime.utcnow()
         except Exception as enq_exc:
             logger.error(f"[WA] enqueue_alert failed: {enq_exc}")
+        # Fallback: notify via email so the team is aware even when WhatsApp is down.
+        from app.services import email_alert_service
+        email_alert_service.send_fallback_email(
+            subject=f"[Sofia] {level} — {service_name} ({service_id})",
+            body=f"La alerta no pudo enviarse por WhatsApp y fue encolada.\n\n{text}\n\nError: {exc}",
+        )
         return False
 
 
