@@ -23,11 +23,15 @@ Breadcrumbs:
     add_breadcrumb(category="auth", message="user logged in", data={"user_id": 42})
 """
 import asyncio
+import json
 import logging
+import os
+import tempfile
 import threading
 import time
 import traceback
 from collections import deque
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
 import httpx
@@ -47,14 +51,28 @@ BREADCRUMBS_MAX = 20
 _breadcrumbs: Deque[dict] = deque(maxlen=BREADCRUMBS_MAX)
 _breadcrumbs_lock = threading.Lock()
 
+# Disk spool: when Sofia is unreachable, events are appended to a local JSONL
+# file and replayed by a daemon flusher thread once Sofia comes back. This is
+# what makes remote monitoring robust — network partitions lose nothing.
+SPOOL_MAX_BYTES = 512 * 1024
+SPOOL_TRIM_ENTRIES = 500
+FLUSH_INTERVAL_SECONDS = 15
+_spool_dir: Optional[str] = None
+_spool_lock = threading.Lock()
+_flushers: set = set()
+_flushers_lock = threading.Lock()
+
+SLOW_REQUEST_MS_DEFAULT = 5000.0
+
 
 def configure(
     sofia_url: str = SOFIA_URL,
     environment: Optional[str] = None,
     release: Optional[str] = None,
     tags: Optional[Dict[str, Any]] = None,
+    spool_dir: Optional[str] = None,
 ):
-    global _sofia_url, _environment, _release, _default_tags
+    global _sofia_url, _environment, _release, _default_tags, _spool_dir
     _sofia_url = sofia_url
     if environment is not None:
         _environment = environment
@@ -62,6 +80,94 @@ def configure(
         _release = release
     if tags is not None:
         _default_tags = dict(tags)
+    if spool_dir is not None:
+        _spool_dir = spool_dir
+
+
+def _spool_file(service_id: str) -> Path:
+    directory = _spool_dir or os.environ.get("SOFIA_SPOOL_DIR") or tempfile.gettempdir()
+    return Path(directory) / f"sofia-spool-{service_id}.jsonl"
+
+
+def _spool_write(line: str, path: Path) -> None:
+    """Append one serialized payload line, trimming the head when over capacity."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _spool_lock:
+            if path.exists() and path.stat().st_size + len(line) > SPOOL_MAX_BYTES:
+                old = path.read_text(encoding="utf-8").splitlines(keepends=True)
+                path.write_text("".join(old[-SPOOL_TRIM_ENTRIES:]), encoding="utf-8")
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+    except Exception:
+        pass
+
+
+def _spool_append(payload: dict) -> None:
+    _spool_write(json.dumps(payload, separators=(",", ":")) + "\n", _spool_file(payload["service_id"]))
+
+
+def _spool_drain(service_id: str) -> None:
+    """Replay spooled events; failures are re-appended so nothing is lost.
+
+    The spool is renamed aside before posting (unique per pid) so appends
+    from other processes during the drain land in a fresh file — with
+    multi-worker servers (e.g. uvicorn --workers 4) nothing is dropped.
+    """
+    path = _spool_file(service_id)
+    drain_path = path.with_name(f"{path.name}.{os.getpid()}.drain")
+    with _spool_lock:
+        try:
+            # Re-merge drain files abandoned by dead processes.
+            for stale in path.parent.glob(f"{path.name}.*.drain"):
+                try:
+                    with path.open("a", encoding="utf-8") as fh:
+                        fh.write(stale.read_text(encoding="utf-8"))
+                    stale.unlink()
+                except Exception:
+                    pass
+            if not path.exists():
+                return
+            drain_path.unlink(missing_ok=True)
+            path.rename(drain_path)
+            lines = drain_path.read_text(encoding="utf-8").splitlines()
+            drain_path.unlink(missing_ok=True)
+        except Exception:
+            return
+    if not lines:
+        return
+    failed: List[str] = []
+    try:
+        with httpx.Client(timeout=3) as client:
+            for line in lines:
+                try:
+                    resp = client.post(_sofia_url, content=line, headers={"Content-Type": "application/json"})
+                    if resp.status_code >= 300:
+                        failed.append(line)
+                except Exception:
+                    failed.append(line)
+    except Exception:
+        failed = list(lines)
+    for line in failed:
+        _spool_write(line + "\n", path)
+
+
+def _flusher_loop(service_id: str) -> None:
+    while True:
+        try:
+            _spool_drain(service_id)
+        except Exception:
+            pass
+        time.sleep(FLUSH_INTERVAL_SECONDS)
+
+
+def _ensure_flusher(service_id: str) -> None:
+    """Start the per-service drain thread once (also replays stale spools after restart)."""
+    with _flushers_lock:
+        if service_id in _flushers:
+            return
+        _flushers.add(service_id)
+    threading.Thread(target=_flusher_loop, args=(service_id,), daemon=True, name=f"sofia-flush-{service_id}").start()
 
 
 def add_breadcrumb(
@@ -128,14 +234,18 @@ async def report_error(
     user_info: Optional[str] = None,
 ) -> bool:
     """Send an error event to Sofia Monitor. Never raises — safe to fire-and-forget."""
+    payload = _build_payload(service_id, service_name, level, message,
+                             detail, tb, url, user_info)
     try:
-        payload = _build_payload(service_id, service_name, level, message,
-                                 detail, tb, url, user_info)
         async with httpx.AsyncClient(timeout=3) as client:
-            await client.post(_sofia_url, json=payload)
+            resp = await client.post(_sofia_url, json=payload)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"Sofia returned {resp.status_code}")
         return True
     except Exception as exc:
-        logger.debug(f"[sofia_sdk] Could not report to Sofia: {exc}")
+        logger.debug(f"[sofia_sdk] Could not report to Sofia (spooled): {exc}")
+        _spool_append(payload)
+        _ensure_flusher(service_id)
         return False
 
 
@@ -150,14 +260,18 @@ def report_error_sync(
     user_info: Optional[str] = None,
 ) -> bool:
     """Sync version — use from logging handlers or non-async contexts."""
+    payload = _build_payload(service_id, service_name, level, message,
+                             detail, tb, url, user_info)
     try:
-        payload = _build_payload(service_id, service_name, level, message,
-                                 detail, tb, url, user_info)
         with httpx.Client(timeout=3) as client:
-            client.post(_sofia_url, json=payload)
+            resp = client.post(_sofia_url, json=payload)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"Sofia returned {resp.status_code}")
         return True
     except Exception as exc:
-        logger.debug(f"[sofia_sdk] Could not report to Sofia: {exc}")
+        logger.debug(f"[sofia_sdk] Could not report to Sofia (spooled): {exc}")
+        _spool_append(payload)
+        _ensure_flusher(service_id)
         return False
 
 
@@ -185,11 +299,15 @@ class SofiaMiddleware(BaseHTTPMiddleware):
         environment: Optional[str] = None,
         release: Optional[str] = None,
         tags: Optional[Dict[str, Any]] = None,
+        slow_ms: Optional[float] = None,
     ):
         super().__init__(app)
         self.service_id = service_id
         self.service_name = service_name
+        self.slow_ms = slow_ms if slow_ms is not None else float(
+            os.environ.get("SOFIA_SLOW_MS", str(SLOW_REQUEST_MS_DEFAULT)))
         configure(sofia_url, environment=environment, release=release, tags=tags)
+        _ensure_flusher(service_id)
 
     def _get_user(self, request: Request) -> Optional[str]:
         """Try to extract user info from JWT or headers."""
@@ -210,21 +328,33 @@ class SofiaMiddleware(BaseHTTPMiddleware):
         url = str(request.url)
         method = request.method
         user = self._get_user(request)
+        t0 = time.monotonic()
 
         try:
             response = await call_next(request)
+            duration_ms = (time.monotonic() - t0) * 1000
             # Drop a breadcrumb for every request
             add_breadcrumb(
                 category="http", level="info",
                 message=f"{method} {request.url.path} {response.status_code}",
                 data={"method": method, "url": str(request.url.path),
-                      "status_code": response.status_code},
+                      "status_code": response.status_code,
+                      "duration_ms": round(duration_ms, 1)},
             )
             if response.status_code >= 500:
                 asyncio.create_task(report_error(
                     self.service_id, self.service_name, "ERROR",
                     f"HTTP {response.status_code} — {method} {request.url.path}",
                     detail=f"Method: {method}\nURL: {url}",
+                    url=url, user_info=user,
+                ))
+            elif duration_ms > self.slow_ms:
+                # Message omits the duration so repeated slow hits on the same
+                # endpoint group into one issue (fingerprint = message hash).
+                asyncio.create_task(report_error(
+                    self.service_id, self.service_name, "WARNING",
+                    f"Slow request — {method} {request.url.path}",
+                    detail=f"Method: {method}\nURL: {url}\nDuration: {duration_ms:.0f}ms",
                     url=url, user_info=user,
                 ))
             return response
@@ -264,6 +394,7 @@ class SofiaLogHandler(logging.Handler):
         self.service_name = service_name
         self.min_level = min_level
         configure(sofia_url)
+        _ensure_flusher(service_id)
 
     def emit(self, record: logging.LogRecord):
         if record.levelno < self.min_level:

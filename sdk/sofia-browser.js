@@ -18,6 +18,9 @@
 
 const DEFAULT_URL = 'http://localhost:5180/api/ingest/event'
 const BREADCRUMBS_MAX = 20
+const QUEUE_KEY = 'sofia:queue'
+const QUEUE_MAX = 50
+const QUEUE_FLUSH_MS = 15000
 
 let _cfg = {
   serviceId: 'frontend',
@@ -27,6 +30,7 @@ let _cfg = {
   release: null,
   tags: null,
   enabled: true,
+  slowMs: 8000,
 }
 
 const _breadcrumbs = []
@@ -41,6 +45,65 @@ function addBreadcrumb(category, message, data, level = 'info') {
   })
   if (_breadcrumbs.length > BREADCRUMBS_MAX) {
     _breadcrumbs.splice(0, _breadcrumbs.length - BREADCRUMBS_MAX)
+  }
+}
+
+function _queueRead() {
+  try {
+    const raw = localStorage.getItem(QUEUE_KEY)
+    const arr = raw ? JSON.parse(raw) : []
+    return Array.isArray(arr) ? arr : []
+  } catch {
+    return []
+  }
+}
+
+function _queueWrite(arr) {
+  try {
+    if (arr.length === 0) localStorage.removeItem(QUEUE_KEY)
+    else localStorage.setItem(QUEUE_KEY, JSON.stringify(arr.slice(-QUEUE_MAX)))
+  } catch {}
+}
+
+function _enqueue(payload) {
+  const arr = _queueRead()
+  arr.push(payload)
+  _queueWrite(arr)
+}
+
+function _postPayload(payload, useBeacon = false) {
+  const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' })
+  // fetch is the primary path: its promise reports failure so the caller can
+  // queue for retry. sendBeacon has no delivery confirmation — use it only for
+  // the unload flush, or as a last resort when fetch is unavailable.
+  if (!useBeacon && typeof fetch !== 'undefined') {
+    return fetch(_cfg.sofiaUrl, { method: 'POST', body: blob, keepalive: true })
+      .then(() => true)
+      .catch(() => false)
+  }
+  if (typeof navigator !== 'undefined' && navigator.sendBeacon) {
+    return navigator.sendBeacon(_cfg.sofiaUrl, blob)
+  }
+  return false
+}
+
+function _beaconFlush() {
+  // pagehide/beforeunload: no time for promises — fire-and-forget via beacon.
+  const arr = _queueRead()
+  _queueWrite([])
+  for (const payload of arr) _postPayload(payload, true)
+}
+
+function _flushQueue() {
+  const arr = _queueRead()
+  if (arr.length === 0) return
+  _queueWrite([])
+  const survivors = []
+  let pending = 0
+  const done = () => { if (--pending === 0 && survivors.length) _queueWrite(_queueRead().concat(survivors)) }
+  for (const payload of arr) {
+    pending++
+    Promise.resolve(_postPayload(payload)).then((ok) => { if (!ok) survivors.push(payload); done() })
   }
 }
 
@@ -60,13 +123,7 @@ function _send(level, message, detail, stack, url) {
   if (_cfg.environment) payload.environment = _cfg.environment
   if (_cfg.release)     payload.release = _cfg.release
   if (_cfg.tags)        payload.tags = _cfg.tags
-  // Use sendBeacon if available (works even during page unload)
-  const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' })
-  if (typeof navigator !== 'undefined' && navigator.sendBeacon) {
-    navigator.sendBeacon(_cfg.sofiaUrl, blob)
-  } else if (typeof fetch !== 'undefined') {
-    fetch(_cfg.sofiaUrl, { method: 'POST', body: blob, keepalive: true }).catch(() => {})
-  }
+  Promise.resolve(_postPayload(payload)).then((ok) => { if (!ok) _enqueue(payload) })
 }
 
 function _hookFetch() {
@@ -79,9 +136,16 @@ function _hookFetch() {
     const t0 = Date.now()
     try {
       const resp = await orig(...args)
+      const duration_ms = Date.now() - t0
       addBreadcrumb('fetch', `${method} ${url} ${resp.status}`, {
-        method, url, status: resp.status, duration_ms: Date.now() - t0,
+        method, url, status: resp.status, duration_ms,
       }, resp.ok ? 'info' : 'warning')
+      // Message omits the duration so repeated slow calls to the same URL
+      // group into one issue (fingerprint = message hash).
+      if (duration_ms > _cfg.slowMs) {
+        _send('WARNING', `Slow fetch — ${method} ${url}`,
+          `Duration: ${duration_ms}ms\nStatus: ${resp.status}`, '', window.location.href)
+      }
       return resp
     } catch (err) {
       addBreadcrumb('fetch', `${method} ${url} FAILED`, {
@@ -104,15 +168,15 @@ function _hookNavigation() {
     })
   })
   // History API (pushState / replaceState) wrapper for SPAs
-  const origPush = history.pushState
-  history.pushState = function (...args) {
+  const origPush = window.history.pushState
+  window.history.pushState = function (...args) {
     addBreadcrumb('navigation', `pushState ${args[2]}`, { url: args[2] })
-    return origPush.apply(history, args)
+    return origPush.apply(window.history, args)
   }
-  const origReplace = history.replaceState
-  history.replaceState = function (...args) {
+  const origReplace = window.history.replaceState
+  window.history.replaceState = function (...args) {
     addBreadcrumb('navigation', `replaceState ${args[2]}`, { url: args[2] })
-    return origReplace.apply(history, args)
+    return origReplace.apply(window.history, args)
   }
 }
 
@@ -166,6 +230,12 @@ export function initSofia(options = {}) {
   _hookFetch()
   _hookNavigation()
   _hookClicks()
+
+  // 5. Offline queue: replay events captured while Sofia was unreachable
+  _flushQueue()
+  setInterval(_flushQueue, QUEUE_FLUSH_MS)
+  window.addEventListener('online', _flushQueue)
+  window.addEventListener('pagehide', _beaconFlush)
 
   console.info('[Sofia] Browser SDK initialized for', _cfg.serviceName)
 }

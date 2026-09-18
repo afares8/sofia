@@ -11,7 +11,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from app.models.event import ErrorEvent
-from app.services import db_service, whatsapp_service
+from app.services import db_service, whatsapp_service, sourcemap_service
 from app.services.config_service import load_config
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
@@ -48,13 +48,24 @@ async def ingest_event(payload: IngestPayload):
             except Exception:
                 tags_str = None
 
+    # Decode minified browser frames via sourcemaps when a map is available.
+    # The original is appended so nothing is lost if the decode was wrong.
+    traceback_str = payload.traceback
+    if traceback_str:
+        try:
+            decoded = sourcemap_service.decode_browser_traceback(traceback_str)
+            if decoded is not None:
+                traceback_str = (decoded + "\n\n--- minified original ---\n" + traceback_str)[:8000]
+        except Exception:
+            pass
+
     event = ErrorEvent(
         service_id=payload.service_id,
         service_name=payload.service_name,
         level=payload.level.upper(),
         message=payload.message,
         detail=payload.detail,
-        traceback=payload.traceback,
+        traceback=traceback_str,
         url=payload.url,
         user_info=payload.user_info,
         source="active",

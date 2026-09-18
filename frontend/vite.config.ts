@@ -3,6 +3,11 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    // Emit .map files without a sourceMappingURL comment so Sofia can decode
+    // production stacks while maps stay out of the browser's fetch path.
+    sourcemap: 'hidden',
+  },
   server: {
     port: 5179,
     strictPort: true,
