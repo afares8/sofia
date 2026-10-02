@@ -54,14 +54,17 @@ async def check_service(svc: ServiceConfig) -> ServiceStatus:
                 cfg = load_config()
                 headers = await whatsapp_service.get_auth_headers(cfg.alerts)
             resp = await client.get(svc.url, headers=headers)
+            if is_wppconnect and resp.status_code == 401:
+                headers = await whatsapp_service.get_auth_headers(cfg.alerts, force_refresh=True)
+                resp = await client.get(svc.url, headers=headers)
             if resp.status_code == 404 and svc.url.rstrip("/").endswith("/health"):
                 fallback_url = svc.url.rstrip("/") + "z"
                 fallback_resp = await client.get(fallback_url, headers=headers)
-                if fallback_resp.status_code < 500:
+                if fallback_resp.status_code == svc.expected_status:
                     resp = fallback_resp
         response_ms = round((asyncio.get_event_loop().time() - start) * 1000, 1)
         status_code = resp.status_code
-        http_ok = resp.status_code == svc.expected_status or resp.status_code < 500
+        http_ok = resp.status_code == svc.expected_status
         if is_wppconnect and http_ok:
             try:
                 raw_status = resp.json().get("status")
@@ -96,6 +99,16 @@ async def check_service(svc: ServiceConfig) -> ServiceStatus:
         last_seen_up=(datetime.utcnow() if http_ok else (prev.last_seen_up if prev else None)),
         consecutive_failures=new_failures,
     )
+
+    _status_cache[svc.id] = status
+
+    # Record metric (response time + uptime sample)
+    try:
+        await db_service.record_metric(
+            svc.id, response_ms, status_code, http_ok,
+        )
+    except Exception as exc:
+        logger.debug(f"[HEALTH] record_metric failed for {svc.id}: {exc}")
 
     # --- fire alert only when crossing the threshold (restarting → down) ---
     prev_status = prev.status if prev else "unknown"
@@ -150,28 +163,20 @@ async def check_service(svc: ServiceConfig) -> ServiceStatus:
                 f"El servicio volvió a responder después de {prev_failures} fallo(s). URL: {svc.url}",
             )
 
-    _status_cache[svc.id] = status
-
-    # Record metric (response time + uptime sample)
-    try:
-        await db_service.record_metric(
-            svc.id, response_ms, status_code, http_ok,
-        )
-    except Exception as exc:
-        logger.debug(f"[HEALTH] record_metric failed for {svc.id}: {exc}")
-
     return status
 
 
 async def poll_loop():
     """Background task: poll all enabled services every N seconds."""
     logger.info("[HEALTH] Poll loop started.")
+
+    async def poll_service(svc: ServiceConfig):
+        try:
+            await check_service(svc)
+        except Exception as exc:
+            logger.error(f"[HEALTH] Error checking {svc.id}: {exc}")
+
     while True:
         cfg = load_config()
-        for svc in cfg.services:
-            if svc.enabled:
-                try:
-                    await check_service(svc)
-                except Exception as exc:
-                    logger.error(f"[HEALTH] Error checking {svc.id}: {exc}")
+        await asyncio.gather(*(poll_service(svc) for svc in cfg.services if svc.enabled))
         await asyncio.sleep(cfg.poll_interval_seconds)
