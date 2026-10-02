@@ -93,17 +93,45 @@ def _format_phone(number: str) -> str:
     return number.replace("+", "").replace("@c.us", "") + "@c.us"
 
 
+class DeliveryUncertainError(RuntimeError):
+    pass
+
+
+def _delivery_uncertain(exc: Exception) -> bool:
+    return isinstance(exc, DeliveryUncertainError)
+
+
+def _delivery_error(exc: Exception) -> str:
+    return f"delivery unknown; automatic retry disabled: {type(exc).__name__}: {exc}" if _delivery_uncertain(exc) else str(exc)
+
+
 async def _post_message(alert_cfg: AlertConfig, phone: str, text: str) -> bool:
     """Single HTTP POST to WPPConnect. Returns True on success."""
     url = f"{alert_cfg.wppconnect_url}/api/{alert_cfg.wppconnect_session}/send-message"
     headers = await get_auth_headers(alert_cfg)
     payload = {"phone": phone, "message": text, "isGroup": False}
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, json=payload, headers=headers)
+        try:
+            resp = await client.post(url, json=payload, headers=headers)
+        except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError) as exc:
+            raise DeliveryUncertainError(f"{type(exc).__name__}: {exc}") from exc
         if resp.status_code == 401:
             headers = await get_auth_headers(alert_cfg, force_refresh=True)
-            resp = await client.post(url, json=payload, headers=headers)
+            try:
+                resp = await client.post(url, json=payload, headers=headers)
+            except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError) as exc:
+                raise DeliveryUncertainError(f"{type(exc).__name__}: {exc}") from exc
+        if resp.status_code >= 500:
+            raise DeliveryUncertainError(f"WPPConnect HTTP {resp.status_code}: {resp.text[:300]}")
         resp.raise_for_status()
+        try:
+            result = resp.json()
+        except ValueError as exc:
+            raise DeliveryUncertainError("WPPConnect returned invalid JSON") from exc
+        if isinstance(result, dict) and str(result.get("status", "")).lower() in ("disconnected", "connected"):
+            raise RuntimeError(f"WPPConnect rejected message: {result}")
+        if not isinstance(result, dict) or str(result.get("status", "")).lower() != "success" or not result.get("response") or result.get("error"):
+            raise DeliveryUncertainError(f"WPPConnect did not confirm success: {result}")
     return True
 
 
@@ -123,17 +151,17 @@ async def send_message(alert_cfg: AlertConfig, text: str, phone: Optional[str] =
         _mark_hourly_sent(target_phone)
         return True
     except Exception as exc:
-        logger.warning(f"[WA] send_message failed, queueing: {exc}")
+        logger.warning(f"[WA] send_message failed: {_delivery_error(exc)}")
         from app.services import db_service
         try:
-            await db_service.enqueue_alert(target_phone, text)
+            await db_service.enqueue_alert(target_phone, text, delivery_uncertain=_delivery_uncertain(exc), error=_delivery_error(exc))
         except Exception as enq_exc:
             logger.error(f"[WA] enqueue_alert failed: {enq_exc}")
         # Fallback: notify via email so the team is aware even when WhatsApp is down.
         from app.services import email_alert_service
         email_alert_service.send_fallback_email(
-            subject="[Sofia] Alerta WhatsApp no entregada",
-            body=f"No se pudo enviar el siguiente mensaje por WhatsApp:\n\n{text}\n\nError: {exc}",
+            subject="[Sofia] Entrega WhatsApp desconocida" if _delivery_uncertain(exc) else "[Sofia] Alerta WhatsApp no entregada",
+            body=("Entrega desconocida; pudo haber llegado. No se reenviará automáticamente." if _delivery_uncertain(exc) else "No se pudo enviar el siguiente mensaje por WhatsApp.") + f"\n\n{text}\n\nError: {_delivery_error(exc)}",
         )
         return False
 
@@ -178,10 +206,10 @@ async def send_alert(
         logger.info(f"[WA] Alert sent for {service_id}: {level}")
         return True
     except Exception as exc:
-        logger.error(f"[WA] Failed to send alert for {service_id}, queueing: {exc}")
+        logger.error(f"[WA] Failed to send alert for {service_id}: {_delivery_error(exc)}")
         from app.services import db_service
         try:
-            await db_service.enqueue_alert(phone, text)
+            await db_service.enqueue_alert(phone, text, delivery_uncertain=_delivery_uncertain(exc), error=_delivery_error(exc))
             # apply cooldown even when queued, otherwise the queue gets spammed
             _cooldown[key] = datetime.utcnow()
         except Exception as enq_exc:
@@ -190,7 +218,7 @@ async def send_alert(
         from app.services import email_alert_service
         email_alert_service.send_fallback_email(
             subject=f"[Sofia] {level} — {service_name} ({service_id})",
-            body=f"La alerta no pudo enviarse por WhatsApp y fue encolada.\n\n{text}\n\nError: {exc}",
+            body=("Entrega desconocida; pudo haber llegado. No se reenviará automáticamente." if _delivery_uncertain(exc) else "La alerta no pudo enviarse por WhatsApp y fue encolada.") + f"\n\n{text}\n\nError: {_delivery_error(exc)}",
         )
         return False
 
@@ -216,7 +244,15 @@ async def flush_queue(alert_cfg: AlertConfig, max_attempts: int = 10) -> int:
             await db_service.mark_alert_sent(row["id"])
             delivered += 1
         except Exception as exc:
-            await db_service.mark_alert_failed(row["id"], str(exc))
+            uncertain = _delivery_uncertain(exc)
+            await db_service.mark_alert_failed(row["id"], _delivery_error(exc), delivery_uncertain=uncertain)
+            if uncertain:
+                logger.error(f"[WA] queue id={row['id']}: {_delivery_error(exc)}")
+                from app.services import email_alert_service
+                email_alert_service.send_fallback_email(
+                    subject="[Sofia] Entrega WhatsApp desconocida",
+                    body=f"Entrega desconocida; pudo haber llegado. No se reenviará automáticamente.\n\n{row['message']}\n\nError: {_delivery_error(exc)}",
+                )
             # Stop trying for now — WPP probably still down
             logger.debug(f"[WA] queue flush halted at id={row['id']}: {exc}")
             break

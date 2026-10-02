@@ -104,7 +104,8 @@ async def init_db():
                 created_at  TEXT NOT NULL,
                 sent_at     TEXT,
                 attempts    INTEGER DEFAULT 0,
-                last_error  TEXT
+                last_error  TEXT,
+                delivery_uncertain INTEGER NOT NULL DEFAULT 0
             )
         """)
         # Indexes for common query patterns
@@ -236,6 +237,10 @@ async def init_db():
             )
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_events(entity_type, entity_id)")
+        async with db.execute("PRAGMA table_info(alert_queue)") as cursor:
+            queue_columns = {row[1] for row in await cursor.fetchall()}
+        if "delivery_uncertain" not in queue_columns:
+            await db.execute("ALTER TABLE alert_queue ADD COLUMN delivery_uncertain INTEGER NOT NULL DEFAULT 0")
         # Migrate old schema if needed
         for stmt in (
             "ALTER TABLE issues ADD COLUMN url TEXT",
@@ -631,13 +636,13 @@ async def get_restore_history(limit: int = 50, service_id: Optional[str] = None)
 # ── Alert queue ──────────────────────────────────────────────────────────────
 
 
-async def enqueue_alert(phone: str, message: str) -> int:
+async def enqueue_alert(phone: str, message: str, delivery_uncertain: bool = False, error: Optional[str] = None) -> int:
     ts = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL")
         cursor = await db.execute(
-            "INSERT INTO alert_queue (phone, message, created_at) VALUES (?, ?, ?)",
-            (phone, message, ts),
+            "INSERT INTO alert_queue (phone, message, created_at, delivery_uncertain, last_error) VALUES (?, ?, ?, ?, ?)",
+            (phone, message, ts, int(delivery_uncertain), error[:500] if error else None),
         )
         await db.commit()
         return int(cursor.lastrowid or 0)
@@ -653,7 +658,7 @@ async def get_pending_alerts(
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute(
             "SELECT * FROM alert_queue "
-            "WHERE sent_at IS NULL AND attempts < ? AND created_at >= ? "
+            "WHERE sent_at IS NULL AND delivery_uncertain = 0 AND attempts < ? AND created_at >= ? "
             "ORDER BY id ASC",
             (max_attempts, cutoff),
         )).fetchall()
@@ -671,12 +676,12 @@ async def mark_alert_sent(alert_id: int) -> None:
         await db.commit()
 
 
-async def mark_alert_failed(alert_id: int, error: str) -> None:
+async def mark_alert_failed(alert_id: int, error: str, delivery_uncertain: bool = False) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute(
-            "UPDATE alert_queue SET attempts = attempts + 1, last_error = ? WHERE id = ?",
-            (error[:500], alert_id),
+            "UPDATE alert_queue SET attempts = attempts + 1, last_error = ?, delivery_uncertain = MAX(delivery_uncertain, ?) WHERE id = ?",
+            (error[:500], int(delivery_uncertain), alert_id),
         )
         await db.commit()
 
@@ -692,7 +697,7 @@ async def purge_failed_alerts(max_attempts: int = 10) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL")
         cursor = await db.execute(
-            "DELETE FROM alert_queue WHERE sent_at IS NULL AND attempts >= ?",
+            "DELETE FROM alert_queue WHERE sent_at IS NULL AND delivery_uncertain = 0 AND attempts >= ?",
             (max_attempts,),
         )
         await db.commit()
