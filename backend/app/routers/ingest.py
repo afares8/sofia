@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from app.models.event import ErrorEvent
 from app.services import db_service, whatsapp_service, sourcemap_service
 from app.services.config_service import load_config
+from app.services.event_classification import normalize_reported_level
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
@@ -62,7 +63,7 @@ async def ingest_event(payload: IngestPayload):
     event = ErrorEvent(
         service_id=payload.service_id,
         service_name=payload.service_name,
-        level=payload.level.upper(),
+        level=normalize_reported_level(payload.level, payload.message),
         message=payload.message,
         detail=payload.detail,
         traceback=traceback_str,

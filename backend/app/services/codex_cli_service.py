@@ -3,10 +3,15 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Optional
+
+import psutil
 
 logger = logging.getLogger("sofia.codex")
 
@@ -18,12 +23,29 @@ CODEX_MODEL_ENV = "SOFIA_CODEX_MODEL"
 DEFAULT_CODEX_MODEL = ""
 
 
+CODEX_BIN_ENV = "SOFIA_CODEX_BIN"
+
+
+def _resolve_codex_bin() -> Optional[str]:
+    override = os.getenv(CODEX_BIN_ENV, "").strip()
+    if override:
+        candidate = Path(override)
+        if (
+            candidate.is_absolute()
+            and candidate.is_file()
+            and os.access(str(candidate), os.X_OK)
+        ):
+            return str(candidate)
+        return None
+    return shutil.which("codex") or shutil.which("codex.exe")
+
+
 def codex_available() -> bool:
-    return shutil.which("codex") is not None or shutil.which("codex.exe") is not None
+    return _resolve_codex_bin() is not None
 
 
 def codex_bin() -> Optional[str]:
-    return shutil.which("codex") or shutil.which("codex.exe")
+    return _resolve_codex_bin()
 
 
 def codex_model() -> str:
@@ -95,23 +117,99 @@ def run_codex(
         assert proc.stdin is not None
         assert proc.stdout is not None
 
-        proc.stdin.write(prompt)
-        proc.stdin.close()
+        deadline = time.monotonic() + timeout
+        events: "queue.Queue" = queue.Queue()
 
-        for line in proc.stdout:
-            line_stripped = line.rstrip()
-            collected.append(line_stripped)
-            logger.info(f"[{log_prefix}] {line_stripped}")
+        def _write_stdin() -> None:
+            try:
+                proc.stdin.write(prompt)
+            except BrokenPipeError:
+                pass
+            except Exception as exc:
+                events.put(("stdin_error", exc))
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
 
-        proc.wait(timeout=timeout)
+        def _read_stdout() -> None:
+            try:
+                for line in proc.stdout:
+                    events.put(("line", line))
+            except Exception as exc:
+                events.put(("read_error", exc))
+            finally:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+                events.put(("eof", None))
+
+        threading.Thread(target=_write_stdin, daemon=True).start()
+        threading.Thread(target=_read_stdout, daemon=True).start()
+
+        eof = False
+        while not eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            try:
+                kind, payload = events.get(timeout=remaining)
+            except queue.Empty:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            if kind == "line":
+                line_stripped = payload.rstrip()
+                collected.append(line_stripped)
+                logger.info(f"[{log_prefix}] {line_stripped}")
+            elif kind == "eof":
+                eof = True
+            else:
+                raise payload
+
+        proc.wait(timeout=max(deadline - time.monotonic(), 0.001))
         return proc.returncode or 0, "\n".join(collected)
     except subprocess.TimeoutExpired:
         if proc:
-            proc.kill()
+            _terminate_proc_tree(proc, log_prefix)
         msg = f"TIMEOUT: Codex no terminó en {timeout}s."
         logger.error(f"[{log_prefix}] {msg}")
         return -1, "\n".join(collected + [msg])
     except Exception as exc:
+        if proc:
+            _terminate_proc_tree(proc, log_prefix)
         msg = f"ERROR: Codex failed: {exc}"
         logger.error(f"[{log_prefix}] {msg}")
         return -3, "\n".join(collected + [msg])
+
+
+def _terminate_proc_tree(proc: subprocess.Popen, log_prefix: str) -> None:
+    try:
+        descendants = psutil.Process(proc.pid).children(recursive=True)
+    except psutil.NoSuchProcess:
+        descendants = []
+    except Exception as exc:
+        logger.warning(f"[{log_prefix}] cleanup: cannot enumerate descendants: {exc}")
+        descendants = []
+    for child in descendants:
+        try:
+            child.terminate()
+        except psutil.NoSuchProcess:
+            pass
+        except Exception as exc:
+            logger.warning(f"[{log_prefix}] cleanup: terminate pid {child.pid} failed: {exc}")
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    except Exception as exc:
+        logger.warning(f"[{log_prefix}] cleanup: kill failed: {exc}")
+    try:
+        proc.wait(timeout=2)
+    except Exception as exc:
+        logger.warning(f"[{log_prefix}] cleanup: reap failed: {exc}")
+    if descendants:
+        try:
+            psutil.wait_procs(descendants, timeout=2)
+        except Exception as exc:
+            logger.warning(f"[{log_prefix}] cleanup: descendant reap failed: {exc}")

@@ -53,8 +53,12 @@ RECENT_CHANGE_WINDOW_SECONDS = 300
 MAX_RESTORE_RETRIES = 3
 RETRY_BACKOFF_BASE_SECONDS = 30
 
-# DIAPI health endpoint (Mayor and Packing use SAP middleware on port 9000)
+# DIAPI health endpoints: Mayor middleware on 9000; Packing runs its own DI API service on 8001
 DIAPI_HEALTH_URL = "http://localhost:9000/api/Health/Ping"
+DIAPI_HEALTH_URLS = {
+    "mayor": DIAPI_HEALTH_URL,
+    "packing": "http://localhost:8001/Health/Index",
+}
 DIAPI_SERVICES = {"mayor", "packing"}
 
 # Per-service context that Codex receives as part of the prompt
@@ -83,9 +87,9 @@ SERVICE_CONTEXT = {
         "work_dir": r"C:\Users\ahmed\apps\Packing\backend",
         "start_cmd": "python run.py",
         "extra": (
-            "Packing also uses the SAP DI API middleware. After Packing is up, verify "
-            "DIAPI at http://localhost:9000/api/Health/Ping responds. "
-            "If not responding, check if Mayor already started it (they share the same DIAPI process)."
+            "Packing manages its own SAP DI API service on port 8001. After Packing is up, "
+            "verify http://localhost:8001/Health/Index returns HTTP 200. "
+            "Do not restart Mayor or assume its port 9000 validates Packing."
         ),
     },
     "mayor_frontend": {
@@ -448,15 +452,40 @@ async def _run_ps1(service_id: str) -> tuple[bool, str]:
         return False, f"PS1 error: {exc}"
 
 
-async def _health_url_ok(url: str) -> bool:
+async def _health_url_ok(url: str, expected_status: int = 200) -> bool:
     try:
         headers = {}
-        if "21465" in url:
+        wpp = "21465" in url
+        if wpp:
+            from app.services import whatsapp_service
             cfg = load_config()
-            headers["Authorization"] = f"Bearer {cfg.alerts.wppconnect_token}"
+            headers = await whatsapp_service.get_auth_headers(cfg.alerts)
         async with httpx.AsyncClient(timeout=5, verify=False, follow_redirects=True) as client:
             resp = await client.get(url, headers=headers)
-            return resp.status_code < 500
+            base = url.rstrip("/")
+            if (
+                expected_status == 200
+                and resp.status_code == 404
+                and base.endswith("/health")
+            ):
+                resp = await client.get(base[: -len("/health")] + "/healthz", headers=headers)
+            if resp.status_code != expected_status:
+                return False
+            if wpp:
+                try:
+                    data = resp.json()
+                except Exception:
+                    return False
+                if not isinstance(data, dict):
+                    return False
+                status = data.get("status", data.get("connected"))
+                connected = status is True or (
+                    isinstance(status, str)
+                    and status.upper() in {"TRUE", "CONNECTED", "1", "YES"}
+                )
+                if not connected:
+                    return False
+            return True
     except Exception:
         return False
 
@@ -513,10 +542,19 @@ def _ps_quote(value: str) -> str:
 async def _wait_for_existing_restart(service_id: str, service_name: str) -> bool:
     ctx = SERVICE_CONTEXT.get(service_id, {})
     health_url = ctx.get("health_url")
+    expected_status = 200
+    try:
+        cfg = load_config()
+        svc_cfg = next((s for s in cfg.services if s.id == service_id), None)
+        if svc_cfg and svc_cfg.url:
+            health_url = svc_cfg.url
+            expected_status = svc_cfg.expected_status
+    except Exception:
+        pass
     work_dir = ctx.get("work_dir")
     if not health_url:
         return False
-    if await _health_url_ok(health_url):
+    if await _health_url_ok(health_url, expected_status):
         return True
     likely_restarting = await _port_accepting(health_url) or _recent_source_change(work_dir)
     if not likely_restarting:
@@ -525,7 +563,7 @@ async def _wait_for_existing_restart(service_id: str, service_name: str) -> bool
     deadline = asyncio.get_event_loop().time() + RECOVERY_STARTUP_WAIT_SECONDS
     while asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(5)
-        if await _health_url_ok(health_url):
+        if await _health_url_ok(health_url, expected_status):
             logger.info(f"[RESTORE] {service_id} recovered during restart wait.")
             return True
     logger.warning(f"[RESTORE] {service_id} did not recover after restart wait; proceeding with recovery.")
@@ -702,7 +740,7 @@ async def _run_restore(service_id: str) -> None:
 
     diapi_ok = True
     if came_up and service_id in DIAPI_SERVICES:
-        diapi_ok = await _check_diapi()
+        diapi_ok = await _check_diapi(service_id)
 
     restore.finished_at = datetime.utcnow()
     elapsed = int((restore.finished_at - (restore.confirmed_at or restore.requested_at)).total_seconds())
@@ -783,11 +821,24 @@ async def _run_restore(service_id: str) -> None:
     logger.error(f"[RESTORE] {service_id} failed after retries. Summary: {summary}")
 
 
-async def _check_diapi() -> bool:
+async def _check_diapi(service_id: str = "mayor") -> bool:
+    url = DIAPI_HEALTH_URLS.get(service_id)
+    if not url:
+        return False
     try:
         async with httpx.AsyncClient(timeout=10, verify=False, follow_redirects=True) as client:
-            resp = await client.get(DIAPI_HEALTH_URL)
-            return resp.status_code < 500
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return False
+            try:
+                data = resp.json()
+            except Exception:
+                data = None
+            if service_id == "packing":
+                return isinstance(data, dict) and data.get("connected") is True
+            if isinstance(data, dict) and data.get("connected") is False:
+                return False
+            return True
     except Exception:
         return False
 

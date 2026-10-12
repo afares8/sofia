@@ -10,8 +10,8 @@ SMTP configuration is read from environment variables, mirroring the ones
 used by the Mayor backend (MAIL_HOST, MAIL_USERNAME, ...) so the same Gmail
 app-password credentials work for both apps without duplication.
 
-The recipient is configurable via SOFIA_ALERT_EMAIL (default:
-ahmed@magnate-inc.com).
+The recipients are configurable via SOFIA_ALERT_EMAIL (comma-separated,
+default: ahmed@magnate-inc.com,order@magnate-inc.com).
 """
 import logging
 import os
@@ -30,8 +30,11 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD") or os.environ.get("MAIL_PASSWORD
 SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL") or os.environ.get("MAIL_FROM", SMTP_USER)
 SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME") or os.environ.get("MAIL_FROM_NAME", "Sofia Monitor")
 
-# Default recipient for Sofia fallback alerts.
-ALERT_EMAIL_RECIPIENT = os.environ.get("SOFIA_ALERT_EMAIL", "ahmed@magnate-inc.com")
+# Default recipients for Sofia fallback alerts (comma-separated; smtplib's
+# send_message resolves every address listed in the To header).
+ALERT_EMAIL_RECIPIENT = os.environ.get(
+    "SOFIA_ALERT_EMAIL", "ahmed@magnate-inc.com,order@magnate-inc.com"
+)
 
 # Cooldown to avoid email flooding when WPPConnect is down for a long time.
 # Stored in-memory; resets on restart (acceptable for a fallback channel).

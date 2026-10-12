@@ -16,7 +16,9 @@ from app.services.alert_queue import alert_queue_loop
 from app.services.analytics_service import spike_detection_loop
 from app.services.config_service import load_config
 from app.services.db_service import init_db, purge_old_events, purge_failed_alerts
+from app.services.droplet_docker_service import droplet_docker_loop
 from app.services.health_service import poll_loop
+from app.services.local_host_service import local_host_loop
 from app.services.log_service import log_poll_loop
 from app.services.nightly_review_service import nightly_loop
 from app.services.rules_engine import rules_loop
@@ -100,6 +102,8 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(nightly_loop())
     asyncio.create_task(autofix_loop())
     asyncio.create_task(job_watchdog_loop())
+    asyncio.create_task(droplet_docker_loop())
+    asyncio.create_task(local_host_loop())
     asyncio.create_task(_auto_purge_loop())
     logger.info("Sofia Monitor started.")
     yield
