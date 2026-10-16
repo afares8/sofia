@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "source_db": "C:/Users/ahmed/apps/sofia/backend/data/sofia.db",
+  "state_root": "C:/Users/ahmed/apps/sofia/backend/data/devin-desktop",
+  "devin_executable": "C:/Users/ahmed/AppData/Local/devin/cli/bin/devin.exe",
+  "python_executable": "C:/Users/ahmed/apps/sofia/backend/.venv/Scripts/python.exe",
+  "poll_seconds": 15,
+  "batch_size": 50,
+  "stall_seconds": 900,
+  "levels": ["WARNING", "ERROR", "CRITICAL"],
+  "permission_mode": "dangerous",
+  "first_start": "from_now",
+  "groups": {
+    "local": {
+      "title": "Sofia - Apps de esta PC - Devin",
+      "cwd": "C:/Users/ahmed/apps",
+      "elevated": true,
+      "initial_prompt": "local-initial.txt",
+      "task_name": "Sofia-Devin-AppsPC"
+    },
+    "elenatec": {
+      "title": "Sofia - ElenaTec - Devin",
+      "cwd": "C:/Users/ahmed/apps/tec-review",
+      "elevated": false,
+      "initial_prompt": "elenatec-initial.txt",
+      "task_name": "Sofia-Devin-ElenaTec"
+    }
+  },
+  "elenatec_route": {
+    "sources": ["docker"],
+    "service_ids": ["tec", "tec_frontend", "elenatec", "elenatec_frontend"],
+    "service_prefixes": ["tec-", "tec_", "elenatec-", "elenatec_", "droplet-"]
+  }
+}
