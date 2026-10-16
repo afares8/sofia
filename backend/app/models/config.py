@@ -240,6 +240,16 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         auto_restore=False,
     ),
     ServiceConfig(
+        id="vision",
+        name="Vision",
+        url="https://127.0.0.1:8200/health",
+        log_path="C:/Users/ahmed/apps/vision/backend/service.log",
+        enabled=True,
+        timeout_seconds=8,
+        restore_enabled=False,
+        auto_restore=False,
+    ),
+    ServiceConfig(
         id="diapi",
         name="SAP DIAPI Middleware",
         url="http://localhost:9000/api/Health/Ping",

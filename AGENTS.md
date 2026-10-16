@@ -77,6 +77,18 @@ Conservar mensaje completo redactado y timestamp de origen en detail (limite 120
 - Pruebas: `backend/.venv/Scripts/python.exe -m pytest tests/test_sofia_devin_bridge.py -q` desde `backend` (agente ACP falso por pipes, DB/state temporales, subprocess reales para mutex/estado, sin red ni modelo). Evidencia en `backend/data/devin-desktop/evidence/` (gitignored). Handshake `initialize` verificado en vivo (Devin 3000.11.3, `loadSession=true`, `authMethods=[devin-browser]`, `devin auth status`=autenticado); durante las pruebas no se envio session/new ni prompts reales. Activacion posterior: ambas tareas quedaron Running y avisos naturales abrieron una sesion real por grupo; esto no acredita que el analisis termine ni autoriza reinicios adicionales.
 
 
+## Vision como servicio monitoreado (2026-10-16)
+
+`vision` se agrego a `DEFAULT_SERVICES` (`app/models/config.py`) y a `backend/data/config.json`
+(runtime, gitignored): health `https://127.0.0.1:8200/health` (TLS self-signed; el health service
+usa `verify=False`) y `log_path C:/Users/ahmed/apps/vision/backend/service.log`. Sofia relee
+`config.json` cada ciclo (~30s) via `load_config()`, asi que no hace falta reiniciar el backend
+para agregar un servicio; `load_config()` tambien auto-agrega los `DEFAULT_SERVICES` faltantes al
+reiniciar. `restore_enabled=false` (no hay `restore_vision.ps1`): solo notifica, no ofrece restore.
+El puente Sofia-Devin rutea `vision` al grupo **local** (todo lo que no sea elenatec/droplet), asi
+que sus avisos los atiende la sesion diaria de las apps de la PC. El log arranca `from_now`
+(cursor al final), asi que no reingesta el historial previo.
+
 ## Triaje: warnings recurrentes de las apps monitoreadas (2026-10-15)
 
 Familias que se repiten y son esperadas o artefactos de parsing, no fallos de las apps:
@@ -84,10 +96,16 @@ Familias que se repiten y son esperadas o artefactos de parsing, no fallos de la
   secret en modo suave por diseno (no bloquea; la marcacion se procesa igual). Detalle en
   `apps/mayor/backend/AGENTS.md`.
 - **Mayor `app.security_service_improved` "PROBLEMA DETECTADO: IP privada sin proxy"**: se emite
-  cuando un cliente LAN conecta directo sin proxy confiable (`security_service_improved.py`); es
-  por diseno, no indica intrusion.
+  cuando un cliente LAN/VPN conecta directo sin proxy confiable (`security_service_improved.py:184-188`);
+  es por diseno, no indica intrusion. **NO tiene rate-limit** (a diferencia de hikvision_push), asi que
+  loguea en CADA request directo -> muchas ocurrencias por IP (una issue por IP porque el fingerprint
+  incluye la IP; p. ej. 71323 con 36+). `192.168.0.123` es la propia IP del servidor (llamadas internas
+  directas).
 - **"Slow request — ..." (fuente active)**: umbral 5 s (`SOFIA_SLOW_MS`, default 5000) en el
-  `sofia_sdk.py` de Mayor y Packing; endpoints pesados lo superan de forma recurrente.
+  `sofia_sdk.py` de Mayor y Packing; endpoints pesados lo superan de forma recurrente. Caso extremo
+  verificado 2026-10-16: `POST /api/v1/packing/logistica/crear-entrega` = **80.9 s** para el pedido
+  8056 (creacion de lineas SAP + backfill del pedido complejo que genero la rafaga de warnings de
+  deficit/lineas); responde 200. `GET /api/v1/packing/logistica/resumen-pedidos` ~5 s (reporte pesado).
 - **Packing `[DATOS] ApTaxCode column not available`**: `OARG.ApTaxCode` no existe en esta BD SAP;
   el codigo cae a la consulta basica y responde OK (warning esperado).
 - **Packing `[SAP-DI] Could not set U_*`**: faltan UDFs en la BD SAP (confirmado por
@@ -95,6 +113,18 @@ Familias que se repiten y son esperadas o artefactos de parsing, no fallos de la
   tolera la ausencia; es un hueco de configuracion SAP, no de codigo.
 - **Packing WMS "reference ... indeterminate ... automatic release prohibited"**: guarda de
   seguridad de inventario; no libera automaticamente referencias ambiguas.
+- **Packing `purchasing.providers.scraping` "Scraping failed for <contenedor>: No scraper available
+  for carrier" (issues 67095/67098)**: `GenericScraper` (scraping.py) es el fallback para carriers
+  sin scraper propio y devuelve `success=False` con ese mensaje; el README de Packing lo documenta
+  como esperado. Es un hueco de cobertura de carriers (no un fallo de la app): ese contenedor no se
+  rastrea automaticamente. No hay fix minimo de codigo salvo agregar un scraper para ese carrier.
+- **Packing tracking Maersk/AI sin datos**: "Scraping failed for <cont>: MAERSK_CONSUMER_KEY not
+  configured" (issues 29897/77344) y "[AI_TRACKING] BL fallback also returned no results for <cont>"
+  (issue 67101). El proveedor Maersk falla rapido A PROPOSITO si falta `MAERSK_CONSUMER_KEY`
+  (`scraping.py:372-378`, para no gastar retry budget con 401/403) y el scheduler avisa que Maersk
+  "will be skipped and fall back to AI/manual tracking" (`scheduler.py:76-82`). Esperado: el
+  tracking de esos contenedores cae a AI/manual. Habilitar Maersk requiere configurar la credencial
+  (decision de credenciales, no un fix de codigo).
 - **Mayor `app.modules.pantalla.dispatch.dispatch_note` "Dispatch counter ... was behind saved
   notes"**: el contador de notas de despacho vive en un dict en memoria por worker
   (`app/modules/pantalla/state.py`), asi que los 4 workers se desfasan entre si; la funcion lo
@@ -112,6 +142,105 @@ Familias que se repiten y son esperadas o artefactos de parsing, no fallos de la
   logra abrir los handles de los procesos Chrome hijos al terminar). Es pre-existente (desde
   2026-10-02) y benigno: el servicio detiene y arranca correctamente. Aparece en rafaga de 5 por
   reinicio; no confundir con un fallo de la sesion WhatsApp.
+- **Packing `ap_scheduler` "Invalid AP timezone 'America/Panama'; using fixed Panama UTC-05:00"
+  (issue 29898)**: el venv de Packing NO tiene el paquete `tzdata`, asi que
+  `zoneinfo.ZoneInfo('America/Panama')` lanza `ZoneInfoNotFoundError` en Windows y el codigo cae a
+  un fallback fijo UTC-05:00 (`timezone_fixed_panama`, `ap_scheduler.py:21-60`). El fallback es
+  CORRECTO (Panama no tiene DST) y el mensaje es enganoso: la zona SI es valida, falta tzdata.
+  Se emite ~diario al calcular el proximo run (cron 01:30 Panama) y en cada reinicio del backend.
+  Benigno; no es un fallo. Silenciarlo requeriria instalar `tzdata` (cambio de dependencia) o
+  emitir el aviso una sola vez / a DEBUG (cambio de codigo).
+- **Mayor `collections_scheduler` "[COLLECTIONS] Omitido <cliente>: cliente sin numero de WhatsApp
+  configurado" (issue 72577)**: el scheduler de cobranzas omite A PROPOSITO a los clientes sin
+  telefono configurado (`collections_scheduler.py:789-797`): registra el skip en la DB
+  (`notes="Omitido: cliente sin telefono configurado"`) y retorna `{"skipped": true}`. Recurrente
+  ~diario (~09:2x local) para los mismos clientes (25003802, 25001782). NO es un fallo; cargarles
+  el telefono es una decision de datos, no un fix de codigo.
+- **Mayor `hikvision_device_service` "Could not resolve employee by name: '<nombre>'" (issue
+  72075 y familia 71617/72998/73568)**: una marcacion Hikvision no se pudo atribuir: el clock ID
+  no matcheo ningun empleado Y el nombre tampoco (`_resolve_by_name`, `hikvision_device_service.py:70-83`,
+  solo matchea "nombre apellido" exacto o el primer nombre, contra empleados ACTIVOS). El evento
+  crudo SI queda guardado con `processed=False` (`HRHikvisionEvent`) y hay un reproceso MANUAL
+  (`POST /{device_id}/reprocess-failed`) que se corre tras corregir `biometric_employee_no`/nombre
+  del empleado. No es un crash: es un hueco de datos/atribucion (empleado inactivo/ausente o con
+  nombre distinto). NO relajar el matching por nombre (riesgo de atribuir a otra persona). Nombres
+  vistos ~1/dia: Nazareth Drenald, JACQUELINE AGRELLI, Christopher Morris, ALEXANDER MARTINEZ.
+- **Mayor `siecloud_service` "SIECloud: not configured, returning empty ..." (issue 71569)**: el
+  servicio SIECloud (precios para Etiquetas, existencias, productos, price-search) NO esta
+  configurado en este server: no existe `backend/siecloud_config.json` y no estan las env
+  `SIECLOUD_API_URL/USER/PASSWORD/CONTEXT_ID` (main.py:1110-1122). Las funciones devuelven vacio
+  con un WARNING (`siecloud_service.py`). Impacto: el cache offline de Etiquetas queda vacio
+  (`frontend/src/lib/productCache.ts::refreshCache` -> `/api/v1/siecloud/all-products-for-cache`).
+  Es un HUECO DE CONFIGURACION, no un bug: se arregla cargando credenciales por el panel Tecnico
+  (`POST /api/v1/siecloud/config`) o por env vars (decision/credenciales del dueno). ~1-2/dia.
+- **Mayor `sales_floor_orders.services` "Stock transfer failed for order PV-xxxxx: No items to
+  transfer" (issue 71851)**: en `complete_order` (PICKING->COMPLETED) se crea una transferencia
+  automatica con los items de `picked_quantity > 0` (`wms_integration.py:210-227`); si NINGUN item
+  tiene picks (todos NOT_FOUND / 0), devuelve `error="No items to transfer"` y `services.py:332-337`
+  loguea WARNING. No es un crash y NO bloquea el completado. Es una condicion legitima (nada
+  recogido -> nada que transferir), pero el "failed" podria indicar pedidos completados sin picking:
+  verificar con negocio si esos pedidos debian tener picks. ~1/dia (PV-10466/10476/10505). NO
+  convertir a `skipped` a ciegas: este warning es la unica senal de ese caso.
+- **Mayor "Slow request — POST /api/v1/email/send-generic" (issue 16863)**: endpoint de envio de
+  correo generico usado por Packing WMS ("Diferencias Inventario - Pedido PV-xxxxx"), familia
+  "Slow request" esperada. Es lento por diseno (SMTP sincrono, 5-13 s) Y ademas hace el `smtplib`
+  BLOQUEANTE dentro del `async def` (`generic_email_routes.py:98-101`), lo que estanca el event
+  loop del worker durante el envio. Uso raro (~3 envios en 2 semanas) => impacto bajo. Mejora
+  posible (NO aplicada): mover el bloque SMTP a `asyncio.to_thread`; requiere reinicio coordinado
+  de MayorBackend (dependencias SCM) y conviene fuera de horario laboral.
+- **Packing `picking_service` "Salesfloor exception email not sent for task X (order PV-xxxxx):
+  {'sent': False, 'reason': 'no_exceptions'}" (issue 54492)**: el correo de diferencias de Sala de
+  Venta solo se envia si HAY excepciones (`salesfloor_email_service.py:190-192` devuelve
+  `no_exceptions` y loguea INFO); el llamador (`picking_service.py:3426-3430`) loguea WARNING para
+  CUALQUIER `sent=False`, incluido este caso normal. Benigno (nada que reportar -> no se envia
+  correo), pero el nivel WARNING es enganoso. ~6 en 4 dias, todos `no_exceptions`. Mejora posible
+  (NO aplicada): INFO para `no_exceptions` y WARNING solo para fallos reales
+  (no_email_configured/no_mayor_url/excel_generation_failed); requiere reinicio de PackingBackend.
+- **Packing `packing_service` guardas/fallbacks (issues 46519, 32190, 32191, 32984, 38523/47976/
+  73526/73532) y "Slow request" en add-bulto/finalize-bodega (10723/10730)**: WARNINGs que el codigo
+  registra y luego CONTINUA (no son crashes):
+  * `Product X not found in SAP order Y after comprehensive search` -> rechaza empacar un producto
+    que no esta en la orden SAP (`{"success": false, "error": "Product not found in SAP order"}`).
+  * `Health check has warnings - proceeding with caution` + `UDF fields validation failed - delivery
+    creation may fail` -> pre-flight con warnings (UDFs faltantes en SAP; ver ApTaxCode/U_SecBltoNum);
+    el codigo sigue con cautela.
+  * `available_sap_lines was empty, using all SAP lines as fallback reference` -> fallback al agregar
+    linea; continua.
+  * `Product X ordered (N) but not packed` / `under-packed: ordered N, packed M` -> resultados de
+    validacion "incomplete" al finalizar (discrepancia de empaque; el sistema avisa, no bloquea).
+  * `add-bulto`/`finalize-bodega` (6-19 s) caen en la familia "Slow request" (endpoints pesados).
+- **Mayor Pantalla `invoice_service`/`dispatch_notifications` "No invoice found for delivery N"
+  (issues 77437/77438/77440)**: al despachar una entrega sin factura asociada todavia; aviso esperado,
+  no es un crash.
+- **Packing `host_utils`/`sap_di_service_manager` "No working API URL found ..." / "No working SAP DI
+  API URL found, using configured URL" (issues 29909/29910)**: warnings de ARRANQUE cuando el middleware
+  SAP DI (8001) aun no responde mientras PackingBackend inicia (es hijo suyo); el codigo cae a la URL
+  configurada y se recupera en ~1 min. Verificado 2026-10-16 tras un reinicio: `/Health/Index` ->
+  `connected:true`, `connectionAge 0.7 min`. Transitorio y esperado en cada reinicio (esperar 30-60s
+  antes de tratarlo como caida).
+- **Packing `packing_service` backfill / entrega parcial (issues 77520-77531/77541-77550 "No matching
+  SAP line found for X in order Y (bulto N)"; 32195 "Order has incomplete quantities - proceeding with
+  partial delivery" + continuaciones "   - Product ...")**: la reconciliacion de cantidades detecta
+  faltantes y el codigo PROCEDE con entrega PARCIAL (loguea el detalle de cada item con prefijo "   - ");
+  el backfill que enlaza lineas empacadas a su LineNum SAP avisa "No matching SAP line found" y OMITE
+  esa linea, pero continua ("Backfill completed! Updated N"). No son crashes; "No matching SAP line"
+  puede indicar lineas SAP ya asignadas/agotadas para ese producto -> revision de datos si negocio lo
+  requiere. Ocurren en rafaga por pedido al finalizar/backfill (p. ej. orden 8056). Variantes del
+  mismo flujo de asignacion de lineas: "Could not assign full quantity (N) to existing lines.
+  Remaining: N" (32982/32985) + "Will create new SAP line for deficit of N units" (32983/32986) ->
+  el codigo detecta el deficit y CREA una linea SAP nueva para cubrirlo (diseno, continua); y
+  "available_sap_lines was empty, using all SAP lines as fallback reference" (32984) -> fallback.
+- **Packing `websockets` legacy "ERROR:    data transfer failed" + traceback terminando en `OSError:
+  [WinError 121] The semaphore timeout period has expired` (issue 77645)**: NO es un error de la app.
+  La libreria `websockets` (protocolo legacy) lo loguea cuando una conexion WebSocket
+  (`/api/v1/ws/<usuario>`) se queda obsoleta y el TCP expira (cliente que dejo de responder o red caida);
+  el cliente solo desconecta. El clasificador pasivo lo marca ERROR por el prefijo de la linea; no
+  requiere accion.
+- **Packing `pre_item_service` "Error resolving codes for target DB" (issue 77691)**: al crear un item
+  en la BD destino, `_resolve_codes_for_target_db` consulta OARG y falla con `Invalid column name 'Code'`
+  (mismo tipo de hueco de esquema SAP que ApTaxCode); el `except` (linea ~694) loguea WARNING y devuelve
+  los codigos sin resolver (-1) -> fallback, el flujo CONTINUA. No es un crash. El ERROR
+  "(Background on this error...)" que lo acompana (74128) es el falso positivo del clasificador pasivo.
 
 ### Falso positivo del clasificador pasivo (verificado 2026-10-15)
 `_classify_level` en `backend/app/services/log_service.py` clasifica lineas SIN prefijo de nivel
@@ -123,3 +252,65 @@ Packing fallara; `normalize_reported_level` (event_classification.py) no cubre e
 tratar un issue ERROR de una sola linea tecnica como incidente, ubicar la linea en el log y ver si
 es continuacion (`[SQL: ...]`, `(Background on this error...)`, `Traceback`, lineas de codigo) de
 un evento ya registrado.
+
+
+## SofiaTunnel: forward remoto zombie (corregido 2026-10-16)
+
+Los probes `sofiatunnel` y `sofiatunnel_e2e` se caen juntos cuando el sshd del
+droplet mantiene `127.0.0.1:5180` por una sesion SSH muerta (cliente que
+desaparece en silencio); NSSM reintenta en bucle (exit 255) hasta ~17-18 min.
+Corregido en el droplet con `ClientAliveInterval 15` + `ClientAliveCountMax 3`
+(drop-in `/etc/ssh/sshd_config.d/10-client-alive.conf`, `systemctl reload ssh`).
+Detalle, evidencia y rollback en `C:/Users/ahmed/AGENTS.md`. No hay bug en el
+monitor; el auto-restore solo reintenta/espera.
+
+
+### Slow request en /products/image (mecanismo verificado 2026-10-16)
+
+El issue 10862 (`Slow request - GET /products/image/...`, WARNING, fuente active) es la
+familia esperada, pero el endpoint es normalmente rapido (16-47 ms): se vuelve lento por el
+indice de imagenes. En `mayor/backend/app/utils/images.py` el indice se construye con
+`os.scandir` sobre el share SMB `\\192.168.0.243\Imagenes Sap\WM-M\Images` y se
+RECONSTRUYE INLINE dentro de la request cuando expira el TTL (`PRODUCT_IMAGES_INDEX_TTL`,
+default 300 s) o cuando el sentinel cross-worker marca invalidacion; las demas requests de
+imagen concurrentes quedan bloqueadas en `_directory_index_lock` hasta que termina el scan. El
+rebuild se dispara cada ~5 min y suelen hacerlo 3-4 workers en el mismo segundo (evidencia:
+`Building image directory index` en el AppStderr de Mayor), asi que las requests de imagen se
+encolan juntas; medido 2026-10-16 01:56 local, 3 rebuilds en 0,2 s y ~9 s hasta liberar.
+Por eso aparecen rafagas con la MISMA duracion (p. ej. 2026-10-14 18:34:49-52: 6 requests de
+22-28 s). `_fingerprint` (db_service.py) normaliza numeros largos a `N`, asi que todos los
+`/products/image/*` caen en el mismo issue. Duraciones observadas 5-28 s. Medido 2026-10-16 con
+el share sano: enumerar sus 9.849 archivos tarda ~245 ms (Test-Path 41 ms), asi que esos stalls
+de 6-28 s son latencia SMB TRANSITORIA, no el costo base del scan (re-medir el share antes de
+culpar al codigo). La request responde
+200 (no es un fallo). Mejora posible (NO aplicada): reconstruir el indice en segundo plano o
+servir el indice anterior mientras se refresca.
+
+
+## WppConnect DOWN: frame de puppeteer colgado (issue 81, 2026-10-16)
+
+Fallo real recurrente (~1-2/dia). Sintoma: el probe `wppconnect` de Sofia marca DOWN con
+`status_code=None` (excepcion/timeout), pero `GET /api/default/status-session` responde
+`CONNECTED` en <0.2s. La causa es que `GET /api/default/check-connection-session` CUELGA:
+internamente llama `Whatsapp.isConnected()` -> `page.evaluate()` y el frame de
+puppeteer/Chromium esta colgado (`Runtime.callFunctionOn timed out` en el log de WPPConnect).
+El status en memoria queda `CONNECTED` stale (no llegan eventos statusFind con el frame muerto).
+
+Remedio NO destructivo (preserva pairing; es lo que hace el propio codigo de Mayor):
+1. `POST /api/default/{secret}/generate-token` -> token.
+2. `POST /api/default/close-session` (Bearer).
+3. `POST /api/default/start-session` (Bearer) con `{"waitQrCode":true,"createOptions":{"autoClose":0}}`
+   y SIN la clave `webhook` (asi el server usa su `WEBHOOK_URL` y no se rompen los entrantes).
+   Tarda ~30s y devuelve `{"status":"CONNECTED","qrcode":null}` (qrcode:null = pairing intacto).
+4. Verificar `check-connection-session` -> 200 `{"status":true}`.
+Verificado 2026-10-16 (12:36Z): recuperado en <1 min, sin QR, y el probe volvio a UP.
+
+Alternativa nativa: Mayor ya tiene `_auto_recover_session` (misma secuencia close+start) que
+dispara `_track_abnormal_and_maybe_recover` (grace `_STUCK_CONNECTED_GRACE_S=90s`) al final de
+`get_full_status`. PERO solo corre cuando alguien pollea `/status`/`/health` de Mayor (el
+frontend cada ~5s); fuera de horario no se dispara y el probe queda DOWN hasta que alguien
+recupere. No hay job periodico que lo dispare. Mejora posible (NO aplicada): un trigger
+periodico en Mayor (o un probe de Sofia a `/api/v1/wppconnect/status`).
+
+No reiniciar el servicio NSSM como primera opcion: close+start es mas suave y suficiente para
+el detached-frame comun. Reiniciar WPPConnect NO borra el pairing (pero es mas pesado).
