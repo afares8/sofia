@@ -45,6 +45,20 @@ def test_passive_classification_warns_expected_cancellations():
     assert log_service._classify_level("ERROR: invoice update failed") == "ERROR"
 
 
+def test_ansi_colored_level_is_stripped_and_classified(tmp_path, clean_log_state):
+    # WPPConnect escribe \x1b[31merror\x1b[39m: <ts> <msg>; sin strip no se clasifica
+    # (el \b de _LEVEL_RE no matchea "merror").
+    log = tmp_path / "wpp.out.log"
+    log.write_bytes(b"\x1b[31merror\x1b[39m: 2026-10-16T12:37:14.972Z Cannot read properties "
+                    b"of undefined (reading 'prepRawMedia')\n")
+    events = asyncio.run(log_service.tail_log(
+        "wppconnect", "WppConnect", str(log), tail_lines=50))
+    assert len(events) == 1
+    assert events[0].level == "ERROR"
+    assert "\x1b" not in events[0].message
+    assert "prepRawMedia" in events[0].message
+
+
 @pytest.fixture
 def clean_log_state(monkeypatch):
     monkeypatch.setattr(log_service, "_file_positions", {})
@@ -307,6 +321,21 @@ def test_multiword_prefix_not_stripped_as_logger():
     reported, message = log_service._split_line("ERROR: HTTP 500: upstream failed")
     assert message == "HTTP 500: upstream failed"
     assert log_service._classify_level("ERROR: HTTP 500: upstream failed") == "ERROR"
+
+
+def test_python_logging_format_uses_reported_level_not_message_words():
+    info_line = (
+        "2026-10-12 05:28:00,691 - app.pantalla.kpi - INFO - "
+        "[WARN] Usando metodo antiguo para 123"
+    )
+    assert log_service._classify_level(info_line) is None
+    warn_line = (
+        "2026-10-12 09:48:49,446 - app.security - WARNING - "
+        "PROBLEMA DETECTADO: ERROR en cabecera"
+    )
+    assert log_service._classify_level(warn_line) == "WARNING"
+    err_line = "2026-10-12 09:28:13,001 - app.dmc - ERROR - DMCE login rejected"
+    assert log_service._classify_level(err_line) == "ERROR"
 
 
 def test_logger_name_does_not_downgrade_severity():

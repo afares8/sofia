@@ -38,6 +38,7 @@ _NSSM_SERVICES = {"mayor": "MayorBackend", "packing": "PackingBackend"}
 
 # Regex to detect log levels
 _LEVEL_RE = re.compile(r"\b(ERROR|CRITICAL|WARNING|WARN)\b", re.IGNORECASE)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _HEAD_RE = re.compile(
     r"^(CRITICAL|ERROR|WARNING|WARN|INFO|DEBUG|TRACE|NOTICE)\b", re.IGNORECASE
 )
@@ -277,7 +278,9 @@ async def tail_log(service_id: str, service_name: str, log_path: str, tail_lines
 
         for raw, was_truncated, pos_after in lines:
             try:
-                text = raw.decode("utf-8", errors="replace").strip()
+                # Quitar codigos ANSI (p. ej. WPPConnect escribe \x1b[31merror\x1b[39m)
+                # para que el nivel se clasifique y el mensaje quede legible.
+                text = _ANSI_RE.sub("", raw.decode("utf-8", errors="replace")).strip()
             except Exception:
                 text = ""
             if not text:

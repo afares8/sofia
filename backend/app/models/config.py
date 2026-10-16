@@ -225,6 +225,7 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         id="wppconnect",
         name="WppConnect",
         url=f"http://{_SOFIA_HOST_IP}:21465/api/default/check-connection-session",
+        log_path="C:/Users/ahmed/apps/service-logs/WPPConnect.out.log",
         enabled=True,
         restore_enabled=True,
         auto_restore=False,
@@ -288,6 +289,14 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         url="http://localhost:9000/api/Health/Ping",
         enabled=True,
         restore_enabled=True,
+        auto_restore=False,
+    ),
+    ServiceConfig(
+        id="diapi_packing",
+        name="SAP DIAPI Middleware (Packing)",
+        url="http://localhost:8001/Health/Index",
+        enabled=True,
+        restore_enabled=False,
         auto_restore=False,
     ),
 ]

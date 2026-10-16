@@ -89,6 +89,20 @@ El puente Sofia-Devin rutea `vision` al grupo **local** (todo lo que no sea elen
 que sus avisos los atiende la sesion diaria de las apps de la PC. El log arranca `from_now`
 (cursor al final), asi que no reingesta el historial previo.
 
+## Detector de drift y cobertura ampliada (2026-10-16)
+
+`drift_service.py` compara la fecha del codigo mas nuevo de cada backend con el arranque del
+servicio NSSM (`/api/health/sofia` -> `deploy_drift`, cacheado 300 s): si el codigo es mas nuevo,
+hay un cambio sin desplegar. Nacio del bug de Vision (servicio con codigo de 2 dias antes).
+`drift=None` cuando no se pudo determinar (no se reporta como drift).
+
+Cobertura agregada: `diapi` (Mayor, `http://localhost:9000/api/Health/Ping`) quedo `enabled` y
+`diapi_packing` (`http://localhost:8001/Health/Index`) se sumo — ambos middlewares SAP. Usar
+`localhost`, no `127.0.0.1` (HTTP.sys devuelve 400). `wppconnect` ahora tiene
+`log_path C:/Users/ahmed/apps/service-logs/WPPConnect.out.log`; sus lineas traen codigos ANSI
+(`\x1b[31merror\x1b[39m`), asi que `log_service` los limpia con `_ANSI_RE` antes de clasificar
+(sin el strip, `\berror\b` no matchea "merror" y el error se perdia).
+
 ## Supresion de ruido: familias conocido-esperadas (2026-10-16)
 
 `config.json` acepta `log_ignore_patterns`: lista de `{id, pattern (regex, case-insensitive,
@@ -342,3 +356,8 @@ periodico en Mayor (o un probe de Sofia a `/api/v1/wppconnect/status`).
 
 No reiniciar el servicio NSSM como primera opcion: close+start es mas suave y suficiente para
 el detached-frame comun. Reiniciar WPPConnect NO borra el pairing (pero es mas pesado).
+
+La linea de log `error: ... Runtime.callFunctionOn timed out ... ProtocolError` (issue 77881) es la
+MISMA firma de ese frame colgado; el monitor pasivo la ingesta como issue ERROR, y puede llegar
+tarde (la linea ingerida era de ~6 h antes, cuando WPPConnect ya estaba UP). No es un error nuevo:
+si el probe `wppconnect` esta UP (200) al momento, es historico.
