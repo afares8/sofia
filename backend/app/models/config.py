@@ -299,6 +299,22 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         restore_enabled=False,
         auto_restore=False,
     ),
+    ServiceConfig(
+        id="sofia-devin-local",
+        name="Sofia-Devin (apps de la PC)",
+        url="http://127.0.0.1:5185/health",
+        enabled=True,
+        restore_enabled=False,
+        auto_restore=False,
+    ),
+    ServiceConfig(
+        id="sofia-devin-elenatec",
+        name="Sofia-Devin (ElenaTec)",
+        url="http://127.0.0.1:5186/health",
+        enabled=True,
+        restore_enabled=False,
+        auto_restore=False,
+    ),
 ]
 
 

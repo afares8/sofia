@@ -89,6 +89,20 @@ El puente Sofia-Devin rutea `vision` al grupo **local** (todo lo que no sea elen
 que sus avisos los atiende la sesion diaria de las apps de la PC. El log arranca `from_now`
 (cursor al final), asi que no reingesta el historial previo.
 
+## Salud del puente y recuperacion (2026-10-16)
+
+El watcher expone `GET /health` en localhost (`policy.health_ports`: local 5185, elenatec 5186):
+200 con `{ok, group, last_poll_age_seconds, status, worker_alive, pending}`; 503 si el ultimo ciclo
+supera `HEALTH_STALE_SECONDS` (120 s). Sofia monitorea `sofia-devin-local` y `sofia-devin-elenatec`
+contra esos endpoints, asi que si el puente se cae o se cuelga, Sofia alerta (antes era un
+componente critico sin vigilancia). Si el puente local muere, el propio CLI local no puede
+arreglarlo (es el que esta caido) → alerta al dueno; el de elenatec si lo puede reiniciar.
+
+Recuperacion de servicios: `sc.exe failure` de los 8 servicios principales y de `VisionMedia`/
+`vms-api` quedo en `restart/5000,restart/10000,restart/60000` con `reset=86400` — **sin `REBOOT`**
+(la maquina ya no se reinicia sola por fallos). Crashes los levanta NSSM/SCM; cuelgues los detecta
+Sofia (probe HTTP) y los reinicia el CLI.
+
 ## Alertas de reglas tambien al AI (2026-10-16)
 
 `rules_engine.evaluate_rules` ahora, ademas de `send_alert` a WhatsApp, crea un issue
@@ -315,6 +329,15 @@ Familias que se repiten y son esperadas o artefactos de parsing, no fallos de la
   (`check_abuseipdb_improved`); el resto del sistema de seguridad funciona. Se emite en
   `init_security_system` (arranque) una vez por worker (~4 por reinicio de Mayor). Hueco de
   configuracion, no un bug.
+- **Packing `bulto_sequence_manager` "[STRICT_OWNERSHIP] ACCESS DENIED: Bulto N warehouse_id=X, access
+  denied for warehouse Y" (78130) + "[SMART_BULTO] Ownership conflict for bulto N, falling back to
+  regular logic" (78131)**: guarda multi-bodega: el bulto pertenece a otra bodega -> se DENIEGA el
+  acceso y se cae a la logica regular (`_open_smart_next_bulto_atomic` -> `_open_next_bulto_atomic`,
+  `bulto_sequence_manager.py:550-558`). Manejado; no es un crash ni perdida de datos.
+- **SERVER-SOFIA Host, Windows System event 20 (WindowsUpdateClient) "Installation Failure ... error
+  0x80073D02: <Store app>" (issues 78159/78160)**: Windows Update no pudo instalar/actualizar apps de
+  Microsoft Store (IntelArcSoftware, YourPhone) -> error 0x80073D02. Es ruido del SO (no afecta a las
+  apps del servidor ni a los servicios NSSM); no requiere accion.
 
 ### Falso positivo del clasificador pasivo (verificado 2026-10-15)
 `_classify_level` en `backend/app/services/log_service.py` clasifica lineas SIN prefijo de nivel
@@ -392,4 +415,7 @@ el detached-frame comun. Reiniciar WPPConnect NO borra el pairing (pero es mas p
 La linea de log `error: ... Runtime.callFunctionOn timed out ... ProtocolError` (issue 77881) es la
 MISMA firma de ese frame colgado; el monitor pasivo la ingesta como issue ERROR, y puede llegar
 tarde (la linea ingerida era de ~6 h antes, cuando WPPConnect ya estaba UP). No es un error nuevo:
-si el probe `wppconnect` esta UP (200) al momento, es historico.
+si el probe `wppconnect` esta UP (200) al momento, es historico. ADEMAS: las mismas lineas del
+2026-10-16T19:32:37Z se reingirieron varias veces (issues 77959/77961 re-creados con nuevas
+occurrences 78050/78051, 78166/78167) -> el CURSOR del log de WPPConnect no avanza / relee tramos;
+revisar el cursor de `WPPConnect.out.log` (identidad de archivo / from_now).

@@ -83,6 +83,7 @@ def env(tmp_path):
     policy["devin_executable"] = str(devin)
     policy["python_executable"] = str(tmp_path / "python.exe")
     policy["poll_seconds"] = 0.01
+    policy.pop("health_ports", None)  # no abrir puertos reales en tests
     (policy_dir / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
     loaded = bridge.load_policy(policy_dir)
     return Simple(tmp=tmp_path, db=db, policy_dir=policy_dir, policy=loaded,
@@ -2058,6 +2059,35 @@ def test_transport_request_without_idle_timeout_still_works():
         assert res["protocolVersion"] == 1
     finally:
         tr.close()
+
+
+def test_health_snapshot_ok_and_stale(env):
+    w, store, spawns = make_watcher(env)
+    payload, status = w.health_snapshot()
+    assert status == 503 and payload["ok"] is False  # todavia no polleo
+    w._last_poll_at = w.now()
+    payload, status = w.health_snapshot()
+    assert status == 200 and payload["ok"] is True
+    assert payload["group"] == "local"
+    w._last_poll_at = w.now() - 10_000
+    assert w.health_snapshot()[1] == 503
+
+
+def test_health_server_serves_json(env):
+    import urllib.request
+    w, store, spawns = make_watcher(env)
+    w._last_poll_at = w.now()
+    httpd = bridge.start_health_server(0, w.health_snapshot)
+    assert httpd is not None
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/health", timeout=5) as resp:
+            assert resp.status == 200
+            body = json.loads(resp.read().decode("utf-8"))
+        assert body["ok"] is True and body["group"] == "local"
+    finally:
+        httpd.shutdown()
 
 
 def test_worker_recovers_from_stalled_turn(env):

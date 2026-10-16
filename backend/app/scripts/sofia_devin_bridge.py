@@ -33,6 +33,7 @@ import time
 import traceback as tb_mod
 from contextlib import contextmanager
 from datetime import date
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -51,6 +52,7 @@ MAX_COMPLETED = 1000
 STALL_SECONDS = 900.0
 MAX_STALL_RETRIES = 1
 STALL_WAIT_SLICE = 0.25
+HEALTH_STALE_SECONDS = 120.0
 CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
 WORKER_FAIL_STATUS = {
     "agent_missing", "agent_spawn_error", "agent_init_error", "session_error",
@@ -869,6 +871,38 @@ def default_log_sink(state_dir: Path) -> Callable[[str], None]:
     return sink
 
 
+class _HealthHandler(BaseHTTPRequestHandler):
+    server_version = "SofiaDevinHealth/1.0"
+
+    def do_GET(self):  # noqa: N802
+        if self.path.split("?")[0] not in ("/health", "/"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        payload, status = self.server.snapshot()  # type: ignore[attr-defined]
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):  # silencio: no ensuciar logs
+        pass
+
+
+def start_health_server(port: int, snapshot) -> Optional[Any]:
+    """Servidor HTTP minimo (solo localhost) con /health. None si no puede."""
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", int(port)), _HealthHandler)
+    except OSError:
+        return None
+    httpd.snapshot = snapshot  # type: ignore[attr-defined]
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd
+
+
 class Watcher:
     def __init__(self, policy, group, source, store,
                  spawn_worker=default_spawn_worker,
@@ -893,6 +927,25 @@ class Watcher:
             devin_exists = lambda: bool(exe) and Path(exe).exists()
         self.devin_exists = devin_exists
         self._last_child = None
+        self._last_poll_at: Optional[float] = None
+
+    def health_snapshot(self):
+        """(payload, http_status) para el endpoint de salud del puente."""
+        state: Dict[str, Any] = {}
+        try:
+            state = self.store.load()
+        except Exception:
+            state = {}
+        age = None if self._last_poll_at is None else self.now() - self._last_poll_at
+        stale = age is None or age > HEALTH_STALE_SECONDS
+        return ({
+            "ok": not stale,
+            "group": self.group,
+            "last_poll_age_seconds": None if age is None else round(age, 1),
+            "status": state.get("status"),
+            "worker_alive": bool(self.is_worker_alive(self.group)),
+            "pending": len(state.get("pending") or []),
+        }, (503 if stale else 200))
 
     def poll_once(self) -> Dict[str, Any]:
         decision: Dict[str, Any] = {"spawn_day": None, "queued": 0,
@@ -1046,10 +1099,16 @@ class Watcher:
     def run(self, poll_seconds=None, sleep=time.sleep,
             max_cycles=None) -> None:
         interval = float(poll_seconds or self.policy.get("poll_seconds", 15))
+        port = (self.policy.get("health_ports") or {}).get(self.group)
+        if port:
+            if start_health_server(int(port), self.health_snapshot) is None:
+                self.log(f"[watcher {self.group}] no se pudo abrir el health "
+                         f"port {port}")
         cycles = 0
         while True:
             try:
                 result = self.poll_once()
+                self._last_poll_at = self.now()
                 if result.get("status") not in ("idle", "ok"):
                     self.log(f"[watcher {self.group}] {result}")
             except (StateError, BridgeError) as exc:

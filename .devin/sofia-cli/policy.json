@@ -7,6 +7,10 @@
   "poll_seconds": 15,
   "batch_size": 50,
   "stall_seconds": 900,
+  "health_ports": {
+    "local": 5185,
+    "elenatec": 5186
+  },
   "levels": ["WARNING", "ERROR", "CRITICAL"],
   "permission_mode": "dangerous",
   "first_start": "from_now",
