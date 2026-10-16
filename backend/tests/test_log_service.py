@@ -45,6 +45,22 @@ def test_passive_classification_warns_expected_cancellations():
     assert log_service._classify_level("ERROR: invoice update failed") == "ERROR"
 
 
+def test_continuation_lines_are_not_own_errors():
+    # Cola de una excepcion multi-linea ya manejada: no es un error propio.
+    assert log_service._classify_level(
+        "(Background on this error at: https://sqlalche.me/e/20/f405)") is None
+    assert log_service._classify_level(
+        '  File "app/x.py", line 1, in f') is None
+    assert log_service._classify_level("[SQL: SELECT 1]") is None
+    assert log_service._classify_level(
+        "Traceback (most recent call last):") is None
+    assert log_service._classify_level("During handling of the above exception") is None
+    # Una linea sin prefijo que menciona ERROR/WARNING sigue clasificandose
+    assert log_service._classify_level("boom: ERROR while saving") == "ERROR"
+    # Y con prefijo sigue igual
+    assert log_service._classify_level("ERROR: real failure") == "ERROR"
+
+
 def test_ansi_colored_level_is_stripped_and_classified(tmp_path, clean_log_state):
     # WPPConnect escribe \x1b[31merror\x1b[39m: <ts> <msg>; sin strip no se clasifica
     # (el \b de _LEVEL_RE no matchea "merror").

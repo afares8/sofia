@@ -339,16 +339,19 @@ Familias que se repiten y son esperadas o artefactos de parsing, no fallos de la
   Microsoft Store (IntelArcSoftware, YourPhone) -> error 0x80073D02. Es ruido del SO (no afecta a las
   apps del servidor ni a los servicios NSSM); no requiere accion.
 
-### Falso positivo del clasificador pasivo (verificado 2026-10-15)
-`_classify_level` en `backend/app/services/log_service.py` clasifica lineas SIN prefijo de nivel
+### Falso positivo del clasificador pasivo (verificado 2026-10-15; CORREGIDO 2026-10-16)
+`_classify_level` en `backend/app/services/log_service.py` clasificaba lineas SIN prefijo de nivel
 buscando la palabra ERROR/WARNING/WARN en cualquier parte de la linea (`_LEVEL_RE`). Por eso una
-linea de continuacion de una excepcion multi-linea ya manejada puede crear un issue ERROR propio.
+linea de continuacion de una excepcion multi-linea ya manejada podia crear un issue ERROR propio.
 Caso real: `(Background on this error at: https://sqlalche.me/e/20/f405)` (cola de un
 `logger.warning(str(exc))` de SQLAlchemy/pyodbc en Packing) quedo como issue ERROR 74128 sin que
-Packing fallara; `normalize_reported_level` (event_classification.py) no cubre ese patron. Antes de
-tratar un issue ERROR de una sola linea tecnica como incidente, ubicar la linea en el log y ver si
-es continuacion (`[SQL: ...]`, `(Background on this error...)`, `Traceback`, lineas de codigo) de
-un evento ya registrado.
+Packing fallara.
+
+**Corregido**: `_CONTINUATION_RE` hace que `_classify_level` devuelva `None` para lineas de
+continuacion (empiezan con espacio, `(`, `[SQL:`, `[parameters:`, `File "`, `Traceback`, `at `,
+`...`) antes de buscar el nivel. Una linea sin prefijo que SI menciona ERROR/WARNING (con word
+boundary) sigue clasificandose. Nota: `\bERROR\b` NO matchea dentro de `ValueError` (sin boundary),
+asi que los tracebacks que solo dicen `ValueError:` no generan issue por si solos.
 
 
 ## SofiaTunnel: forward remoto zombie (corregido 2026-10-16)

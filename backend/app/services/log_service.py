@@ -39,6 +39,14 @@ _NSSM_SERVICES = {"mayor": "MayorBackend", "packing": "PackingBackend"}
 # Regex to detect log levels
 _LEVEL_RE = re.compile(r"\b(ERROR|CRITICAL|WARNING|WARN)\b", re.IGNORECASE)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# Lineas de continuacion (cola de una excepcion multi-linea ya manejada). NO son
+# un error propio: buscar ERROR/WARNING dentro de ellas crea falsos positivos
+# (caso real: "(Background on this error at: https://sqlalche.me/e/20/f405)").
+_CONTINUATION_RE = re.compile(
+    r"^(?:\s|\(|\[(?:SQL|parameters|cached|raw sql|generated sql|tip:)"
+    r"|File \"|Traceback \(most recent call last\)|During handling of the above"
+    r"|The above exception|at |\.\.\.|\^+$)",
+)
 _HEAD_RE = re.compile(
     r"^(CRITICAL|ERROR|WARNING|WARN|INFO|DEBUG|TRACE|NOTICE)\b", re.IGNORECASE
 )
@@ -142,6 +150,9 @@ def _classify_level(line: str) -> Optional[str]:
         return normalize_reported_level(level, message)
     m = _LEVEL_RE.search(line)
     if not m:
+        return None
+    if _CONTINUATION_RE.match(line):
+        # Continuacion de una excepcion ya manejada, no un error propio.
         return None
     level = m.group(1).upper()
     if level == "WARN":
