@@ -89,6 +89,24 @@ El puente Sofia-Devin rutea `vision` al grupo **local** (todo lo que no sea elen
 que sus avisos los atiende la sesion diaria de las apps de la PC. El log arranca `from_now`
 (cursor al final), asi que no reingesta el historial previo.
 
+## Alertas de reglas tambien al AI (2026-10-16)
+
+`rules_engine.evaluate_rules` ahora, ademas de `send_alert` a WhatsApp, crea un issue
+(`upsert_event`, level WARNING, `source="rules"`, mensaje estable `[REGLA] <nombre>` y el detalle
+variable en `detail`) para que el CLI Sofia-Devin lo vea. Antes las alertas de reglas
+(spike/error_count/slow_response) iban SOLO al WhatsApp y el AI nunca las veia. El mensaje estable
+evita crear un issue nuevo por cada conteo distinto (el fingerprint incluye el mensaje).
+
+## Tareas programadas deshabilitadas (2026-10-16)
+
+El dueno pidio no tener scripts automaticos de arranque/reinicio. Deshabilitadas:
+`ServerSofia-HealthWatchdog` (server_watchdog.ps1, reiniciaba servicios), `SofiaTunnelFix`
+(fix-tunnel.ps1) y `ServerSofia-PlatformHealthObserver` (Observe-PlatformHealth.ps1, solo observa).
+Nada en el codigo de Sofia lee `PlatformHealth.state.json` ni `watchdog.log`. Se mantienen los
+backups (`ServerSofia-BackupReplica`, `ServerSofia-BackupRestoreTest`) y `ReinicioProgramadoServidor`.
+La recuperacion de servicios sigue por NSSM (`sc.exe failure ... restart/...`) y por el restore
+manual de Sofia; el auto-reinicio por script ya no corre.
+
 ## Detector de drift y cobertura ampliada (2026-10-16)
 
 `drift_service.py` compara la fecha del codigo mas nuevo de cada backend con el arranque del
@@ -283,6 +301,20 @@ Familias que se repiten y son esperadas o artefactos de parsing, no fallos de la
   Transitorio/benigno, no es un error. Log en `C:/ProgramData/VmsSofia/Api/vms-api.log`. Ojo: la
   ocurrencia ingerida era del 2026-10-14 18:19:30Z (el monitor leyo el log desde el inicio, no
   from_now); revisar el cursor de ese servicio si se quiere evitar reingesta de historial.
+- **Mayor `printnode_service` "[PrintNode] process_order_for_printing called ..." (71535) y
+  "[Approver Resolution] ... Found approver ..." (71536)**: son DIAGNOSTICOS logueados a nivel WARNING
+  (no errores): reportan que se disparo el flujo de impresion y que se resolvio el aprobador
+  (`printnode_service.py:99-138,1642`). Benignos. Solo "[Approver Resolution] No approver found"
+  seria un caso a revisar (sin aprobador resoluble).
+- **Packing `routers.packing` "Skipping pallet label print for order X, pallet N: Cannot print
+  pallet with only placeholder records ..." (issue 32637)**: SKIP intencional (`packing.py:2298-2305`):
+  el palet tiene solo registros placeholder (sin contenido real) -> no se imprime etiqueta
+  (`status="skipped"`, se registra en el log de impresion). Benigno; el WARNING podria bajarse a INFO.
+- **Mayor `security_service_improved` "AbuseIPDB API key no configurada" (issue 71289)**: falta la
+  credencial de AbuseIPDB, asi que se salta el chequeo de reputacion de IP
+  (`check_abuseipdb_improved`); el resto del sistema de seguridad funciona. Se emite en
+  `init_security_system` (arranque) una vez por worker (~4 por reinicio de Mayor). Hueco de
+  configuracion, no un bug.
 
 ### Falso positivo del clasificador pasivo (verificado 2026-10-15)
 `_classify_level` en `backend/app/services/log_service.py` clasifica lineas SIN prefijo de nivel

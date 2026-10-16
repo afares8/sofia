@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 
 from app.models.config import AlertRule, ServiceConfig
+from app.models.event import ErrorEvent
 from app.services import analytics_service, db_service, whatsapp_service
 from app.services.config_service import load_config
 
@@ -124,6 +125,19 @@ async def evaluate_rules() -> int:
                 continue
             _mark_fired(rule, svc.id)
             fired += 1
+            # La alerta de regla tambien crea un issue para que el CLI
+            # (Sofia-Devin) la vea: antes solo llegaba al WhatsApp.
+            # El mensaje es estable para que agrupe en un solo issue; el
+            # detalle variable (conteos) va en `detail`.
+            try:
+                await db_service.upsert_event(ErrorEvent(
+                    service_id=svc.id, service_name=svc.name, level="WARNING",
+                    message=f"[REGLA] {rule.name}", detail=msg,
+                    source="rules", timestamp=datetime.utcnow(),
+                ))
+            except Exception as exc:
+                logger.error(f"[RULES] no se pudo registrar el issue de "
+                             f"'{rule.id}' para {svc.id}: {exc}")
             await whatsapp_service.send_alert(
                 cfg.alerts, svc.name, svc.id, "WARNING",
                 f"📋 Regla: {rule.name}", msg,
