@@ -1700,13 +1700,23 @@ class ConsoleWorker:
             self._inflight_failed(exc)
             return False
         self._turn_active = False
-        self._stall_retries = 0
         self._flush_stream()
         self._active_event_ids = []
         stop_reason = (result or {}).get("stopReason") if isinstance(result, dict) else None
         if stop_reason != "end_turn":
+            if stop_reason == "max_tokens" \
+                    and self._stall_retries < MAX_STALL_RETRIES:
+                self._stall_retries += 1
+                self._print("\n*** El turno se corto por limite de tokens "
+                            "(max_tokens); reintento el lote. ***")
+                self._ui_event("turn_retry", reason="max_tokens")
+                with self.store.transaction() as state:
+                    state["inflight"] = None
+                    state["uncertain"] = False
+                return self._send_batch(events, use_initial)
             self._inflight_incomplete(stop_reason)
             return False
+        self._stall_retries = 0
         with self.store.transaction() as state:
             completed = set(state["completed"])
             completed.update(event_ids)
@@ -1959,8 +1969,26 @@ class ConsoleWorker:
         except Exception:
             return True
 
+    def _heal_truncated_turn(self) -> None:
+        """Un turno cortado por max_tokens no es una entrega incierta: se
+        descarta el inflight para que el worker lo reintente desde pending."""
+        try:
+            state = self.store.load()
+        except Exception:
+            return
+        inflight = state.get("inflight") or {}
+        if state.get("uncertain") and inflight.get("stop_reason") == "max_tokens":
+            with self.store.transaction() as st:
+                st["inflight"] = None
+                st["uncertain"] = False
+                st["status"] = "ok"
+                st["status_at"] = self.now()
+                st["last_error"] = None
+            self._print("Turno previo cortado por max_tokens: lo reintento.")
+
     def _main_loop(self) -> int:
         self._start_dispatchers()
+        self._heal_truncated_turn()
         try:
             while not self._stop.is_set():
                 if self._eof_defer and not self._has_sendable():

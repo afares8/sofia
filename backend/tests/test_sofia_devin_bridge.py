@@ -2084,3 +2084,42 @@ def test_worker_recovers_from_stalled_turn(env):
                if m["method"] == "session/prompt"]
     assert len(prompts) == 1
     assert "colgado" in prompts[0]["params"]["prompt"][0]["text"]
+
+
+def test_worker_retries_batch_on_max_tokens(env):
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["pending"] = [ev(1, message="cortado")]
+    calls = {"n": 0}
+
+    def hook(msg, proc):
+        calls["n"] += 1
+        proc.stop_reason = "max_tokens" if calls["n"] == 1 else "end_turn"
+
+    agent = FakeAcpProc(prompt_hook=hook)
+    worker, wstore, out, ph = make_worker(env, agent=agent)
+    assert worker.run() == 0
+    prompts = [m for m in agent.received if m["method"] == "session/prompt"]
+    assert len(prompts) == 2
+    st = wstore.load()
+    assert st["completed"] == [1] and st["pending"] == []
+    assert st["uncertain"] is False and st["inflight"] is None
+
+
+def test_worker_heals_truncated_turn_on_start(env):
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["pending"] = [ev(1, message="cortado")]
+        st["inflight"] = {"event_ids": [1], "prompt_sent": True,
+                          "uncertain": True, "use_initial": False,
+                          "day": "2026-01-01", "stop_reason": "max_tokens"}
+        st["uncertain"] = True
+        st["status"] = "turn_incomplete:max_tokens"
+    agent = FakeAcpProc()
+    worker, wstore, out, ph = make_worker(env, agent=agent)
+    assert worker.run() == 0
+    st = wstore.load()
+    assert st["completed"] == [1] and st["pending"] == []
+    assert st["uncertain"] is False and st["inflight"] is None
