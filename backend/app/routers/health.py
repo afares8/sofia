@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from app.services import db_service, whatsapp_service
+from app.services import db_service, whatsapp_service, noise_service
 from app.services.config_service import load_config
 from app.services.health_service import get_all_statuses, check_service
 from app.models.event import ServiceStatus
@@ -176,6 +176,7 @@ async def sofia_self_health() -> Dict:
         "docker_monitor": docker_monitor,
         "local_monitor": local_monitor,
         "log_monitor": log_monitor,
+        "noise": noise_service.get_stats(),
         "automation": automation,
         "now": datetime.utcnow().isoformat(),
     }

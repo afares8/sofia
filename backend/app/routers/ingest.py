@@ -78,6 +78,11 @@ async def ingest_event(payload: IngestPayload):
 
     issue_id, is_new, is_regression = await db_service.upsert_event(event)
 
+    if issue_id == 0:
+        # Familia conocido-esperada (ruido): no se crea issue ni alerta.
+        return {"ok": True, "issue_id": 0, "is_new": False,
+                "is_regression": False, "ignored": True}
+
     # Attach breadcrumbs to the latest occurrence
     if payload.breadcrumbs:
         try:

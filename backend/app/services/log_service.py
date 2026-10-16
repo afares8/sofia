@@ -51,6 +51,11 @@ _TS_LEVEL_RE = re.compile(
     r"(?:[^\s:]{1,80}:\s*)?(.*)$",
     re.IGNORECASE | re.S,
 )
+_PY_LOGGING_RE = re.compile(
+    r"^\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s+-\s+\S+\s+-\s+"
+    r"(CRITICAL|ERROR|WARNING|WARN|INFO|DEBUG|TRACE|NOTICE)\s+-\s+(.*)$",
+    re.IGNORECASE | re.S,
+)
 _LOGGER_PREFIX_RE = re.compile(r"^[^\s:]{1,80}:")
 
 
@@ -109,7 +114,7 @@ def _resolve_log_path(service_id: str, configured_path: str) -> Optional[Path]:
 
 def _split_line(line: str):
     """Return (reported_level|None, canonical_message) for a raw log line."""
-    m = _TS_LEVEL_RE.match(line)
+    m = _PY_LOGGING_RE.match(line) or _TS_LEVEL_RE.match(line)
     if m:
         return m.group(1).upper(), (m.group(2) or "").strip()
     m = _HEAD_RE.match(line)
@@ -301,6 +306,8 @@ async def tail_log(service_id: str, service_name: str, log_path: str, tail_lines
                 src["drain_backlog"] = False
                 return events
             _file_positions[key] = pos_after
+            if issue_id == 0:
+                continue
             events.append(event)
 
             # Alert on ERROR or CRITICAL

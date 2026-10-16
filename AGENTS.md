@@ -89,6 +89,19 @@ El puente Sofia-Devin rutea `vision` al grupo **local** (todo lo que no sea elen
 que sus avisos los atiende la sesion diaria de las apps de la PC. El log arranca `from_now`
 (cursor al final), asi que no reingesta el historial previo.
 
+## Supresion de ruido: familias conocido-esperadas (2026-10-16)
+
+`config.json` acepta `log_ignore_patterns`: lista de `{id, pattern (regex, case-insensitive,
+busqueda parcial), service_id (opcional; vacio = todos), note}`. Se aplican en
+`db_service.upsert_event` — el punto unico de creacion de issues — asi que cubren ingesta activa
+(SDK) y pasiva (logs): un mensaje que matchea NO crea issue ni alerta y el cursor del log avanza
+igual. `ingest.py` responde `ignored: true` e `issue_id: 0`; `log_service.tail_log` no agrega el
+evento ni alerta. Observabilidad en `/api/health/sofia` -> `noise.counts` / `noise.last_skip_at`
+(`noise_service.get_stats()`). Cache por mtime de config.json; regex invalida o config ausente
+fallan abierto (no suprimen). Usar SOLO con evidencia de que la familia es esperada; nunca para
+ocultar fallos reales (los patrones cargados son los del triaje documentado de Mayor/Packing).
+NO se silencian "Slow request" (fue como se detecto la caida de produccion del 15/10).
+
 ## Triaje: warnings recurrentes de las apps monitoreadas (2026-10-15)
 
 Familias que se repiten y son esperadas o artefactos de parsing, no fallos de las apps:
@@ -241,6 +254,21 @@ Familias que se repiten y son esperadas o artefactos de parsing, no fallos de la
   (mismo tipo de hueco de esquema SAP que ApTaxCode); el `except` (linea ~694) loguea WARNING y devuelve
   los codigos sin resolver (-1) -> fallback, el flujo CONTINUA. No es un crash. El ERROR
   "(Background on this error...)" que lo acompana (74128) es el falso positivo del clasificador pasivo.
+- **Packing `sap_di_service_manager` ERROR "[SAP-DI] Item creation failed in ELMAGINCSA: Error -5002:
+  [OITM.CstGrpCode] , 'Linked value 773 does not exist'" (issue 77826)**: la creacion de un item en la
+  BD destino (compania ELMAGINCSA) falla porque el `CstGrpCode` del item origen (773) no existe alli.
+  Se RELACIONA con "Error resolving codes for target DB" (77691): como la resolucion de codigos falla
+  (`Invalid column 'Code'`), no se ajusta el CstGrpCode y SAP lo rechaza (-5002). Es un hueco de mapeo
+  de datos multi-compania SAP (no un crash del backend); el endpoint create-item igual responde 200 y el
+  error queda en el log/resultado. Revision de datos SAP si negocio lo requiere. Variante en el
+  llamador `pre_item_service`: "Failed to create item in ELMAGINCSA: SAP Error -5002: [OITM.CstGrpCode]..."
+  (issue 77831).
+- **Vision vms-api (Kestrel) "warn: Microsoft.AspNetCore.Server.Kestrel[22]" (issue 77862)**: es el
+  warning de Kestrel "the heartbeat has been running for X which is longer than 1s. This could be
+  caused by thread pool starvation" -> el servicio .NET (vms-api) estuvo ocupado >1s en un latido.
+  Transitorio/benigno, no es un error. Log en `C:/ProgramData/VmsSofia/Api/vms-api.log`. Ojo: la
+  ocurrencia ingerida era del 2026-10-14 18:19:30Z (el monitor leyo el log desde el inicio, no
+  from_now); revisar el cursor de ese servicio si se quiere evitar reingesta de historial.
 
 ### Falso positivo del clasificador pasivo (verificado 2026-10-15)
 `_classify_level` en `backend/app/services/log_service.py` clasifica lineas SIN prefijo de nivel

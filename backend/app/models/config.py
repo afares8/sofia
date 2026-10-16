@@ -176,6 +176,19 @@ DEFAULT_ALERT_RULES: List[AlertRule] = [
 ]
 
 
+class LogIgnorePattern(BaseModel):
+    """Mensaje conocido-esperado: no crea issue ni alerta (ruido operativo).
+
+    `service_id` vacio/None aplica a todos los servicios. `pattern` es una regex
+    (case-insensitive, busqueda parcial) contra el mensaje. Usar SOLO para
+    familias con evidencia de que son esperadas; nunca para ocultar fallos reales.
+    """
+    id: str
+    pattern: str
+    service_id: Optional[str] = None
+    note: str = ""
+
+
 class MonitorConfig(BaseModel):
     poll_interval_seconds: int = 30
     log_tail_lines: int = 200
@@ -186,6 +199,7 @@ class MonitorConfig(BaseModel):
     autonomy: AutonomyConfig = AutonomyConfig()
     app_repos: List[AppRepoConfig] = []
     github_sync: GithubSyncConfig = GithubSyncConfig()
+    log_ignore_patterns: List[LogIgnorePattern] = []
 
 
 DEFAULT_SERVICES: List[ServiceConfig] = [
@@ -244,6 +258,25 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         name="Vision",
         url="https://127.0.0.1:8200/health",
         log_path="C:/Users/ahmed/apps/vision/backend/service.log",
+        enabled=True,
+        timeout_seconds=8,
+        restore_enabled=False,
+        auto_restore=False,
+    ),
+    ServiceConfig(
+        id="vision_media",
+        name="Vision Media (mediamtx)",
+        url="http://127.0.0.1:9997/v3/paths/list",
+        enabled=True,
+        timeout_seconds=5,
+        restore_enabled=False,
+        auto_restore=False,
+    ),
+    ServiceConfig(
+        id="vms-api",
+        name="Vision vms-api (dispositivos)",
+        url="https://127.0.0.1:8443/health",
+        log_path="C:/ProgramData/VmsSofia/Api/vms-api.log",
         enabled=True,
         timeout_seconds=8,
         restore_enabled=False,

@@ -10,6 +10,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 from app.models.event import ErrorEvent
+from app.services import noise_service
 
 DB_PATH = Path(os.getenv("SOFIA_DB_PATH", str(Path(__file__).resolve().parents[2] / "data" / "sofia.db")))
 
@@ -281,6 +282,13 @@ async def upsert_event(event: ErrorEvent) -> Tuple[int, bool, bool]:
     """
     fp = _fingerprint(event.service_id, event.level, event.message)
     ts = (event.timestamp or datetime.utcnow()).isoformat()
+
+    # Ruido operativo: familias conocido-esperadas no crean issue ni alerta.
+    # Se aplica aqui (punto unico) para cubrir ingesta activa y pasiva.
+    ignored = noise_service.ignored_reason(event.service_id, event.message)
+    if ignored is not None:
+        noise_service.record_skip(event.service_id, ignored)
+        return (0, False, False)
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL")
