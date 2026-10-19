@@ -13,13 +13,14 @@ app-password credentials work for both apps without duplication.
 The recipients are configurable via SOFIA_ALERT_EMAIL (comma-separated,
 default: ahmed@magnate-inc.com,order@magnate-inc.com).
 """
+import asyncio
 import logging
 import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Dict, Optional
 
 logger = logging.getLogger("sofia.email_alert")
 
@@ -40,6 +41,11 @@ ALERT_EMAIL_RECIPIENT = os.environ.get(
 # Stored in-memory; resets on restart (acceptable for a fallback channel).
 _last_email_sent: Optional[datetime] = None
 _EMAIL_COOLDOWN_SECONDS = 300  # 5 minutes
+
+# Correos diferidos pendientes (clave -> task). Permiten esperar un tiempo
+# antes de mandar el aviso: si al vencer el servicio ya se recupero (p. ej.
+# WPPConnect reiniciado por su watchdog), el correo no se envia.
+_deferred_tasks: Dict[str, "asyncio.Task"] = {}
 
 
 def is_configured() -> bool:
@@ -114,3 +120,64 @@ def send_fallback_email(
     except Exception as exc:
         logger.error("[EMAIL] Unexpected error sending fallback email: %s", exc)
     return False
+
+
+def schedule_fallback_email(
+    subject: str,
+    body: str,
+    delay_seconds: float,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    key: Optional[str] = None,
+) -> bool:
+    """Programa un correo de respaldo para dentro de `delay_seconds`.
+
+    Pensado para caidas transitorias: si al vencer el plazo `cancel_check()`
+    devuelve True (p. ej. el servicio ya se recupero y solo era un reinicio),
+    el correo NO se envia. Un schedule nuevo con la misma clave reemplaza al
+    anterior. Sin event loop disponible cae al envio inmediato (no se pierde).
+    """
+    if not is_configured():
+        logger.warning("[EMAIL] SMTP not configured, no se programa el correo diferido.")
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return send_fallback_email(subject, body)
+    key = key or subject
+    prev = _deferred_tasks.get(key)
+    if prev is not None and not prev.done():
+        prev.cancel()
+    task = loop.create_task(
+        _send_deferred(subject, body, float(delay_seconds), cancel_check))
+    _deferred_tasks[key] = task
+
+    def _cleanup(t: "asyncio.Task", k: str = key) -> None:
+        if _deferred_tasks.get(k) is t:
+            _deferred_tasks.pop(k, None)
+
+    task.add_done_callback(_cleanup)
+    logger.info("[EMAIL] Correo diferido programado en %.0fs: %s",
+                delay_seconds, subject)
+    return True
+
+
+async def _send_deferred(
+    subject: str,
+    body: str,
+    delay_seconds: float,
+    cancel_check: Optional[Callable[[], bool]],
+) -> None:
+    try:
+        await asyncio.sleep(delay_seconds)
+    except asyncio.CancelledError:
+        logger.info("[EMAIL] Correo diferido cancelado: %s", subject)
+        return
+    if cancel_check is not None:
+        try:
+            if cancel_check():
+                logger.info("[EMAIL] Correo diferido descartado (ya no aplica): %s",
+                            subject)
+                return
+        except Exception as exc:
+            logger.warning("[EMAIL] cancel_check fallo (%s); se envia igual", exc)
+    send_fallback_email(subject, body)

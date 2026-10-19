@@ -105,6 +105,38 @@ def test_alerts_only_on_confirmed_outage_and_recovery(monkeypatch):
     assert health_service.whatsapp_service.send_alert.await_count == 2
 
 
+def test_wppconnect_down_defers_fallback_email(monkeypatch):
+    """WPPConnect caido: la alerta se intenta igual, pero el correo de respaldo
+    queda diferido (si vuelve solo, no se manda correo)."""
+    mock_http(monkeypatch, [httpx.Response(503)] * 3)
+    service = ServiceConfig(
+        id="wppconnect", name="WPP",
+        url="http://localhost:21465/api/default/check-connection-session")
+
+    async def run():
+        for _ in range(3):
+            await health_service.check_service(service)
+
+    asyncio.run(run())
+    assert health_service.whatsapp_service.send_alert.await_count == 1
+    kwargs = health_service.whatsapp_service.send_alert.await_args.kwargs
+    assert kwargs["defer_email_seconds"] == health_service.WPPCONNECT_EMAIL_DEFER_SECONDS
+
+
+def test_other_service_down_does_not_defer_email(monkeypatch):
+    mock_http(monkeypatch, [httpx.Response(503)] * 3)
+    service = ServiceConfig(id="packing", name="Packing", url="http://localhost/ping")
+
+    async def run():
+        for _ in range(3):
+            await health_service.check_service(service)
+
+    asyncio.run(run())
+    assert health_service.whatsapp_service.send_alert.await_count == 1
+    kwargs = health_service.whatsapp_service.send_alert.await_args.kwargs
+    assert kwargs["defer_email_seconds"] == 0
+
+
 def test_services_are_polled_concurrently(monkeypatch):
     class StopPolling(Exception):
         pass

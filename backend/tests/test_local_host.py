@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
@@ -54,10 +56,26 @@ def test_unknown_error_source_is_warning():
     assert svc._classify_event(ev) == "WARNING"
 
 
-def test_dotnet_profiler_attach_event_is_warning():
+def test_dotnet_profiler_attach_event_is_noise():
     ev = {"ProviderName": ".NET Runtime", "Id": 1022,
           "LevelDisplayName": "Error"}
-    assert svc._classify_event(ev) == "WARNING"
+    assert svc._classify_event(ev) is None
+
+
+@pytest.mark.parametrize("provider,eid", [
+    ("Microsoft-Windows-DistributedCOM", 10010),
+    ("Microsoft-Windows-LanguagePackSetup", 1042),
+    ("Microsoft-Windows-Search-ProfileNotify", 6),
+])
+def test_known_benign_windows_events_ignored(provider, eid):
+    ev = {"ProviderName": provider, "Id": eid, "LevelDisplayName": "Error"}
+    assert svc._classify_event(ev) is None
+
+
+def test_crash_report_1026_still_alerts():
+    ev = {"ProviderName": ".NET Runtime", "Id": 1026,
+          "LevelDisplayName": "Error"}
+    assert svc._classify_event(ev) == "ERROR"
 
 
 def test_watched_services_present():
@@ -98,6 +116,30 @@ def test_stopped_watched_service_triggers_error(monkeypatch):
     host_event.assert_awaited_once_with(
         "ERROR", "svc_vms-api", "Windows service vms-api is STOPPED"
     )
+
+
+def test_transitional_pending_state_is_warning_not_error(monkeypatch):
+    monkeypatch.setitem(svc._svc_state, "VisionBackend", "RUNNING")
+    host_event = AsyncMock(return_value=True)
+    monkeypatch.setattr(svc, "_host_event", host_event)
+
+    asyncio.run(svc._process_services({"VisionBackend": "STOP_PENDING"}))
+
+    host_event.assert_awaited_once_with(
+        "WARNING", "svc_VisionBackend",
+        "Windows service VisionBackend is STOP_PENDING")
+
+
+def test_service_recovery_is_info(monkeypatch):
+    monkeypatch.setitem(svc._svc_state, "VisionBackend", "STOP_PENDING")
+    host_event = AsyncMock(return_value=True)
+    monkeypatch.setattr(svc, "_host_event", host_event)
+
+    asyncio.run(svc._process_services({"VisionBackend": "RUNNING"}))
+
+    host_event.assert_awaited_once_with(
+        "INFO", "svc_VisionBackend",
+        "Windows service VisionBackend recovered: STOP_PENDING -> RUNNING")
 
 
 def test_paused_service_transition_is_warning(monkeypatch):

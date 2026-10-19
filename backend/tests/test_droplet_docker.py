@@ -222,3 +222,40 @@ def test_remote_grep_superset_for_known_containers():
         pat = re.compile(svc._remote_grep_pattern(container))
         for line in lines:
             assert pat.search(line), f"remote grep missed: {line}"
+
+
+# ── fetch de logs por contenedor (cap de lineas + aislamiento) ───────────────
+
+def test_fetch_container_logs_caps_emission_with_tail():
+    """`docker logs` debe ir acotado con --tail: sin el cap, un json-log de
+    varios GB (tec-db-1 ~2.2 GB) supera el timeout del canal SSH y tumba el
+    poll completo."""
+    cmds = []
+
+    def fake_exec(client, cmd, timeout=40):
+        cmds.append(cmd)
+        return "salida"
+
+    logs, failures = svc._fetch_container_logs(
+        None, ["tec-db-1"], "240s", exec_fn=fake_exec)
+    assert failures == [] and logs["tec-db-1"] == "salida"
+    assert f"--tail {svc.LOG_TAIL_CAP}" in cmds[0]
+    assert "--since 240s" in cmds[0]
+    assert f"tail -{svc.GREP_TAIL_CAP}" in cmds[0]
+
+
+def test_fetch_container_logs_isolates_slow_container():
+    """Un contenedor que revienta (timeout) no debe tumbar el fetch: el resto
+    se devuelve igual y la falla queda listada para diagnostico."""
+    def fake_exec(client, cmd, timeout=40):
+        if "tec-db-1" in cmd:
+            raise TimeoutError()
+        return "ok"
+
+    logs, failures = svc._fetch_container_logs(
+        None, ["tec-db-1", "tec-redis-1"], "240s", exec_fn=fake_exec)
+    assert "tec-db-1" not in logs
+    assert logs["tec-redis-1"] == "ok"
+    assert len(failures) == 1
+    assert failures[0][0] == "tec-db-1"
+    assert "TimeoutError" in failures[0][1]

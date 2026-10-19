@@ -38,7 +38,7 @@ import tempfile
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Deque, Dict, Optional, Set, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 from app.models.event import ErrorEvent
 from app.services import db_service, whatsapp_service
@@ -57,6 +57,10 @@ MEM_WARN_PCT = int(os.getenv("SOFIA_DROPLET_MEM_WARN_PCT", "10"))
 
 FETCH_TIMEOUT_S = 90          # hard cap for a whole SSH fetch round
 GREP_TAIL_CAP = 1000          # safety bound AFTER remote grep (error lines only)
+LOG_TAIL_CAP = 50000          # lineas maximas que docker emite por contenedor:
+# `docker logs --since` sobre un json-log de varios GB (tec-db-1 ~2.2 GB)
+# escanea el archivo hacia atras y supera cualquier timeout de canal; con
+# --tail la emision queda acotada y la consulta baja de ~60-150 s a ~3 s.
 SEEN_CAP = 3000               # persisted dedup ring size
 STATE_PATH = Path(__file__).resolve().parents[2] / "data" / "droplet_state.json"
 
@@ -182,6 +186,7 @@ _status: Dict = {
     "last_error": None,
     "last_ingest_count": 0,
     "consecutive_failures": 0,
+    "log_failures": {},
 }
 
 
@@ -267,6 +272,31 @@ def _remote_grep_pattern(container: str) -> str:
     return _REMOTE_GREP.get(container, _REMOTE_GREP_DEFAULT)
 
 
+def _fetch_container_logs(client, names: List[str], since: str,
+                          exec_fn=None) -> Tuple[Dict[str, str], List[Tuple[str, str]]]:
+    """Fetch + grep remoto de logs, aislado por contenedor.
+
+    Un contenedor lento (json-log de varios GB) o caido no debe tumbar el
+    poll completo: se omite esa fuente en esta pasada, el resto se ingesta
+    igual y la falla queda en (failures) para diagnostico.
+    """
+    exec_fn = exec_fn or _ssh_exec
+    logs: Dict[str, str] = {}
+    failures: List[Tuple[str, str]] = []
+    for name in names:
+        pattern = _remote_grep_pattern(name)
+        try:
+            logs[name] = exec_fn(
+                client,
+                f"docker logs --since {since} --tail {LOG_TAIL_CAP} "
+                f"--timestamps {name} 2>&1 "
+                f"| grep -aE '{pattern}' | tail -{GREP_TAIL_CAP}",
+            )
+        except Exception as exc:
+            failures.append((name, f"{type(exc).__name__}: {exc}"))
+    return logs, failures
+
+
 def _fetch_all(host: str, user: str, key_path: str, since: str) -> Dict:
     """
     One SSH session, all read-only commands. Returns a dict:
@@ -307,14 +337,7 @@ def _fetch_all(host: str, user: str, key_path: str, since: str) -> Dict:
             for ln in ps.splitlines() if ln.strip()
         ]
 
-        logs: Dict[str, str] = {}
-        for name in names:
-            pattern = _remote_grep_pattern(name)
-            logs[name] = _ssh_exec(
-                client,
-                f"docker logs --since {since} --timestamps {name} 2>&1 "
-                f"| grep -aE '{pattern}' | tail -{GREP_TAIL_CAP}",
-            )
+        logs, log_failures = _fetch_container_logs(client, names, since)
 
         events = _ssh_exec(
             client,
@@ -378,7 +401,8 @@ def _fetch_all(host: str, user: str, key_path: str, since: str) -> Dict:
                 checks[k.strip()] = v.strip()
 
         return {"ps": ps, "logs": logs, "events": events,
-                "host": host_info, "checks": checks}
+                "host": host_info, "checks": checks,
+                "log_failures": log_failures}
     finally:
         client.close()
 
@@ -426,7 +450,7 @@ _LIFECYCLE_LEVELS = {
     "oom": "CRITICAL",
     "kill": "WARNING",
     "stop": "WARNING",
-    "start": "WARNING",
+    "start": "INFO",
     "restart": "WARNING",
 }
 _EPHEMERAL_CONTAINER_PREFIXES = ("tec-backend-run-",)
@@ -438,10 +462,7 @@ def _is_ephemeral_container(name: str) -> bool:
 
 async def _ingest_lifecycle(action: str, name: str, exit_code: Optional[int]) -> None:
     if action == "die":
-        if _is_ephemeral_container(name) and exit_code is None:
-            level = "WARNING"
-        else:
-            level = "WARNING" if exit_code in _LIFECYCLE_CLEAN_EXITS else "ERROR"
+        level = "WARNING" if exit_code is None or exit_code in _LIFECYCLE_CLEAN_EXITS else "ERROR"
     else:
         level = _LIFECYCLE_LEVELS.get(action)
     if not level:
@@ -665,6 +686,16 @@ async def _collect_once(since: str) -> int:
         asyncio.to_thread(_fetch_all, SSH_HOST, SSH_USER, SSH_KEY, since),
         timeout=FETCH_TIMEOUT_S,
     )
+
+    # Fallas de logs por contenedor: visibles en /api/health/sofia y en el
+    # log del backend, sin tumbar el poll (el resto de fuentes se ingesta).
+    log_failures = {name: err for name, err in (data.get("log_failures") or [])}
+    if log_failures != (_status.get("log_failures") or {}):
+        for name, err in log_failures.items():
+            logger.warning(f"[DOCKER] logs no obtenidos de {name}: {err}")
+        if not log_failures:
+            logger.info("[DOCKER] todos los contenedores entregan logs de nuevo.")
+        _status["log_failures"] = log_failures
 
     count = 0
     # 1) container health/status transitions

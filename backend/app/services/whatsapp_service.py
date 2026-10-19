@@ -105,6 +105,14 @@ def _delivery_error(exc: Exception) -> str:
     return f"delivery unknown; automatic retry disabled: {type(exc).__name__}: {exc}" if _delivery_uncertain(exc) else str(exc)
 
 
+def _service_is_up(service_id: str) -> bool:
+    """True si el servicio monitoreado ya se recupero (para cancelar un
+    correo diferido: si solo era un reinicio, no se avisa por correo)."""
+    from app.services import health_service
+    status = health_service.get_status(service_id)
+    return bool(status and status.status == "up")
+
+
 async def _post_message(alert_cfg: AlertConfig, phone: str, text: str) -> bool:
     """Single HTTP POST to WPPConnect. Returns True on success."""
     url = f"{alert_cfg.wppconnect_url}/api/{alert_cfg.wppconnect_session}/send-message"
@@ -173,7 +181,11 @@ async def send_alert(
     level: str,
     message: str,
     detail: str = "",
+    defer_email_seconds: int = 0,
 ) -> bool:
+    """Envía una alerta por WhatsApp. Si falla y `defer_email_seconds` > 0,
+    el correo de respaldo se programa para más tarde y se cancela si el
+    servicio ya se recuperó (p. ej. un reinicio rápido de WPPConnect)."""
     if not alert_cfg.whatsapp_enabled:
         return False
 
@@ -216,10 +228,15 @@ async def send_alert(
             logger.error(f"[WA] enqueue_alert failed: {enq_exc}")
         # Fallback: notify via email so the team is aware even when WhatsApp is down.
         from app.services import email_alert_service
-        email_alert_service.send_fallback_email(
-            subject=f"[Sofia] {level} — {service_name} ({service_id})",
-            body=("Entrega desconocida; pudo haber llegado. No se reenviará automáticamente." if _delivery_uncertain(exc) else "La alerta no pudo enviarse por WhatsApp y fue encolada.") + f"\n\n{text}\n\nError: {_delivery_error(exc)}",
-        )
+        subject = f"[Sofia] {level} — {service_name} ({service_id})"
+        body = ("Entrega desconocida; pudo haber llegado. No se reenviará automáticamente." if _delivery_uncertain(exc) else "La alerta no pudo enviarse por WhatsApp y fue encolada.") + f"\n\n{text}\n\nError: {_delivery_error(exc)}"
+        if defer_email_seconds > 0:
+            email_alert_service.schedule_fallback_email(
+                subject, body, delay_seconds=defer_email_seconds,
+                cancel_check=lambda: _service_is_up(service_id),
+                key=f"deferred:{service_id}")
+        else:
+            email_alert_service.send_fallback_email(subject=subject, body=body)
         return False
 
 

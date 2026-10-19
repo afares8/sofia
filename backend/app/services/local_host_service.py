@@ -73,6 +73,14 @@ _ERROR_SOURCES = {
 }
 # Event IDs that are notorious noise even at Error level.
 _IGNORE_EVENT_IDS = {10016}  # DistributedCOM permission spam
+# (provider, id) pairs that are Windows housekeeping, not failures. Real crashes
+# arrive separately as Application Error 1000 / .NET 1026.
+_IGNORE_PROVIDER_EVENTS = {
+    ("microsoft-windows-distributedcom", 10010),
+    ("microsoft-windows-languagepacksetup", 1042),
+    ("microsoft-windows-search-profilenotify", 6),
+    (".net runtime", 1022),
+}
 # SCM IDs worth alerting (unexpected termination / crash).
 _SCM_ALERT_IDS = {7031, 7034}
 
@@ -278,10 +286,8 @@ def _classify_event(ev: Dict) -> Optional[str]:
     provider = (ev.get("ProviderName") or "").lower()
     eid = int(ev.get("Id") or 0)
     level = (ev.get("LevelDisplayName") or "").lower()
-    if eid in _IGNORE_EVENT_IDS:
+    if eid in _IGNORE_EVENT_IDS or (provider, eid) in _IGNORE_PROVIDER_EVENTS:
         return None
-    if eid == 1022 and provider == ".net runtime":
-        return "WARNING"
     if "service control manager" in provider:
         return "ERROR" if eid in _SCM_ALERT_IDS else "WARNING"
     if provider in _ERROR_SOURCES or "error" in provider:
@@ -334,13 +340,13 @@ async def _process_services(states: Dict[str, str]) -> int:
         if state == prev or prev is None:
             continue
         if state not in ("RUNNING", "START_PENDING"):
-            level = "WARNING" if state == "PAUSED" else "ERROR"
+            transitional = state == "PAUSED" or state.endswith("_PENDING")
             count += await _host_event(
-                level, f"svc_{name}",
+                "WARNING" if transitional else "ERROR", f"svc_{name}",
                 f"Windows service {name} is {state}")
         elif prev not in ("RUNNING", "START_PENDING"):
             count += await _host_event(
-                "WARNING", f"svc_{name}",
+                "INFO", f"svc_{name}",
                 f"Windows service {name} recovered: {prev} -> {state}")
     return count
 

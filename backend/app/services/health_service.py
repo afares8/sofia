@@ -27,6 +27,11 @@ logger = logging.getLogger("sofia.health")
 # In-memory status cache
 _status_cache: Dict[str, ServiceStatus] = {}
 
+# WPPConnect cae y vuelve solo (su watchdog lo reinicia en ~1-2 min). Antes de
+# mandar el correo de respaldo se espera este tiempo; si el servicio ya
+# respondio, el correo no se envia (solo era un reinicio).
+WPPCONNECT_EMAIL_DEFER_SECONDS = 180  # 3 minutos
+
 
 def get_all_statuses() -> Dict[str, ServiceStatus]:
     return dict(_status_cache)
@@ -139,6 +144,9 @@ async def check_service(svc: ServiceConfig) -> ServiceStatus:
             cfg.alerts, svc.name, svc.id, "CRITICAL",
             f"{svc.name} no responde",
             f"URL: {svc.url} — caído por más de {grace_secs}s",
+            defer_email_seconds=(
+                WPPCONNECT_EMAIL_DEFER_SECONDS
+                if svc.id == "wppconnect" else 0),
         )
         if sent:
             await db_service.mark_notified(event_id)

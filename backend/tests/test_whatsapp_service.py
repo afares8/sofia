@@ -56,6 +56,80 @@ async def test_pre_send_errors_remain_retryable(initialized_db, cfg, monkeypatch
     assert (await rows())[0]["sent_at"] is not None
 
 
+async def test_wppconnect_down_defers_email_fallback(initialized_db, cfg, monkeypatch):
+    """Con defer_email_seconds el correo no sale ya: se programa y se cancela
+    si el servicio se recupero (solo era un reinicio)."""
+    post = AsyncMock(side_effect=httpx.ConnectError("down"))
+    monkeypatch.setattr(wa, "_post_message", post)
+    scheduled = MagicMock(return_value=True)
+    monkeypatch.setattr(email_alert_service, "schedule_fallback_email", scheduled)
+    assert not await wa.send_alert(
+        cfg, "WppConnect", "wppconnect", "CRITICAL",
+        "WppConnect no responde", "detalle", defer_email_seconds=180)
+    assert not email_alert_service.send_fallback_email.called
+    assert scheduled.call_count == 1
+    kwargs = scheduled.call_args.kwargs
+    assert kwargs["delay_seconds"] == 180
+    assert kwargs["key"] == "deferred:wppconnect"
+    assert callable(kwargs["cancel_check"])
+    assert len(await db_service.get_pending_alerts()) == 1
+
+
+async def test_alert_without_defer_still_emails_immediately(initialized_db, cfg, monkeypatch):
+    post = AsyncMock(side_effect=httpx.ConnectError("down"))
+    monkeypatch.setattr(wa, "_post_message", post)
+    scheduled = MagicMock(return_value=True)
+    monkeypatch.setattr(email_alert_service, "schedule_fallback_email", scheduled)
+    assert not await wa.send_alert(cfg, "Packing", "packing", "ERROR", "message")
+    assert email_alert_service.send_fallback_email.called
+    assert not scheduled.called
+
+
+async def test_cancel_check_reflects_health_status(monkeypatch):
+    from types import SimpleNamespace
+    from app.services import health_service
+    monkeypatch.setattr(health_service, "_status_cache",
+                        {"wppconnect": SimpleNamespace(status="up")})
+    assert wa._service_is_up("wppconnect") is True
+    assert wa._service_is_up("mayor") is False
+    monkeypatch.setattr(health_service, "_status_cache", {})
+    assert wa._service_is_up("wppconnect") is False
+
+
+async def test_deferred_email_end_to_end(initialized_db, cfg, monkeypatch):
+    """Cadena completa: alerta que falla -> correo diferido que se cancela si
+    el servicio se recupera y sale si sigue caido."""
+    import asyncio
+    from types import SimpleNamespace
+    from app.services import health_service
+
+    post = AsyncMock(side_effect=httpx.ConnectError("down"))
+    monkeypatch.setattr(wa, "_post_message", post)
+    sent = MagicMock()
+    monkeypatch.setattr(email_alert_service, "send_fallback_email", sent)
+    monkeypatch.setattr(email_alert_service, "is_configured", lambda: True)
+    monkeypatch.setattr(email_alert_service, "_deferred_tasks", {})
+
+    # 1) el servicio se recupera dentro de la ventana -> no sale correo
+    monkeypatch.setattr(health_service, "_status_cache",
+                        {"wppconnect": SimpleNamespace(status="up")})
+    assert not await wa.send_alert(cfg, "WppConnect", "wppconnect", "CRITICAL",
+                                   "WppConnect no responde", "detalle",
+                                   defer_email_seconds=0.05)
+    await asyncio.sleep(0.25)
+    assert not sent.called
+
+    # 2) sigue caido -> el correo sale al vencer la ventana
+    wa._cooldown.clear()
+    monkeypatch.setattr(health_service, "_status_cache",
+                        {"wppconnect": SimpleNamespace(status="down")})
+    assert not await wa.send_alert(cfg, "WppConnect", "wppconnect", "CRITICAL",
+                                   "WppConnect no responde", "detalle",
+                                   defer_email_seconds=0.05)
+    await asyncio.sleep(0.25)
+    assert sent.call_count == 1
+
+
 @pytest.mark.parametrize("error", [httpx.ReadTimeout, httpx.WriteTimeout, httpx.ReadError, httpx.RemoteProtocolError])
 async def test_flush_unknown_survives_future_flush_and_purge(initialized_db, cfg, monkeypatch, error):
     await db_service.enqueue_alert("1234@c.us", "message")
