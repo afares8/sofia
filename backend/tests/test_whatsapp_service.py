@@ -236,6 +236,23 @@ async def test_message_retry_after_401_timeout_is_unknown(initialized_db, cfg, m
     assert client.post.await_count == 2
 
 
+async def test_disabled_whatsapp_never_sends_or_queues(initialized_db, monkeypatch):
+    cfg = AlertConfig(whatsapp_enabled=False, whatsapp_number="1234")
+    post = AsyncMock()
+    monkeypatch.setattr(wa, "_post_message", post)
+    sent = MagicMock()
+    scheduled = MagicMock()
+    monkeypatch.setattr(email_alert_service, "send_fallback_email", sent)
+    monkeypatch.setattr(email_alert_service, "schedule_fallback_email", scheduled)
+    assert not await wa.send_message(cfg, "message")
+    assert not await wa.send_alert(cfg, "Test", "test", "ERROR", "message",
+                                   defer_email_seconds=180)
+    assert await wa.flush_queue(cfg) == 0
+    assert post.await_count == 0
+    assert not sent.called and not scheduled.called
+    assert await rows() == []
+
+
 @pytest.mark.parametrize("status,body,uncertain", [
     (201, {"status": "success", "response": [{"id": "mock-id"}]}, None),
     (500, {"status": "Error", "error": "send failed"}, 1),

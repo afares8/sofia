@@ -61,6 +61,7 @@ MAX_STALL_RETRIES = 1
 STALL_WAIT_SLICE = 0.25
 HEALTH_STALE_SECONDS = 120.0
 CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+SW_SHOWMINNOACTIVE = getattr(subprocess, "SW_SHOWMINNOACTIVE", 7)
 WORKER_FAIL_STATUS = {
     "agent_missing", "agent_spawn_error", "agent_init_error", "session_error",
     "elevation_mismatch", "auth_required", "manual_gap", "spawn_error",
@@ -646,7 +647,13 @@ def default_spawn_worker(policy: Dict[str, Any], group: str,
     py = policy.get("python_executable") or sys.executable
     cmd = [py, str(SCRIPT_PATH), "worker", "--group", group, "--day", day,
            "--policy-dir", str(policy["_dir"])]
-    return subprocess.Popen(cmd, creationflags=CREATE_NEW_CONSOLE)
+    startupinfo = None
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = SW_SHOWMINNOACTIVE
+    return subprocess.Popen(cmd, creationflags=CREATE_NEW_CONSOLE,
+                            startupinfo=startupinfo)
 
 
 def default_spawn_agent(executable: str, mode: str,

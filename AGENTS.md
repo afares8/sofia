@@ -75,6 +75,7 @@ Conservar mensaje completo redactado y timestamp de origen en detail (limite 120
 - Tareas programadas: `.devin/sofia-cli/install.ps1` DRY RUN por defecto (preflight de rutas, cwd, templates, SQL, `devin auth status` acotado, drift de tareas existentes por args/exe/principal); `-Install` exige consola elevada, auth `autenticado` y cuenta resoluble; `-Start` requiere `-Install`. Requiere autorizacion expresa; imprime comandos reversibles, no borra nada.
 - Leccion de proceso: `pythonw.exe`/`python.exe` del venv arranca un hijo redirector en `Python311` real (padre->hijo PID); ese hijo NO es una instancia duplicada del puente ni de tareas. Verificar parent/child antes de reportar watchers duplicados.
 - Pruebas: `backend/.venv/Scripts/python.exe -m pytest tests/test_sofia_devin_bridge.py -q` desde `backend` (agente ACP falso por pipes, DB/state temporales, subprocess reales para mutex/estado, sin red ni modelo). Evidencia en `backend/data/devin-desktop/evidence/` (gitignored). Handshake `initialize` verificado en vivo (Devin 3000.11.3, `loadSession=true`, `authMethods=[devin-browser]`, `devin auth status`=autenticado); durante las pruebas no se envio session/new ni prompts reales. Activacion posterior: ambas tareas quedaron Running y avisos naturales abrieron una sesion real por grupo; esto no acredita que el analisis termine ni autoriza reinicios adicionales.
+- Consola minimizada (2026-10-18, pedido del dueno): `default_spawn_worker` pasa `STARTUPINFO` con `STARTF_USESHOWWINDOW` + `SW_SHOWMINNOACTIVE`; la consola del worker arranca minimizada en la barra de tareas y se restaura para interactuar. Verificado en vivo: con el flag el spawn usa conhost clasico (no Windows Terminal) y la ventana queda minimizada; sin el flag abria visible (WT). Aplica a workers nuevos: watchers reiniciados 2026-10-18 23:34:34 (Stop/Start) con el codigo nuevo; los workers abiertos siguen con el codigo previo. Test: `test_default_spawn_worker_starts_minimized_console`.
 
 
 ## Vision como servicio monitoreado (2026-10-16)
@@ -725,3 +726,10 @@ un reinicio).
   config.json (o restaurar el .bak) — aplica en ~30 s sin reiniciar; confirmar
   con `POST /api/config/alerts/test`. Con el apagado, el correo diferido de
   3 min queda dormido hasta reactivar.
+- Sin cola durante la prueba (pedido del dueno, 2026-10-18): con
+  `whatsapp_enabled=false` no se encola, no se drena y no sale correo (los
+  envios retornan temprano; `flush_queue` no toca la cola); test
+  `test_disabled_whatsapp_never_sends_or_queues`. Verificado contra la DB:
+  0 filas serian enviadas al reactivar (las 103 pendientes son
+  `delivery_uncertain` o superan las 24 h de `get_pending_alerts`), asi que
+  no habra rafaga al volver a activar WhatsApp.

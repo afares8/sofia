@@ -2381,3 +2381,27 @@ def test_worker_heals_truncated_turn_on_start(env):
     st = wstore.load()
     assert st["completed"] == [1] and st["pending"] == []
     assert st["uncertain"] is False and st["inflight"] is None
+
+
+def test_default_spawn_worker_starts_minimized_console(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(bridge.subprocess, "Popen", FakePopen)
+    policy = {"python_executable": "python.exe", "_dir": str(tmp_path)}
+    bridge.default_spawn_worker(policy, "local", "2026-01-01")
+    kwargs = captured["kwargs"]
+    assert kwargs["creationflags"] == bridge.CREATE_NEW_CONSOLE
+    assert captured["cmd"][:3] == ["python.exe", str(bridge.SCRIPT_PATH),
+                                   "worker"]
+    if os.name == "nt":
+        si = kwargs["startupinfo"]
+        assert si is not None
+        assert si.dwFlags & subprocess.STARTF_USESHOWWINDOW
+        assert si.wShowWindow == bridge.SW_SHOWMINNOACTIVE
+    else:
+        assert kwargs["startupinfo"] is None
