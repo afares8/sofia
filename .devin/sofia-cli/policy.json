@@ -6,6 +6,7 @@
   "python_executable": "C:/Users/ahmed/apps/sofia/backend/.venv/Scripts/python.exe",
   "poll_seconds": 15,
   "batch_size": 50,
+  "batch_hold_seconds": 60,
   "stall_seconds": 900,
   "health_ports": {
     "local": 5185,
@@ -33,6 +34,7 @@
   "elenatec_route": {
     "sources": ["docker"],
     "service_ids": ["tec", "tec_frontend", "elenatec", "elenatec_frontend"],
-    "service_prefixes": ["tec-", "tec_", "elenatec-", "elenatec_", "droplet-"]
+    "service_prefixes": ["tec-", "tec_", "elenatec-", "elenatec_", "droplet-"],
+    "exclude_service_ids": ["droplet-ssh"]
   }
 }

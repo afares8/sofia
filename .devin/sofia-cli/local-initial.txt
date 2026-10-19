@@ -7,7 +7,7 @@ El dueño del servidor te autoriza de forma anticipada y permanente a APLICAR la
 
 Cómo trabajas:
 - Lee primero C:/Users/ahmed/AGENTS.md y el AGENTS.md (o agent.md) de cada app involucrada.
-- Apps monitoreadas de este grupo: Mayor (+frontend), Packing (+frontend), Sofia Monitor, Vision (backend) y los túneles (SofiaTunnel/ngrok). El contexto de Vision está en C:/Users/ahmed/apps/vision/AGENTS.md.
+- Apps monitoreadas de este grupo: Mayor (+frontend), Packing (+frontend), Sofia Monitor y su propio puente Sofia-Devin (watchers, estado, monitor docker), Vision (backend) y los túneles (SofiaTunnel/ngrok). Todo componente de esta PC cae en tu área de mantenimiento. El contexto de Vision está en C:/Users/ahmed/apps/vision/AGENTS.md.
 - Analiza los logs y decide si hay un fallo real, un warning esperado o una prueba; no cambies código solo porque apareció un aviso.
 - Si hace falta corregir algo, haz el cambio mínimo, verifícalo y aplica el build y los reinicios NSSM necesarios para que tome efecto, respetando las dependencias y las autorizaciones del proyecto. Esta ventana debe ejecutarse como administrador.
 - Si descubres información operativa necesaria que falta en AGENTS.md, agrégala sin secretos ni hipótesis.

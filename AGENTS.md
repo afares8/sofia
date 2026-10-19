@@ -89,6 +89,68 @@ El puente Sofia-Devin rutea `vision` al grupo **local** (todo lo que no sea elen
 que sus avisos los atiende la sesion diaria de las apps de la PC. El log arranca `from_now`
 (cursor al final), asi que no reingesta el historial previo.
 
+Ruido esperado (2026-10-18): `marked N stale AI job(s) as error after restart` (bookkeeping de cada
+reinicio de VisionBackend; los jobs en vuelo quedan "abandonado por reinicio del servicio" y visibles
+en la UI de IA) quedo suprimido con el patron `vision-stale-ai-jobs-after-restart` en
+`log_ignore_patterns`; Vision emite la linea como WARNING desde el fix de logging de `vision.ai.engine`
+(antes salia sin nivel y Sofia la clasificaba ERROR por la palabra "error"). Los ERROR reales del motor
+(p. ej. `ai worker iteration failed`) NO estan suprimidos.
+
+## Reboot de Windows Update y revival de HikCentral (2026-10-18)
+
+- 03:01-03:10 local: Windows Update (MoUsoCoreWorker/TrustedInstaller) reinicio el servidor (3
+  arranques; la tarea `ReinicioProgramadoServidor` no corrio, proxima 10/25). Durante la ventana
+  cayeron SofiaTunnel/Sofia-Devin (5185/5186)/Ingest E2E y los enlaces SAP (08S01 10053; issues
+  12926/12927/81782/81783/400): todo se recupero solo. El host monitor ingesta los eventos del boot
+  (OpenSSH 7034 x2, ThirdPluginServer 1000, nssm 1002, BitLocker 24641, BrFilter 7000, etc.) —
+  transitorios, sin accion.
+- El reboot revivio el stack HikCentral local (servicios Automatic: BeeAgent, 6 Nginx, SADPServer,
+  STREAM...; nginx ocupa 80/443). El 17-oct se habia detenido por la crisis de memoria. Hoy: 0
+  crashes de nginx desde el boot, commit disponible ~4.4 GB, HCP ~950 MB — sin presion aguda.
+  PENDIENTE decision del dueno: dejarlo corriendo (trabajo bridge Tocumen) o detenerlo otra vez
+  (y deshabilitar los start types para que no vuelva con cada reboot).
+- Patron `packing-maersk-key` corregido a `MAERSK_CONSUMER_KEY( is)? not configured` (la variante
+  con "is" no matcheaba; issue 29897). AbuseIPDB (71289, 48 ocurrencias) y los probes de API URL de
+  Packing (29909/29910) siguen sin patron: son config/transitorios, decision del dueno.
+- Schannel 36884 hacia `api.elenatec.com` (18-oct 15:15Z, desde curl): el host NO existe en DNS y el
+  certificado del droplet (198.211.99.4) solo cubre elenatec.com/app/www. `api.elenatec.com` figura
+  como API de produccion del movil (`tec-review/mobile/eas.json`) y como ejemplo de webhooks
+  (`config.py`). Un solo evento, actor no identificado (curl efimero; no aparece en los exec
+  loggeados de la sesion ElenaTec; sin tarea programada). Dominio ElenaTec — su sesion trabaja en
+  tec-review; no hay dependencia local.
+- Mayor: el reinicio de las 11:14:56 del 18-oct (despliegue del modulo `elenatec` por otra sesion)
+  dejo el app SIN rol scheduler: los workers loguearon "Scheduler lock port 8175 already held" (un
+  huerfano de la instancia anterior retenia 8175) -> sin schedulers ni middleware SAP (9000 caido;
+  el issue 15465 "Error reading middleware stdout: [Errno 22]" es el artefacto benigno del reinicio).
+  FIX aplicado: `taskkill /T /F` del arbol uvicorn -> NSSM respawneo a los 5 s (AppRestartDelay=5000);
+  el worker nuevo adquirio el lock (11:16:57) y levanto el middleware (READY 11:17:16). Si se repite
+  tras un reinicio: confirmar "Acquired scheduler lock" en el log y quien retiene el puerto 8175.
+- WPPConnect (18-oct 11:27-11:36): el watchdog de Chromium "flapeo" en ciclos
+  (unresponsive/recovered 1-2/3, sin llegar a 3/3) y `check-connection-session` se colgaba ->
+  Sofia DOWN (issue 81, CRITICAL) y envios en riesgo. Criterio: si flapea >5 min sin escalar y
+  `wpp_ok` sigue False, **reiniciar WPPConnect** (sin dependientes; preserva pairing: el log
+  muestra `isLogged` + "Started Session" al minuto y medio, SIN QR, con WhatsApp Web fijado).
+  Verificado 11:36: wpp_ok True y sesion CONNECTED. No esperar al 3/3 del watchdog si ya hay
+  degradacion real; no usar logout/clear-session.
+- Duplicados de ocurrencias tras reiniciar SofiaBackend (observado 3x el 18-oct: 08:13, 16:24,
+  16:45): el log_monitor reanuda desde su cursor persistido y **re-ingesta el ultimo lote previo
+  al reinicio** (at-least-once). Identificarlos por el timestamp de origen viejo en el detail
+  (mismo texto ya visto); NO son eventos nuevos ni requieren accion — solo inflan counts.
+  El reinicio de las 11:45:41 (tercero del dia) fue de la sesion que itera el despliegue.
+  MECANISMO VERIFICADO (5a re-ingesta a las 14:25:44, 1 s despues de un reinicio de SofiaBackend
+  a las 14:25:43): los cursores viven SOLO en memoria (`_file_positions = {}` en log_service.py);
+  en la primera lectura tras un arranque `pos = size - _STARTUP_TAIL_BYTES (8192)` -> se relee la
+  cola del archivo y se re-ingesta su ultimo lote. NO es un cursor atascado: es el diseno
+  (at-least-once) y explica todos los episodios de duplicados del dia. Mitigacion en curso: la
+  ventana de acumulacion + dedup del puente agrupa estas ocurrencias del mismo issue al enviarlas.
+- Pico de memoria 18-oct ~17:30-17:32: crashearon procesos no relacionados (PackingSapDiService,
+  RustDesk, ChatGPT, Codex) y fallaron jobs del motor de IA de Vision (llama CLI + cv2); Vision se
+  recupero solo (5 jobs OK despues). El DIAPI de Packing quedo caido y se restauro con reinicio
+  coordinado de PackingBackend (parar SofiaFrontend/SofiaBackend/PackingFrontend -> Restart ->
+  levantar; healthy 17:34:40, connected WALIGMAG). Causa probable: presion de commit
+  (WindowsTerminal ~28 GB commit + 6 procesos devin ~19 GB; disponible cayo a ~3 GB) — son
+  procesos del dueno/sesiones, NO del stack: no tocarlos; flag al dueno.
+
 ## Salud del puente y recuperacion (2026-10-16)
 
 El watcher expone `GET /health` en localhost (`policy.health_ports`: local 5185, elenatec 5186):
@@ -338,6 +400,21 @@ Familias que se repiten y son esperadas o artefactos de parsing, no fallos de la
   0x80073D02: <Store app>" (issues 78159/78160)**: Windows Update no pudo instalar/actualizar apps de
   Microsoft Store (IntelArcSoftware, YourPhone) -> error 0x80073D02. Es ruido del SO (no afecta a las
   apps del servidor ni a los servicios NSSM); no requiere accion.
+- **Vision "Exception in ASGI application" (issue 78189)**: el traceback es HISTORICO. Referencia
+  `scanner.py:157` = una version vieja; el `scanner.py` actual tiene esa sentencia (`pwd = password or
+  dev.password or DEFAULT_DEVICE_PASSWORD`) en la linea **278**, y el modelo `Device` SI expone la
+  property `password` (`models.py:40-44`, descifra `password_enc`/`password_legacy`). La linea se
+  reingirio desde el INICIO del `service.log` (cuyo primer registro es un arranque con pid 26980,
+  distinto del proceso actual 42780 del 2026-10-16 13:30). NO es un bug actual; el cursor del log de
+  `vision` tambien esta reingiriendo historial.
+- **Vision "marked N stale AI job(s) as error after restart" (issue 78193)**: es un `log.warning` de
+  housekeeping al arrancar (`app/services/ai_engine.py:759`): los AI jobs interrumpidos por un reinicio
+  se marcan como error. El monitor lo clasifica ERROR porque la palabra "error" aparece en el texto
+  (nivel real: WARNING). Benigno, no es un fallo.
+- **Vision `vision.perf` "slow request <METHOD> <path> -> 200 in N ms" (issue 78207)**: Vision tiene su
+  propio logger de requests lentos (`vision.perf`); p. ej. `POST /vms-api/api/devices/discovery/sadp`
+  (descubrimiento SADP = escaneo de red, inherentemente lento) en 4.1 s. Es la familia "slow request"
+  de Vision: responde 200, no es un fallo. Mismo patron que el "Slow request" de Mayor/Packing.
 
 ### Falso positivo del clasificador pasivo (verificado 2026-10-15; CORREGIDO 2026-10-16)
 `_classify_level` en `backend/app/services/log_service.py` clasificaba lineas SIN prefijo de nivel
@@ -422,3 +499,229 @@ si el probe `wppconnect` esta UP (200) al momento, es historico. ADEMAS: las mis
 2026-10-16T19:32:37Z se reingirieron varias veces (issues 77959/77961 re-creados con nuevas
 occurrences 78050/78051, 78166/78167) -> el CURSOR del log de WPPConnect no avanza / relee tramos;
 revisar el cursor de `WPPConnect.out.log` (identidad de archivo / from_now).
+
+## Vision: ola de 502 WHEP en MUCHAS camaras (2026-10-16 ~21:21-22:28 local)
+
+Escalada respecto a la familia "cam_1702 sola": en la cola de `service.log` (logger vision.perf)
+hay 158 lineas `-> 502` repartidas en 26 camaras distintas (`cam_*` / `_low` / `_sub`), no una sola.
+Ambos servicios estan Running (VisionBackend, VisionMedia): NO es caida de Vision.
+
+Evidencia (solo lectura, 2026-10-16):
+- `GET http://127.0.0.1:9997/v3/paths/list`: 1225 paths registrados; solo 38 `ready`.
+- 7 paths `ready` con `readers=0` y bytesReceived altos (cam_1225_sub 4.4 GB, cam_1544_sub 1.5 GB,
+  cam_1011_low/cam_1291_low/cam_1035_low/cam_1596_low ~600 MB) -> sources on-demand que NO se
+  cerraron pese a `sourceOnDemandCloseAfter: 15s` (posibles sesiones RTSP colgadas hacia la camara).
+- Las camaras que dan 502 son las que NO estan `ready` (0 bytes): su source RTSP no arranca a tiempo
+  (`sourceOnDemandStartTimeout: 15s`) y el proxy `/mtx/<path>/whep` responde 502 tras ~35 s.
+- Los picos de 502 coinciden con rafagas de aperturas WHEP simultaneas (muro/grid abriendo decenas
+  de camaras a la vez), p.ej. ~22:24-22:25 y ~22:27-22:28.
+
+Interpretacion: problema de INFRAESTRUCTURA/UPSTREAM (camaras/red/MediaMTX), no de codigo de Vision.
+Combinacion probable: camaras inalcanzables/inestables + timeout de arranque on-demand bajo rafaga +
+paths colgados ocupando sesiones RTSP de la camara.
+
+Accion tomada: NINGUNA (solo lectura). Items para el dueno:
+- Revisar red/RTSP de las camaras que fallan (posible segmento/NVR comun).
+- Evaluar limpiar paths colgados (reiniciar VisionMedia) -> CORTA todas las vistas en vivo; requiere OK.
+- Evaluar subir `sourceOnDemandStartTimeout` o reducir aperturas simultaneas en el muro.
+
+No confundir 201/204/404 (negociacion normal de WHEP) con 502 (fallo real). Solo el 502 es accionable.
+## Vision /mtx WHEP: 502 = timeout del proxy (35 s); ERROR = ClientDisconnect no capturado (2026-10-16)
+
+- `backend/app/routers/mtx_proxy.py` proxya `/mtx/<path>/whep` hacia MediaMTX `https://127.0.0.1:8889`.
+- El `502 "video service unavailable"` lo genera el PROPIO proxy: `_SESSION.request(..., timeout=(5, 35))`.
+  Si MediaMTX no contesta el WHEP en 35 s (source on-demand no lista), salta
+  `requests.exceptions.RequestException` -> `HTTPException(502)`. NO implica MediaMTX caido.
+  Por eso los 502 de la ola aparecen a ~35 s (y bajo carga extrema hasta 36-69 s por cola).
+- `ERROR: Exception in ASGI application` (issue 78189) = `starlette.requests.ClientDisconnect` SIN capturar
+  en `mtx_proxy.py:61` (`body = await request.body()`): el navegador cierra/cancela mientras el proxy
+  espera hasta 35-70 s. Benigno (el cliente ya se fue) pero ensucia el log y el monitor lo sube a ERROR.
+- Es VIVO, no historico: los ultimos 2 tracebacks referencian `mtx_proxy.py:61` y `main.py:162/88/119`
+  actuales. Nota: issue 78189 agrupa por el TEXTO "Exception in ASGI application", asi que distintos
+  tracebacks (p.ej. el viejo de Device.password) caen en el MISMO issue -> no fiarse del issue para el origen.
+- Fix minimo propuesto (NO aplicado; requiere reiniciar VisionBackend -elevado- y corta las vistas en vivo):
+  envolver `body = await request.body()` en `try/except starlette.requests.ClientDisconnect: return Response(status_code=499)`.
+
+## Vision: el 502 masivo NO es de codigo (muro/grid sobrecarga MediaMTX) (2026-10-16)
+
+Bajo un muro/grid que abre decenas de camaras a la vez, MediaMTX no arranca todas las sources on-demand
+dentro del timeout y el proxy devuelve 502 en rafaga sobre MUCHAS camaras (26 distintas, 158 eventos en ~1 h).
+Las latencias de negociacion suben de 2-7 s a 20-69 s. Es infraestructura/upstream (camaras/red/MediaMTX),
+no un defecto por camara. Ver tambien la seccion de paths colgados mas arriba.
+## Vision: la ola de 502 TERMINO; el cursor pasivo va ~10 h atrasado (2026-10-17)
+
+Comprobado en vivo (solo lectura) el 2026-10-17 ~09:14:
+- La ola de 502 se corto ~**07:09** (ultimo 502: `cam_1011_low` 07:09:50). Sin 502 despues.
+- MediaMTX recuperado: **158 paths ready / 1302** (estaba en 38-44 durante la ola).
+- Los reportes que llegan con `detail` de **2026-10-16 22:35** son BACKLOG: el log ya esta en
+  ~09:14 del 2026-10-17 -> el cursor pasivo de Vision va ~10 h atrasado (mismo defecto de cursor
+  ya documentado para WPPConnect). NO tratar esos reportes como estado actual.
+- Regla practica: antes de concluir "sigue fallando", mirar la ULTIMA linea de `service.log` y el
+  `ready` de MediaMTX (`:9997/v3/paths/list`), no la marca de tiempo del reporte.
+## WPPConnect: auto-recuperacion por WATCHDOG y webhook 502 por reinicios de Mayor (2026-10-17)
+
+- `start_wppconnect_nssm.ps1` ya trae un WATCHDOG (chequeo cada 60s): `show-all-sessions` (HTTP, sin
+  Chromium) y `check-connection-session` (Chromium). Tras 3 fallos consecutivos de Chromium mata el node
+  y el loop externo lo relanza. Log: `C:\Users\ahmed\apps\service-logs\watchdog.log`.
+  -> El "frame colgado" de Puppeteer se auto-recupera; ya NO hay que hacer close+start a mano si el
+  watchdog esta vivo. Verificado 2026-10-17: episodio de "Chromium unresponsive (1/3)-(2/3)-recovered"
+  cada ~90 s entre ~00:48 y ~01:31 local, luego silencio (sano). El watchdog NO loguea cuando todo va bien.
+- `WEBHOOK_URL` de WPPConnect se define en `start_wppconnect_nssm.ps1` (NO en el registro NSSM):
+  `http://127.0.0.1:8075/api/v1/whatsapp/webhook/wpp` (Mayor). El secretKey del API NO es el placeholder
+  por defecto (generate-token con `THISISMYSECURETOKEN` da 404); esta en `src/config.ts` (env SECRET_KEY).
+- **`warn: Error calling Webhook ... status code 502`** = Mayor estaba reiniciando en ese instante.
+  Correlacion verificado 2026-10-17: 502 a las 09:06:28/35 y 09:54:17/40 <-> arranques de Mayor a las
+  09:06:53 y 09:54:55 (log `MayorBackend.out.log`, marca `SAP DI API Middleware is now running!`).
+  El endpoint en si responde 200 (`POST /api/v1/whatsapp/webhook/wpp` 200 OK en el out de Mayor).
+  -> Cada reinicio de Mayor = ventana en que se PIERDEN mensajes entrantes de WhatsApp.
+- Mayor se reinicio 4 veces en ~1 h el 2026-10-17 (09:06, 09:54, 10:02, 10:09), sin traceback en
+  `MayorBackend.err.log` (arranca limpio). Es un item a vigilar: si se repite, revisar por que muere.
+
+## Vision: ERROR "El modelo local termino con error." (issues 79024/79025, 2026-10-16 23:52 local)
+
+Familia NUEVA: `raise RuntimeError("El modelo local terminó con error.")` + `RuntimeError: El modelo
+local terminó con error.` (2 lineas del MISMO evento; el monitor las crea como 2 issues porque no
+reconoce el patron raise/mensaje). Es un fallo REAL del motor de IA local de Vision (no del monitor).
+Ocurrio en backlog (23:52 local del 10-16). Revisar el modulo de IA local de Vision si reaparece.
+## Vision: POST /api/playback/open -> 502 = fallo del GRABADOR (no de Vision) (2026-10-16 23:54 local)
+
+- `routers/playback.py::open_playback` -> `_open_sync` -> `services/recordings.py` que lanza
+  `PlaybackError(502, ...)` (lineas 210/259/335) cuando el grabador/camara NO sirve el track grabado.
+- Patron observado: la latencia del endpoint ESCALA (1.9 -> 3.5 -> 4.4 -> 4.7 -> 7.0 -> 8.7 -> 9.7 s)
+  y luego 502 a ~10.5 s. Es el grabador estresado/lento y luego fallando: mismo origen que los 502 de
+  WHEP (lado dispositivo/upstream), NO codigo de Vision.
+- No confundir con `/api/playback/media/*` ni con el WHEP `pb_<hash>` (400 = "no hay grabacion", normal).
+
+## Sofia (monitor): el redactor SOBRE-redacta palabras normales en URLs
+
+- Reportado 2026-10-16: `POST /api/[REDACTADO]/open` en el mensaje del issue, cuando la ruta real
+  (log crudo de Vision) es `/api/playback/open`. El redactor sustituyo la palabra "playback".
+- Efecto: se pierde informacion de diagnostico. Sugerencia (NO aplicada): redactar solo valores
+  (numeros largos, tokens, UUID, emails, telefonos) y no segmentos de ruta con palabras del dominio.
+
+## Fixes 2026-10-17 (noche): monitor docker, watcher y ruteo - autorizados por el dueno
+
+Contexto: el dueno pidio "arreglar de raiz las dos salvedades [de la auditoria], que el CLI local las vea; todo lo de esta PC es area de mantenimiento".
+
+### 1. Monitor docker del droplet caido ~8 h (46 fallos consecutivos desde ~11:10 local)
+- Causa demostrada: `docker logs --since <ventana> tec-db-1` tarda 60-150 s porque su json-log mide ~2.2 GB en el droplet (domina el escaneo hacia atras del archivo, no el tamano de la ventana); revienta el timeout de canal de `_ssh_exec` (40 s) -> `TimeoutError()` con str vacio -> poll fallido; la ventana crece hasta el tope de 2 h y no se auto-recupera.
+- Fix (`droplet_docker_service.py`): `LOG_TAIL_CAP = 50000` (`docker logs --since X --tail 50000 ...`; la consulta baja a ~3 s) + `_fetch_container_logs()` aisla fallas por contenedor (queda en `log_failures` de `/api/health/sofia`; una fuente lenta ya no tumba el poll completo).
+- Verificado en vivo tras reiniciar SofiaBackend: primer poll OK y segundo poll estable (`consecutive_failures: 0`, `log_failures: {}`), sin nuevas ocurrencias `droplet-ssh`.
+- Pendiente del dueno (NO autorizado aun): rotacion de logs docker en el droplet (`daemon.json` log-opts max-size/max-file; requiere recrear contenedores) y/o truncar el json-log de 2.2 GB. El droplet ademas mostro OOM reales esa noche (postgres/redis/systemd oom-killer 19:35-19:47 y 01:03 UTC) - presion de memoria a vigilar.
+
+### 2. Errores WinError 5 del watcher al reemplazar state.json
+- Evidencia: 5 lineas en `local/watcher.log` (mtime <=07:58 local) y 4 en `elenatec/watcher.log` (<=02:08); los state.json se escribian normal; la suite de tests usa dirs temporales (no toca el state real). Holder no identificado (locks transitorios; candidatos: AV/filtros). OJO: `occurrences.timestamp` de eventos pasivos = hora de INGESTA (los 9 eventos se ingirieron recien al activar el monitoreo, no a la hora del error original).
+- Fix (`sofia_devin_bridge.py`): retry del rename con backoff exponencial topado: `STATE_REPLACE_ATTEMPTS=8`, `STATE_REPLACE_DELAY=0.2`, `STATE_REPLACE_MAX_DELAY=2.0` (~9 s de tolerancia total; antes ~2 s).
+- Visibilidad: `log_path` de ambos watcher.log agregado a los servicios `sofia-devin-local`/`sofia-devin-elenatec` (config.json + DEFAULT_SERVICES); el clasificador los marca ERROR y rutean al grupo local. Los watcher.log previos quedaron como `watcher.log.bak-20261017` (evidencia).
+
+### 3. Ruteo: `droplet-ssh` al grupo local
+- `elenatec_route.exclude_service_ids = ["droplet-ssh"]` (policy.json) + soporte en `load_policy`/`route_event`: los fallos del propio monitor (fix Sofia-side) son area local, no de elenatec. Verificado en vivo: la ultima ocurrencia pre-fix (81581) se entrego a la sesion local.
+
+### 4. Reloj del host y procesos Python
+- `tzutil /g` = Eastern Standard Time; bias 300->240 el 2026-10-17 20:04:43 local => offset actual UTC-04:00. Confirmar con `Get-Date -Format K` antes de correlacionar.
+- Los procesos Python escriben asctime con el tz CACHEADO al arrancar: SofiaBackend viejo (arrancado con UTC-5) logueaba UTC-5; el reiniciado hoy loguea UTC-4. Correlacionar por proceso, no por regla fija.
+
+### 5. Efectos colaterales de la activacion (informativo)
+- Al agregar los watcher.log como fuente se ingirieron UNA vez los 9 eventos historicos (2 alertas WhatsApp, issues 81570-81578); el archivo se roto despues para no repetir.
+- El restart de SofiaBackend ingirio OOMs reales del droplet que el monitor roto nunca vio (alerta CRITICAL `droplet-host`).
+- Tests: `backend/.venv/Scripts/python.exe -m pytest tests/ -q` -> 336 passed (incluye tests nuevos de `--tail`/aislamiento por contenedor y del backoff/ruteo).
+
+
+## Ventana de acumulacion del puente y correo diferido de WPPConnect (2026-10-18)
+
+Pedido del dueno: (a) que el puente espere ~1 min antes de mandar a Devin para
+acumular rafagas y no repetir lo mismo; (b) que el correo de respaldo por
+WPPConnect caido espere 3 min y se cancele si el servicio se reactiva (solo era
+un reinicio).
+
+### Ventana de acumulacion (`sofia_devin_bridge.py`, policy `batch_hold_seconds=60`)
+- `hold_until` (clave nueva de estado, OPCIONAL en `validate_state`: los
+  state.json previos cargan y se completan con 0.0; no se sube STATE_VERSION).
+- El watcher arma la ventana cuando encola eventos y la cola estaba VACIA
+  (`had_pending=False`): `hold_until = now + batch_hold_seconds`. No se extiende
+  con cada aviso nuevo (latencia acotada); si ya habia pendientes (backlog,
+  worker ocupado) no se re-arma.
+- `Watcher._maybe_spawn` no abre consola y `ConsoleWorker._take_pending_events`
+  no toma lote mientras `now < hold_until`. `/reintentar` manual NO se ve
+  afectado. `batch_hold_seconds=0` desactiva la espera (asi corren los tests
+  que no la prueban).
+- Dedup en la cola: `find_pending_duplicate` agrupa por `issue_id`; las
+  ocurrencias del MISMO issue mientras siga pendiente no se reenvian, solo
+  incrementan `duplicates` y el reporte lo indica
+  (`(+N ocurrencia(s) del mismo issue agrupadas en esta ventana)`). Un issue ya
+  despachado que vuelve a fallar SI se encola de nuevo (no se oculta una
+  recurrencia). `poll_once` devuelve `queued` y `deduped` para diagnostico.
+- No se modifican los templates de prompt inicial; el marcador de duplicados es
+  autoexplicativo y este AGENTS lo documenta.
+
+### Correo diferido por WPPConnect caido (3 min)
+- `health_service.WPPCONNECT_EMAIL_DEFER_SECONDS = 180`; al cruzar el umbral
+  DOWN de `wppconnect`, `send_alert(..., defer_email_seconds=180)`. La alerta
+  WhatsApp se intenta igual (queda encolada y sale cuando WPPConnect vuelve).
+- `whatsapp_service.send_alert`: si el envio falla y hay defer, programa
+  `email_alert_service.schedule_fallback_email(...)` con
+  `cancel_check=lambda: _service_is_up(service_id)` (estado del health poll) y
+  `key="deferred:<service_id>"`; sin defer el correo sigue siendo inmediato.
+- `schedule_fallback_email` crea un task en el event loop del backend
+  (`asyncio.get_running_loop()`; sin loop cae a envio inmediato). Un schedule
+  nuevo con la misma clave reemplaza al anterior; al vencer, si el servicio
+  esta `up` el correo NO se manda; si `cancel_check` falla, se manda igual
+  (fail-open: no se pierde el aviso). Cooldown de correo (5 min) sigue
+  aplicando al envio real.
+- LIMITE CONOCIDO: la espera vive en memoria; un restart de SofiaBackend dentro
+  de la ventana descarta ese correo (el issue queda en la DB y la alerta
+  WhatsApp queda en `alert_queue`, que se drena al recuperar WPPConnect).
+- NO se cambia el flujo de la cola WhatsApp: si WPPConnect se recupera rapido,
+  el dueno puede recibir la alerta encolada + la recuperacion por WhatsApp.
+
+### Verificacion
+- Tests nuevos: `tests/test_sofia_devin_bridge.py` (ventana, no-extension,
+  deshabilitada, dedup, reencolado post-despacho, migracion de estado, worker
+  espera la ventana), `tests/test_email_alert_service.py` (diferido/cancelado/
+  reemplazo/sin SMTP/sin loop), `tests/test_whatsapp_service.py` (defer +
+  cancel_check + cadena completa E2E) y `tests/test_health_service.py`
+  (wppconnect difiere, otros servicios no). Suite completa: 356 passed.
+- DRY RUN de `.devin/sofia-cli/install.ps1`: policy.json parsea, tareas
+  registradas sin drift, `devin auth status` autenticado.
+- Los state.json reales (local/elenatec) migran sin tocar produccion (solo
+  lectura): `hold_until=0.0`.
+
+### Despliegue y monitoreo (2026-10-18, autorizado por el dueno)
+- 14:23:42: tareas `Sofia-Devin-AppsPC`/`Sofia-Devin-ElenaTec` reiniciadas
+  (Stop/Start). Ambos watchers Running con el codigo nuevo; state.json ya
+  escribe `hold_until`; health 5185/5186 en 200; watcher.log sin errores.
+- 14:25:37-14:25:51: `SofiaBackend` reiniciado con elevacion UAC aprobada por
+  el dueno (script `backend/data/restart_sofia_backend_20261018.ps1`, log
+  homonimo `.log`): SofiaFrontend parado -> SofiaBackend parado/arrancado ->
+  SofiaFrontend arrancado; corte backend ~8 s, frontend ~13 s. Arranque limpio
+  (una sola falla transitoria de SofiaFrontend mientras estaba parado, 1/3,
+  sin alerta). El correo diferido quedo ACTIVO en el backend.
+- En vivo se observo la ventana armandose correctamente (+60 s exactos) al
+  primer evento nuevo; el worker abierto (codigo previo) tomo el evento antes
+  de que venciera: **la espera efectiva de 1 min aplica cuando las consolas
+  abiertas se reemplacen** (cierre del dueno o cambio de dia, la sesion se
+  reanuda con session/load). La dedup del watcher SI esta activa ya.
+- Senal del problema que motivaba la ventana (ui-events, 10-17/10-18):
+  elenatec 237 lotes con 166 de tamano 1; local 48 lotes con 16 de tamano 1.
+- Monitor de 15 min post-restart (data/monitor_fix_20261018.log): 45/45
+  muestras 200/ok en ambos grupos, poll age < 15 s, 0 muestras no-ok, 0
+  lineas de error nuevas en backend o watcher.log. En la ventana solo salieron
+  2 alertas normales (wppconnect WARNING 14:33 y droplet ERROR 14:37) y 0
+  correos de respaldo. La ventana se armo en vivo dos veces (+60 s exactos).
+- PENDIENTE de observar en vivo: primer flap real de WPPConnect tras el
+  restart para ver `[EMAIL] Correo diferido programado/descartado`; y la
+  espera de 1 min efectiva cuando se reemplacen las consolas abiertas.
+
+### Prueba: WhatsApp apagado 1 semana (2026-10-18, decision del dueno)
+- `backend/data/config.json`: `alerts.whatsapp_enabled=false` (respaldo
+  `config.json.bak-20261018-wa-off`). El backend relee config cada ~30 s;
+  verificado en vivo sin reiniciar: `GET /api/config/alerts` -> false y
+  `POST /api/config/alerts/test` -> `{"sent": false}` (no envia nada).
+- Efecto: 0 mensajes de WhatsApp y 0 correos de respaldo (`send_alert`/
+  `send_message` retornan False temprano); avisos de restauracion manual por
+  WhatsApp silenciados (los auto-restore no dependen de esto); `alert_queue`
+  queda congelada. El puente Sofia-Devin NO depende de WhatsApp.
+- Revision acordada: ~2026-10-25. Revertir: poner `whatsapp_enabled=true` en
+  config.json (o restaurar el .bak) — aplica en ~30 s sin reiniciar; confirmar
+  con `POST /api/config/alerts/test`. Con el apagado, el correo diferido de
+  3 min queda dormido hasta reactivar.

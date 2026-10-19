@@ -61,6 +61,18 @@ def add_occurrence(db, service_id="sofia_frontend", service_name="Sofia Frontend
     return issue_id, occ_id
 
 
+def add_occurrence_for_issue(db, issue_id, detail="detalle",
+                             timestamp="2026-01-01T10:05:00"):
+    conn = sqlite3.connect(str(db))
+    cur = conn.execute(
+        "INSERT INTO occurrences (issue_id, timestamp, detail) VALUES (?,?,?)",
+        (issue_id, timestamp, detail))
+    occ_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return occ_id
+
+
 class Simple:
     def __init__(self, **kw):
         self.__dict__.update(kw)
@@ -83,6 +95,9 @@ def env(tmp_path):
     policy["devin_executable"] = str(devin)
     policy["python_executable"] = str(tmp_path / "python.exe")
     policy["poll_seconds"] = 0.01
+    # La ventana de acumulacion (espera de 1 min) se prueba en sus propios
+    # tests con reloj controlado; el resto corre sin espera.
+    policy["batch_hold_seconds"] = 0
     policy.pop("health_ports", None)  # no abrir puertos reales en tests
     (policy_dir / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
     loaded = bridge.load_policy(policy_dir)
@@ -384,6 +399,16 @@ def test_route_levels_and_groups(env):
     assert r(p, {"level": "INFO", "source": "docker", "service_id": "tec"}) is None
 
 
+def test_route_monitor_component_stays_local(env):
+    """droplet-ssh (poll del monitor docker de Sofia) es area local: el fix
+    es Sofia-side aunque la fuente sea docker y el prefijo sea droplet-."""
+    p = env.policy
+    r = bridge.route_event
+    assert r(p, {"level": "ERROR", "source": "docker", "service_id": "droplet-ssh"}) == "local"
+    assert r(p, {"level": "WARNING", "source": "docker", "service_id": "droplet-ssh"}) == "local"
+    assert r(p, {"level": "ERROR", "source": "docker", "service_id": "droplet-other"}) == "elenatec"
+
+
 def test_same_day_events_one_spawn(env):
     w, store, spawns = make_watcher(env)
     w.poll_once()
@@ -394,6 +419,89 @@ def test_same_day_events_one_spawn(env):
     pending = store.load()["pending"]
     assert len(pending) == 2 and pending[0]["message"] == "uno"
     assert all(e["received_day"] == "2026-01-01" for e in pending)
+
+
+def test_batch_hold_waits_and_accumulates_burst(env):
+    """Con batch_hold_seconds=60 el lote no sale al primer aviso: espera la
+    ventana para juntar toda la rafaga en un solo reporte."""
+    env.policy["batch_hold_seconds"] = 60
+    clock = {"t": 1000.0}
+    w, store, spawns = make_watcher(env, now=lambda: clock["t"])
+    w.poll_once()
+    add_occurrence(env.db, level="ERROR", message="uno")
+    w.poll_once()
+    assert spawns == []
+    assert store.load()["hold_until"] == 1060.0
+    clock["t"] = 1030.0
+    add_occurrence(env.db, level="ERROR", message="dos")
+    w.poll_once()
+    assert spawns == []
+    assert len(store.load()["pending"]) == 2
+    clock["t"] = 1060.0
+    res = w.poll_once()
+    assert res["queued"] == 0
+    assert spawns == [("local", "2026-01-01")]
+
+
+def test_batch_hold_expires_once_not_extended(env):
+    """La ventana no se extiende con cada aviso nuevo: vence 60 s despues del
+    primer evento (latencia acotada aunque sigan llegando avisos)."""
+    env.policy["batch_hold_seconds"] = 60
+    clock = {"t": 1000.0}
+    w, store, spawns = make_watcher(env, now=lambda: clock["t"])
+    w.poll_once()
+    add_occurrence(env.db, level="ERROR", message="uno")
+    w.poll_once()
+    clock["t"] = 1055.0
+    add_occurrence(env.db, level="ERROR", message="dos")
+    w.poll_once()
+    assert store.load()["hold_until"] == 1060.0
+    clock["t"] = 1060.0
+    w.poll_once()
+    assert spawns == [("local", "2026-01-01")]
+
+
+def test_batch_hold_disabled_spawns_immediately(env):
+    w, store, spawns = make_watcher(env)
+    w.poll_once()
+    add_occurrence(env.db, level="ERROR")
+    w.poll_once()
+    assert len(spawns) == 1
+    assert store.load()["hold_until"] == 0.0
+
+
+def test_dedup_same_issue_in_window(env):
+    """Ocurrencias del mismo issue se agrupan: un solo reporte con contador."""
+    w, store, _ = make_watcher(env)
+    w.poll_once()
+    issue_id, _ = add_occurrence(env.db, level="ERROR", message="mismo")
+    add_occurrence_for_issue(env.db, issue_id)
+    add_occurrence_for_issue(env.db, issue_id)
+    add_occurrence(env.db, level="ERROR", message="otro")
+    res = w.poll_once()
+    assert res["queued"] == 2 and res["deduped"] == 2
+    pending = store.load()["pending"]
+    assert len(pending) == 2
+    grouped = [e for e in pending if e["message"] == "mismo"][0]
+    assert grouped["duplicates"] == 2
+    text = bridge.render_report(pending, "2026-01-01")
+    assert "(+2 ocurrencia(s) del mismo issue" in text
+
+
+def test_dedup_after_dispatch_requeues(env):
+    """La deduplicacion es solo dentro de la cola: un issue ya despachado que
+    vuelve a fallar se encola de nuevo (no se oculta una recurrencia)."""
+    w, store, _ = make_watcher(env)
+    w.poll_once()
+    issue_id, occ1 = add_occurrence(env.db, level="ERROR", message="mismo")
+    w.poll_once()
+    with store.transaction() as st:
+        st["completed"] = [occ1]
+        st["pending"] = []
+    add_occurrence_for_issue(env.db, issue_id)
+    res = w.poll_once()
+    assert res["queued"] == 1 and res["deduped"] == 0
+    assert len(store.load()["pending"]) == 1
 
 
 def test_groups_isolated_cursors(env):
@@ -453,6 +561,77 @@ def test_failed_queue_write_keeps_cursor(env, monkeypatch):
     assert st["cursor"] == 0 and st["pending"] == []
 
 
+def test_state_save_retries_transient_winerror(env, monkeypatch):
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["cursor"] = 1
+    real_replace = os.replace
+    monkeypatch.setattr(bridge.time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            exc = PermissionError(13, "Access is denied")
+            exc.winerror = 5
+            raise exc
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(bridge.os, "replace", flaky_replace)
+    with store.transaction() as st:
+        st["cursor"] = 2
+    assert calls["n"] == 3
+    assert store.load()["cursor"] == 2
+    assert not list(store.state_dir.glob(".state-*.tmp"))
+
+
+def test_state_save_fails_closed_after_retries(env, monkeypatch):
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["cursor"] = 1
+    monkeypatch.setattr(bridge.time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def denied_replace(src, dst):
+        calls["n"] += 1
+        exc = PermissionError(13, "Access is denied")
+        exc.winerror = 5
+        raise exc
+
+    monkeypatch.setattr(bridge.os, "replace", denied_replace)
+    with pytest.raises(PermissionError):
+        with store.transaction() as st:
+            st["cursor"] = 2
+    assert calls["n"] == bridge.STATE_REPLACE_ATTEMPTS
+    assert not list(store.state_dir.glob(".state-*.tmp"))
+    assert store.load()["cursor"] == 1
+
+
+def test_state_save_backoff_grows_and_is_capped(env, monkeypatch):
+    """El backoff ante WinError 5/32 crece exponencialmente y queda topado:
+    locks transitorios (AV/indexer) de varios segundos ya no abortan el ciclo."""
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["cursor"] = 1
+    sleeps = []
+    monkeypatch.setattr(bridge.time, "sleep", lambda s: sleeps.append(s))
+
+    def denied_replace(src, dst):
+        exc = PermissionError(13, "Access is denied")
+        exc.winerror = 5
+        raise exc
+
+    monkeypatch.setattr(bridge.os, "replace", denied_replace)
+    with pytest.raises(PermissionError):
+        with store.transaction() as st:
+            st["cursor"] = 2
+    assert len(sleeps) == bridge.STATE_REPLACE_ATTEMPTS - 1
+    assert sleeps[0] == bridge.STATE_REPLACE_DELAY
+    assert sleeps[-1] == bridge.STATE_REPLACE_MAX_DELAY
+    assert all(s <= bridge.STATE_REPLACE_MAX_DELAY for s in sleeps)
+    assert sum(sleeps) >= 5.0  # aguanta locks de varios segundos, no solo ~2 s
+
+
 def test_malformed_state_fail_closed(env):
     w, store, _ = make_watcher(env)
     store.state_dir.mkdir(parents=True)
@@ -462,6 +641,17 @@ def test_malformed_state_fail_closed(env):
     store.path.write_text(json.dumps({"version": 1}), encoding="utf-8")
     with pytest.raises(bridge.StateError):
         w.poll_once()
+
+
+def test_state_without_hold_until_loads(env):
+    """Un state.json previo a la ventana de acumulacion (sin hold_until) se
+    carga sin romper: el campo nuevo se completa con su default."""
+    store = bridge.StateStore(env.state_root / "local")
+    store.state_dir.mkdir(parents=True)
+    state = bridge._initial_state()
+    state.pop("hold_until")
+    store.path.write_text(json.dumps(state), encoding="utf-8")
+    assert store.load()["hold_until"] == 0.0
 
 
 def test_state_transaction_serializes_rmw(env):
@@ -802,6 +992,44 @@ def test_worker_sends_initial_batch(env):
     assert st["worker_ready"] is True
     assert agent.spawn_env_mode == env.policy["permission_mode"]
     assert agent.spawn_cwd == env.policy["groups"]["local"]["cwd"]
+
+
+def test_worker_waits_for_hold_window(env):
+    """El worker con consola abierta tambien respeta la ventana: no manda el
+    lote hasta que vence el hold (o hasta que se limpia)."""
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["cursor"] = 1
+        st["pending"] = [ev(1, message="en espera")]
+        st["hold_until"] = time.time() + 3600
+    agent = FakeAcpProc()
+    q = queue.Queue()
+    worker = bridge.ConsoleWorker(
+        env.policy, "local", "2026-01-01", store,
+        spawn_agent=lambda e, m, c: agent, stdin_queue=q,
+        stdout=io.StringIO(), poll_state_seconds=0.05,
+        today=lambda: "2026-01-01",
+        verify_elevation_fn=lambda c: None,
+        mutex_factory=lambda n: bridge.HeldMutex(
+            "Local\\T5-" + os.urandom(6).hex()),
+        auth_fn=lambda e: True, title_fn=lambda t: None)
+    t = threading.Thread(target=worker.run, daemon=True)
+    t.start()
+    time.sleep(0.5)
+    assert not any(m["method"] == "session/prompt" for m in agent.received)
+    with store.transaction() as st:
+        st["hold_until"] = 0.0
+    for _ in range(200):
+        if any(m["method"] == "session/prompt" for m in agent.received):
+            break
+        time.sleep(0.05)
+    q.put(None)
+    t.join(15)
+    prompts = [m for m in agent.received if m["method"] == "session/prompt"]
+    assert len(prompts) == 1
+    assert "en espera" in prompts[0]["params"]["prompt"][0]["text"]
+    assert store.load()["completed"] == [1]
 
 
 def test_worker_second_batch_followup(env):

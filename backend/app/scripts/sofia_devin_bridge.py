@@ -49,6 +49,13 @@ STATE_POLL_SECONDS = 5.0
 MAX_SPAWN_FAILURES = 5
 SPAWN_GRACE_SECONDS = 15.0
 MAX_COMPLETED = 1000
+# Ventana de acumulacion: tras el primer aviso nuevo se espera este tiempo
+# (policy: batch_hold_seconds) antes de mandar el lote a Devin, para que una
+# rafaga de eventos relacionados llegue en UN solo reporte en vez de varios.
+BATCH_HOLD_SECONDS = 60.0
+STATE_REPLACE_ATTEMPTS = 8
+STATE_REPLACE_DELAY = 0.2
+STATE_REPLACE_MAX_DELAY = 2.0
 STALL_SECONDS = 900.0
 MAX_STALL_RETRIES = 1
 STALL_WAIT_SLICE = 0.25
@@ -162,6 +169,8 @@ def load_policy(policy_dir: Path) -> Dict[str, Any]:
         "service_ids": {str(s).lower() for s in route.get("service_ids", [])},
         "service_prefixes": tuple(
             str(s).lower() for s in route.get("service_prefixes", [])),
+        "exclude_service_ids": {
+            str(s).lower() for s in route.get("exclude_service_ids", [])},
     }
     policy["_levels"] = {str(l).upper() for l in policy.get("levels", [])}
     return policy
@@ -174,6 +183,11 @@ def route_event(policy: Dict[str, Any], row: Dict[str, Any]) -> Optional[str]:
     route = policy["_elenatec"]
     source = str(row.get("source") or "").lower()
     service_id = str(row.get("service_id") or "").lower()
+    # Componentes del propio monitor (p.ej. droplet-ssh: el poll del monitor
+    # docker de Sofia) son area local aunque su fuente sea "docker": el fix es
+    # Sofia-side y lo aplica la sesion local de esta PC.
+    if service_id in route["exclude_service_ids"]:
+        return "local"
     if source in route["sources"] or service_id in route["service_ids"]:
         return "elenatec"
     if service_id and service_id.startswith(route["service_prefixes"]):
@@ -238,7 +252,13 @@ def _initial_state() -> Dict[str, Any]:
         "status": "ok", "status_at": 0.0, "last_error": None,
         "spawn_failures": 0, "next_retry_after": 0.0, "last_spawn": 0.0,
         "spawn_counted": False, "worker_ready": False, "circuit_open": False,
+        "hold_until": 0.0,
     }
+
+
+# Claves agregadas despues de la version 1 inicial: los state.json existentes
+# no las traen y cargar debe seguir funcionando (se completan con el default).
+_OPTIONAL_STATE_KEYS = {"hold_until"}
 
 
 def _valid_event(ev: Any) -> bool:
@@ -256,7 +276,7 @@ def validate_state(state: Any, existing: bool = True) -> Dict[str, Any]:
         raise StateError("estado no es un objeto")
     base = _initial_state()
     if existing:
-        missing = set(base) - set(state)
+        missing = set(base) - set(state) - _OPTIONAL_STATE_KEYS
         if missing:
             raise StateError(f"estado sin claves: {sorted(missing)}")
     for key, default in base.items():
@@ -270,6 +290,7 @@ def validate_state(state: Any, existing: bool = True) -> Dict[str, Any]:
         ("status_at", (int, float)), ("spawn_failures", int),
         ("next_retry_after", (int, float)), ("last_spawn", (int, float)),
         ("spawn_counted", bool), ("worker_ready", bool), ("circuit_open", bool),
+        ("hold_until", (int, float)),
     )
     for key, typ in checks:
         if not isinstance(state[key], typ):
@@ -518,7 +539,16 @@ class StateStore:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(state, fh, ensure_ascii=False, indent=1)
-            os.replace(tmp, self.path)
+            for attempt in range(STATE_REPLACE_ATTEMPTS):
+                try:
+                    os.replace(tmp, self.path)
+                    return
+                except OSError as exc:
+                    if (getattr(exc, "winerror", None) not in (5, 32)
+                            or attempt + 1 >= STATE_REPLACE_ATTEMPTS):
+                        raise
+                    time.sleep(min(STATE_REPLACE_DELAY * (2 ** attempt),
+                                   STATE_REPLACE_MAX_DELAY))
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -564,6 +594,24 @@ def event_from_row(row: Dict[str, Any], received_day: str) -> Dict[str, Any]:
     }
 
 
+def find_pending_duplicate(pending: List[Dict[str, Any]],
+                           ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Busca en la cola un evento del MISMO issue (misma familia de error).
+
+    Una rafaga de lineas del mismo problema crea varias occurrences del mismo
+    issue_id; mientras ese issue siga en la cola, las ocurrencias adicionales
+    se agrupan (no se manda lo mismo varias veces). Un issue sin id o que ya
+    fue despachado (ya no esta en pending) no se deduplica.
+    """
+    issue_id = ev.get("issue_id")
+    if issue_id is None:
+        return None
+    for e in pending:
+        if e.get("issue_id") == issue_id:
+            return e
+    return None
+
+
 def render_report(events: List[Dict[str, Any]], day: str) -> str:
     lines = [f"Reportes del dia {day} ({len(events)}):", ""]
     for ev in events:
@@ -575,6 +623,10 @@ def render_report(events: List[Dict[str, Any]], day: str) -> str:
         lines.append(
             f"  issue actual: environment={ev['environment'] or 'n/d'} "
             f"release={ev['release'] or 'n/d'}")
+        if ev.get("duplicates"):
+            lines.append(
+                f"  (+{ev['duplicates']} ocurrencia(s) del mismo issue "
+                "agrupadas en esta ventana)")
         if ev["detail"]:
             lines.append("  detalle:")
             for dline in ev["detail"].splitlines():
@@ -949,7 +1001,7 @@ class Watcher:
 
     def poll_once(self) -> Dict[str, Any]:
         decision: Dict[str, Any] = {"spawn_day": None, "queued": 0,
-                                    "early": None}
+                                    "deduped": 0, "early": None}
         with self.store.transaction() as state:
             self._account_locked(state)
             if state["source_reset"]:
@@ -976,6 +1028,7 @@ class Watcher:
                                              "queued": 0}
                 else:
                     day = self.today()
+                    had_pending = bool(state["pending"])
                     handled_last = cursor
                     for row in rows:
                         rid = int(row["occurrence_id"])
@@ -986,12 +1039,21 @@ class Watcher:
                                 state["last_error"] = \
                                     "cola llena; cursor detenido"
                                 break
-                            state["pending"].append(event_from_row(row, day))
-                            decision["queued"] += 1
+                            ev = event_from_row(row, day)
+                            duplicate = find_pending_duplicate(
+                                state["pending"], ev)
+                            if duplicate is not None:
+                                duplicate["duplicates"] = int(
+                                    duplicate.get("duplicates") or 0) + 1
+                                decision["deduped"] += 1
+                            else:
+                                state["pending"].append(ev)
+                                decision["queued"] += 1
                         handled_last = rid
                     state["cursor"] = handled_last
                     if decision["queued"]:
                         state["paused"] = False
+                        self._arm_hold_locked(state, had_pending)
                         if not state["circuit_open"] and (
                                 state["status"] != "pending_full" or
                                 len(state["pending"]) < MAX_PENDING):
@@ -1002,7 +1064,27 @@ class Watcher:
         if decision["early"] is not None:
             return decision["early"]
         self._maybe_spawn(decision.get("spawn_day"))
-        return {"status": "ok", "queued": decision["queued"]}
+        return {"status": "ok", "queued": decision["queued"],
+                "deduped": decision["deduped"]}
+
+    def _hold_seconds(self) -> float:
+        try:
+            return float(self.policy.get("batch_hold_seconds",
+                                         BATCH_HOLD_SECONDS))
+        except (TypeError, ValueError):
+            return BATCH_HOLD_SECONDS
+
+    def _arm_hold_locked(self, state, had_pending: bool) -> None:
+        """Arma la ventana de acumulacion cuando arranca un lote nuevo.
+
+        Si la cola ya tenia eventos (ventana en curso o backlog que espera
+        worker), no se extiende la espera: la ventana vence igual.
+        """
+        hold = self._hold_seconds()
+        if hold <= 0 or had_pending:
+            return
+        if float(state.get("hold_until") or 0.0) <= self.now():
+            state["hold_until"] = self.now() + hold
 
     def _spawn_day_locked(self, state) -> Optional[str]:
         if not state["pending"] or state["paused"] or state["circuit_open"]:
@@ -1068,6 +1150,8 @@ class Watcher:
                 st["last_error"] = "devin_executable no existe"
             return None
         with self.store.transaction() as st:
+            if float(st.get("hold_until") or 0.0) > self.now():
+                return None
             if self.now() < float(st["next_retry_after"]):
                 return None
             if st["last_spawn"] and not st["spawn_counted"] \
@@ -1477,6 +1561,9 @@ class ConsoleWorker:
     def _take_pending_events(self) -> List[Dict[str, Any]]:
         state = self.store.load()
         if state["uncertain"] or state["inflight"]:
+            return []
+        if float(state.get("hold_until") or 0.0) > self.now():
+            # Ventana de acumulacion activa: esperar a que llegue todo el lote.
             return []
         completed = set(state["completed"])
         out = []
