@@ -65,6 +65,7 @@ class IncidentTeamConfig(BaseModel):
     enabled: bool = False
     execution_enabled: bool = False
     isolated_worker_confirmed: bool = False
+    authenticated_ingest_confirmed: bool = False
     legacy_dispatch_excluded_confirmed: bool = False
     upstream_spend_cap_confirmed: bool = False
     max_runs_per_day: int = Field(default=3, ge=0, le=20)

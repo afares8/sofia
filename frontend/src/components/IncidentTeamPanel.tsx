@@ -25,6 +25,7 @@ export default function IncidentTeamPanel() {
   const [artifact, setArtifact] = useState('')
   const [worker, setWorker] = useState<{ enabled: boolean; execution_enabled: boolean; scope_gaps: number; error_code: string | null } | null>(null)
   const [evidence, setEvidence] = useState<Record<number, string>>({})
+  const [beforeId, setBeforeId] = useState<number | null>(null)
 
   async function request(path = '', body?: object) {
     const response = await fetch(`/api/autonomy/incidents${path}`, {
@@ -36,12 +37,14 @@ export default function IncidentTeamPanel() {
     return response.json()
   }
 
-  async function act(action: () => Promise<unknown>) {
+  async function act(action: () => Promise<unknown>, pageBefore: number | null = beforeId) {
     setBusy(true); setError('')
     try {
       await action()
-      const [list, status] = await Promise.all([request(), request('/status')])
-      setRuns(list); setWorker(status)
+      const [list, status] = await Promise.all([
+        request(pageBefore === null ? '' : `?before_id=${pageBefore}`), request('/status'),
+      ])
+      setRuns(list); setWorker(status); setBeforeId(pageBefore)
     }
     catch (e) { setError(e instanceof Error ? e.message : 'Error al consultar incidentes') }
     finally { setBusy(false) }
@@ -52,13 +55,17 @@ export default function IncidentTeamPanel() {
     <p className="text-sm text-gray-400">Una tarjeta por empresa, entorno y versión. Análisis, corrección y revisión separados; CI verifica el commit. El despliegue requiere tu decisión y un ejecutor autorizado.</p>
     <div className="flex flex-wrap gap-2">
       <input type="password" autoComplete="off" aria-label="Clave de operador" placeholder="Clave de operador (solo esta sesión)"
-        value={key} onChange={e => { setKey(e.target.value); setRuns([]); setWorker(null); setEvidence({}); setSelected(null) }}
+        value={key} disabled={busy} onChange={e => { setKey(e.target.value); setRuns([]); setWorker(null); setEvidence({}); setSelected(null); setBeforeId(null) }}
         className="bg-gray-950 border border-gray-700 rounded px-3 py-2 text-sm text-white w-80" />
-      <button disabled={!key || busy} onClick={() => act(async () => {})}
+      <button disabled={!key || busy} onClick={() => act(async () => {}, null)}
         className="bg-sky-800 rounded px-3 py-2 text-sm text-white disabled:opacity-40">Consultar incidentes</button>
     </div>
     {error && <p role="alert" className="text-red-300 text-sm">{error}</p>}
     {worker && <p className="text-sm text-gray-400">Detección: {worker.enabled ? 'habilitada' : 'apagada'} · Ejecución: {worker.execution_enabled ? 'sujeta a controles' : 'apagada'} · Ocurrencias sin contexto autorizado: {worker.scope_gaps}{worker.error_code ? ` · Atención: ${worker.error_code}` : ''}</p>}
+    {worker && <div className="flex gap-3 text-sm text-sky-300">
+      {beforeId !== null && <button disabled={busy} onClick={() => act(async () => {}, null)}>Volver a recientes</button>}
+      {runs.length === 50 && <button disabled={busy} onClick={() => act(async () => {}, runs[runs.length - 1].id)}>Ver 50 anteriores</button>}
+    </div>}
     {runs.map(run => <article key={run.id} className="border border-gray-700 rounded-lg p-3 space-y-2 text-sm text-gray-300">
       <div className="flex flex-wrap justify-between gap-2"><strong>#{run.id} · {run.service_id} · {run.tenant_id}</strong><span>{labels[run.status] || run.status}</span></div>
       <p>{run.environment} · {run.release} · {run.occurrences} ocurrencia(s) agrupadas</p>

@@ -18,6 +18,8 @@ from pathlib import Path
 
 from app.services import db_service
 from app.services.config_service import load_config
+from app.services.secret_redaction import redact, contains_literal_credentials
+from app.services.ingest_identity import identity_matches_context
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS incident_runs (
@@ -32,6 +34,7 @@ CREATE TABLE IF NOT EXISTS incident_runs (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_active ON incident_runs(scope_key)
  WHERE status NOT IN ('cancelled');
+CREATE INDEX IF NOT EXISTS idx_incident_pending ON incident_runs(status,id);
 CREATE TABLE IF NOT EXISTS incident_receipts (
  occurrence_id INTEGER PRIMARY KEY, run_id INTEGER, reason TEXT
 );
@@ -51,7 +54,7 @@ SHA = re.compile(r"[0-9a-f]{40}\Z")
 IDENT = re.compile(r"[A-Za-z0-9_.:-]{1,120}\Z")
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 TRANSITIONS = {
-    "pending": {"analyzing", "cancelled"},
+    "pending": {"analyzing", "blocked", "cancelled"},
     "analyzing": {"preparing", "blocked", "uncertain"},
     "preparing": {"reviewing", "blocked", "uncertain"},
     "reviewing": {"awaiting_ci", "blocked", "uncertain"},
@@ -68,21 +71,6 @@ def encode(value) -> str:
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
-
-
-def redact(value: str) -> str:
-    value = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|\Z)",
-                   "[PRIVATE KEY]", value, flags=re.S)
-    value = re.sub(r"(?i)\b(?:(?:Bearer|Basic)\s+\S+|(?:api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+)",
-                   "[CREDENTIAL]", value)
-    value = re.sub(r"\b(?:github_pat_|gh[pousr]_|sk-|xox[baprs]-)[A-Za-z0-9_-]{10,}", "[CREDENTIAL]", value)
-    value = re.sub(r"\b(?:AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)", "[CREDENTIAL]", value)
-    value = re.sub(r"((?:https?|rtsp)://)[^\s/@]+:[^\s/@]+@", r"\1[USERINFO]@", value)
-    value = re.sub(r"((?:https?|rtsp)://[^\s?#]+)[?#][^\s]*", r"\1[QUERY]", value)
-    value = re.sub(r"(?i)(/(?:token|secret|apikey|api-key|auth)/)[^/\s]+", r"\1[REDACTED]", value)
-    value = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[EMAIL]", value)
-    value = re.sub(r"(?<!\w)\+?\d[\d ()-]{8,}\d(?!\w)", "[PHONE]", value)
-    return value
 
 
 @contextmanager
@@ -118,9 +106,24 @@ def get_run(run_id: int) -> dict:
         return result
 
 
-def list_runs() -> list[dict]:
+def list_runs(limit: int = 50, before_id: int | None = None) -> list[dict]:
+    if not 1 <= limit <= 100 or (before_id is not None and before_id < 1):
+        raise ValueError("Paginacion invalida.")
     with transaction() as db:
-        return [dict(row) for row in db.execute("SELECT * FROM incident_runs ORDER BY id DESC LIMIT 50")]
+        return [dict(row) for row in db.execute(
+            "SELECT * FROM incident_runs WHERE (? IS NULL OR id<?) ORDER BY id DESC LIMIT ?",
+            (before_id, before_id, limit))]
+
+
+def next_pending_id() -> int | None:
+    """Worker FIFO selection is independent of operator history pagination.
+
+    Selection grants no execution rights: claim() still atomically checks the
+    state, current scope authorization and persistent budget before any effects.
+    """
+    with transaction() as db:
+        row = db.execute("SELECT id FROM incident_runs WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
+        return row[0] if row else None
 
 
 def status() -> dict:
@@ -175,6 +178,9 @@ def enqueue(occurrence_id: int) -> int | None:
             raise ValueError("Ocurrencia no encontrada.")
         try:
             ctx = json.loads(row["context"] or "{}")
+            if not identity_matches_context(ctx):
+                db.execute("INSERT INTO incident_receipts VALUES(?,NULL,'unverified_ingest_identity')", (occurrence_id,))
+                return None
             scope = {k: ctx[k] for k in ("service_id", "environment", "release", "source")}
             scope["tenant_id"] = ctx["tenant_id"]
             if not all(isinstance(v, str) and IDENT.fullmatch(v) for v in scope.values()):
@@ -194,6 +200,7 @@ def enqueue(occurrence_id: int) -> int | None:
             db.execute("UPDATE incident_runs SET occurrences=occurrences+1 WHERE id=?", (run_id,))
         else:
             snapshot = encode({"context": scope, "occurred_at": row["timestamp"],
+                               "ingest_identity": ctx["ingest_identity"],
                                "message": redact(ctx["message"])[:2000],
                                "detail": redact(row["detail"] or "")[:4000],
                                "traceback": redact(row["traceback"] or "")[:4000]})
@@ -236,14 +243,35 @@ def claim(run_id: int) -> bool:
     config = load_config().autonomy
     cfg = config.incident_team
     if (not os.getenv("SOFIA_API_KEY") or config.kill_switch or not cfg.enabled or not cfg.execution_enabled or
-        not cfg.isolated_worker_confirmed or not cfg.legacy_dispatch_excluded_confirmed or
+        not cfg.isolated_worker_confirmed or not cfg.authenticated_ingest_confirmed or
+        not cfg.legacy_dispatch_excluded_confirmed or
         not cfg.upstream_spend_cap_confirmed or
         cfg.session_cost_ceiling_cents <= 0):
         raise ValueError("Ejecucion cerrada: faltan habilitacion, aislamiento o limite de gasto externo.")
     run = get_run(run_id)
-    repo = repo_for(run)
-    if repo.autofix_enabled:
-        raise ValueError("Excluir primero el servicio del autofix heredado.")
+    if run["status"] != "pending":
+        return False
+    snapshot = json.loads(run["snapshot"])
+    if not identity_matches_context({**snapshot.get("context", {}), "ingest_identity": snapshot.get("ingest_identity")}):
+        try:
+            transition(run_id, "pending", "blocked", reason="unverified_ingest_identity",
+                       payload={"code": "unverified_ingest_identity"})
+        except ValueError:
+            pass
+        return False
+    try:
+        repo = repo_for(run)
+        if repo.autofix_enabled:
+            raise ValueError("Legacy dispatcher still enabled")
+    except ValueError:
+        # A revoked scope must not execute or monopolize the FIFO indefinitely.
+        # CAS preserves another worker's claim/cancellation; no budget is spent.
+        try:
+            transition(run_id, "pending", "blocked", reason="scope_or_dispatch_policy_revoked",
+                       payload={"code": "scope_or_dispatch_policy_revoked"})
+        except ValueError:
+            pass
+        return False
     day = time.strftime("%Y-%m-%d", time.gmtime())
     hour = time.strftime("%Y-%m-%dT%H", time.gmtime())
     with transaction() as db:
@@ -304,7 +332,7 @@ def frozen_diff(path: str, repo) -> str:
     if not diff or len(diff) > 60000 or "GIT binary patch" in diff or "mode 120000" in diff or "mode 160000" in diff:
         raise ValueError("Diff vacio, binario, enlace o demasiado grande.")
     if (any(p.search(diff) for p in SECRET_PATTERNS) or
-        re.search(r'''(?i)(api[_-]?key|password|secret|access[_-]?token)\s*[:=]\s*['"][^'"\s]{8,}['"]''', diff) or
+        contains_literal_credentials(diff) or
         re.search(r"(?i)(drop\s+table|truncate\s+table|danger-full-access|verify\s*=\s*false)", diff)):
         raise ValueError("Diff bloqueado por politica de seguridad.")
     return diff
@@ -353,6 +381,7 @@ def execute(run_id: int):
             current = load_config().autonomy
             if (current.kill_switch or not current.incident_team.execution_enabled or not current.incident_team.enabled or
                 not current.incident_team.isolated_worker_confirmed or
+                not current.incident_team.authenticated_ingest_confirmed or
                 not current.incident_team.upstream_spend_cap_confirmed or
                 not current.incident_team.legacy_dispatch_excluded_confirmed or
                 get_run(run_id)["status"] not in ACTIVE):
@@ -493,11 +522,9 @@ async def incident_loop():
             cfg = load_config().autonomy.incident_team
             if cfg.enabled and cfg.execution_enabled:
                 # Also resume durable pending work after a clean worker restart.
-                pending = await asyncio.to_thread(list_runs)
-                for run in reversed(pending):
-                    if run["status"] == "pending":
-                        await asyncio.to_thread(execute, run["id"])
-                        break
+                pending_id = await asyncio.to_thread(next_pending_id)
+                if pending_id is not None:
+                    await asyncio.to_thread(execute, pending_id)
         except ValueError as exc:
             error_code = "source_reset" if str(exc).startswith("source_reset") else "controls_or_budget_blocked"
         except Exception:

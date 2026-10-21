@@ -17,8 +17,10 @@ occurrence → pending → analyzing → preparing → reviewing → awaiting_ci
 - La clave de deduplicación incluye repositorio, servicio, empresa, entorno, release, fuente y fingerprint. Cada ID de ocurrencia tiene un receipt único; otra ocurrencia del mismo contexto incrementa el contador, no abre otra sesión. El snapshot inicial no cambia.
 - Activar el lector por primera vez guarda el highwater y empieza **desde ahora**. No procesa backlog histórico. Encolado manual: `POST /api/autonomy/incidents/occurrences/{id}`. Un reset no vacío de IDs detiene el lector; `MAX(id)=0` por retención no rebobina el cursor.
 - Claim, reserva de presupuesto y cambio de estado son una transacción SQLite corta. Tres sesiones y cuatro acciones lógicas (análisis, preparación, revisión, commit) se reservan antes de crear el sandbox. No se mantiene el lock durante Git, modelos o GitHub. Los límites son globales al nuevo circuito, persistentes, con ventanas calendario UTC.
+- La selección del worker es FIFO (`status=pending ORDER BY id`) y usa un índice propio, sin el límite de la vista. La API de historial pagina con `limit` (1–100, default 50) y `before_id`; el panel permite cargar páginas anteriores. Si se revoca un scope o se habilita un despachador incompatible, ese pendiente pasa a `blocked` mediante CAS y auditoría, sin reservar presupuesto: no bloquea al siguiente. Un presupuesto temporalmente agotado conserva `pending`.
 - El analista y revisor usan `read-only`; el engineer usa `workspace-write`, sin red ni raíces temporales adicionales. Tres invocaciones efímeras distintas; el revisor recibe incidente y diff completo, sin las afirmaciones del engineer. JSON estricto: un string `"false"`, claves duplicadas, acciones pendientes o riesgo alto bloquean.
 - Cada stage tiene deadline (300 s por defecto, máximo 600 s), salida acotada y entorno por allowlist. La salida de herramientas/modelos no se imprime en logs; la evidencia guardada está redactada. Se usa el mensaje final del CLI, separado del banner. No se invoca Codex durante los tests.
+- La redacción visita JSON y dict/list literales de forma recursiva, incluso dentro de mensajes serializados; reconoce alias/camelCase/separadores y claves escapadas. Conserva evidencia segura y usa un fallback léxico para texto incompleto. El gate de diff comparte los alias y bloquea literales de credenciales genéricas antes de revisión/transmisión/commit, incluidos dicts JSON/Python y JSON serializado. El escaneo está acotado y no certifica ausencia de cualquier secreto posible. La redacción cubre el contexto y la evidencia nuevos; no limpia datos históricos ni modifica las columnas raw del monitor heredado.
 - El clone queda sin `origin`. El controller bloquea paths de datos/configuración/credenciales/gobernanza, escapes, enlaces, submódulos, diffs binarios, secretos conocidos y diffs mayores de 60.000 caracteres o 12 archivos. Incluye archivos nuevos, staged y borrados. El engineer no puede aportar su propio commit. Se verifica HEAD y hash del diff otra vez después de la revisión; el controller crea el commit con hooks deshabilitados.
 - El controller **no ejecuta comandos de test del código generado en el host**. La verificación determinista ocurre en CI aislada. Falta de tests/checks configurados, checks omitidos/pendientes, otro SHA o emisor, workflow incorrecto y evidencia ambigua bloquean la decisión.
 - GitHub se consulta desde el servidor con `gh api`, en el repositorio y SHA exactos. Se exige `github-actions`, nombres de checks explícitos y ruta de workflow acordada; también se verifica la ejecución Actions asociada. No hay endpoint para que un agente declare que la CI pasó.
@@ -42,6 +44,10 @@ Antes de habilitar ejecución:
 
 No se hicieron esos pasos operativos en esta tarea. SERVER-SOFIA y producción siguen fuera del alcance autorizado.
 
+**Gate obligatorio de identidad de ingesta:** `/api/ingest/event` es una excepción de autenticación heredada. Permanece compatible con SDKs públicos para captura/alertas legacy, así que servicio/empresa/entorno/release/fuente declarados por el payload no prueban quién los emitió. La nueva automatización no acepta esos eventos sin procedencia verificada: el servidor construye `VerifiedIngestIdentity`, la liga al contexto exacto y la persiste sin credenciales; ni un campo del payload ni sus tags pueden suplirla. Solo está implementado el adaptador de la identidad central existente: exige el Bearer real en **esa petición**, más repo/tenant/entorno autorizados. Tener `SOFIA_API_KEY` en el entorno no autentica una petición sin header. Eventos públicos, intentos de suplantación y pendientes anteriores sin procedencia se excluyen/bloquean sin abrir modelos ni consumir cuotas. `authenticated_ingest_confirmed` es otro gate apagado por defecto; no fabrica procedencia ni reemplaza esa validación por evento.
+
+Antes de activar un worker externo, autorizar y verificar un adaptador de emisor con identidad/alcance de mínimo privilegio y transporte protegido. **No distribuir la clave central a SDKs, navegadores ni modelos.** Ese adaptador por emisor no se provisionó en esta tarea; continúa siendo un bloqueo de activación. La identidad central sirve para ingesta explícita de un operador ya autorizado, no para atribuir identidad de empresa a usuarios finales. La exposición de captura/alertas raw legacy es una limitación heredada; el riesgo nuevo de gastar presupuesto/atribuir trabajo a otra empresa se cierra con este gate. No se cambiaron credenciales, permisos, conexiones ni datos reales.
+
 ## CI, publicación y una decisión humana
 
 El candidato queda en la rama y path de sandbox registrados. Un operador revisa/publica ese SHA en el repositorio exacto mediante el flujo Git autorizado; este circuito no hace push automático. No publicar snapshots, DB, evidencia de clientes ni credenciales. El siguiente paso es la CI del SHA candidato, no una señal verde de otra rama.
@@ -54,7 +60,7 @@ API, todas las rutas con Bearer de operador:
 
 | Operación | Ruta |
 | --- | --- |
-| Cola y tarjetas | `GET /api/autonomy/incidents` |
+| Cola y tarjetas paginadas | `GET /api/autonomy/incidents?limit=50&before_id=N` |
 | Cobertura / último ciclo / gaps | `GET /api/autonomy/incidents/status` |
 | Snapshot, evidencia y digests | `GET /api/autonomy/incidents/{id}` |
 | Incluir ocurrencia explícita | `POST /api/autonomy/incidents/occurrences/{occurrence_id}` |
@@ -78,6 +84,8 @@ Cobertura mínima de ejemplo probada:
 | Recuperar carrito | Fixture recuperado distinto del esperado | No abre sesiones ni usa carritos/clientes reales |
 
 Un test integra contrato fallido → ingesta FastAPI aislada → occurrence → incidente pendiente. Son conectores reutilizables y ejemplos, **no recorridos E2E implantados en Mayor, Packing o ElenaTec**, ni certificación de sus reglas de negocio. Fuente/tenant declarados por un SDK son datos no confiables; no confieren permisos ni demuestran causa. Un detector malicioso sigue sujeto a cuotas, revisión y CI, nunca puede autoaprobar producción.
+
+El test integrado anterior usa una identidad central sintética verificada por header; un SDK público sin identidad verificada solo conserva la captura legacy y no entra al worker.
 
 ## Rollback y parada
 
@@ -119,3 +127,5 @@ npm run build
 No importar `app.main`, usar lifespan, arrancar Sofia, leer config productiva ni llamar modelos/proveedores durante la verificación. Las fixtures configuran DB/config temporales y simulan modelos/GitHub/HTTP; solo se crean procesos Git/repos temporales y procesos Python de prueba propios. En entornos Windows que bloquean `socketpair`, asyncio necesita permiso para su comunicación local interna.
 
 Flags contrastados con documentación oficial: [CLI](https://developers.openai.com/codex/cli/reference), [configuración de sandbox](https://developers.openai.com/codex/config-reference). El binario Codex no está instalado en este workspace; no se instaló ni se contactó un modelo.
+
+Revisión independiente del PR: se reprodujeron dos fallos de credenciales con tests rojos (JSON sin redactar y dict genérico admitido al candidato), y se agregaron regresiones de 62 incidentes, claims concurrentes, revocación del primero de la cola, claves anidadas/alias/escapadas, conservación de evidencia segura e identidad de ingesta. Resultado posterior: **138 tests aprobados**, build TypeScript/Vite correcto. La CI remota sigue sin bootstrap; los 94 tests citados en la captura remota inicial son la validación previa, no el conteo final.

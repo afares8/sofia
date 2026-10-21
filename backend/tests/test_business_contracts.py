@@ -65,6 +65,7 @@ async def test_failed_business_probe_enters_existing_ingestion_then_incident(con
         incident_tenant_ids=["fixture-a"], incident_environments=["test"])])
     monkeypatch.setattr(ingest, "load_config", lambda: cfg)
     monkeypatch.setattr(team, "load_config", lambda: cfg)
+    monkeypatch.setenv("SOFIA_API_KEY", "synthetic-operator-key")
     alert = AsyncMock(return_value=False)
     monkeypatch.setattr(ingest.whatsapp_service, "send_alert", alert)
     payload = contracts.sale_total(expected_total="10", observed_total="9").incident_payload(
@@ -72,7 +73,8 @@ async def test_failed_business_probe_enters_existing_ingestion_then_incident(con
     app = FastAPI()
     app.include_router(ingest.router, prefix="/api")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
-        response = await client.post("/api/ingest/event", json=payload)
+        response = await client.post("/api/ingest/event", json=payload,
+                                     headers={"Authorization": "Bearer synthetic-operator-key"})
     assert response.status_code == 200
     occurrences = await initialized_db.get_occurrences(response.json()["issue_id"])
     run_id = team.enqueue(occurrences[0]["id"])

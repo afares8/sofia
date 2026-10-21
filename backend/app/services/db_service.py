@@ -28,16 +28,21 @@ def _fingerprint(service_id: str, level: str, message: str) -> str:
     return hashlib.md5(key.encode()).hexdigest()
 
 
-def _occurrence_context(event: ErrorEvent) -> str:
-    from app.services.incident_team_service import redact
+def _occurrence_context(event: ErrorEvent, ingest_identity=None) -> str:
+    from app.services.secret_redaction import redact
+    from app.services.ingest_identity import VerifiedIngestIdentity, scope_identifier
     try:
         tags = json.loads(event.tags or "{}")
         tenant = tags.get("tenant_id") if isinstance(tags, dict) else None
     except (ValueError, TypeError):
         tenant = None
-    return json.dumps({"service_id": event.service_id, "source": event.source,
-                       "environment": event.environment, "release": event.release,
-                       "tenant_id": tenant, "message": redact(event.message), "level": event.level})
+    scope = {key: scope_identifier(value) for key, value in {
+        "service_id": event.service_id, "source": event.source, "environment": event.environment,
+        "release": event.release, "tenant_id": tenant}.items()}
+    identity = ingest_identity.bind(scope) if isinstance(ingest_identity, VerifiedIngestIdentity) else None
+    return json.dumps({**scope, "ingest_identity": identity,
+                       "message": redact(event.message),
+                       "level": event.level if event.level in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"} else "UNKNOWN"})
 
 
 async def init_db():
@@ -288,7 +293,7 @@ async def init_db():
 # ── Issues / occurrences ─────────────────────────────────────────────────────
 
 
-async def upsert_event(event: ErrorEvent) -> Tuple[int, bool, bool]:
+async def upsert_event(event: ErrorEvent, *, ingest_identity=None) -> Tuple[int, bool, bool]:
     """
     Insert or update an issue by fingerprint.
     Returns (issue_id, is_new, is_regression).
@@ -360,7 +365,7 @@ async def upsert_event(event: ErrorEvent) -> Tuple[int, bool, bool]:
             """INSERT INTO occurrences (issue_id, timestamp, url, user_info, detail, traceback, context)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (issue_id, ts, event.url, event.user_info, event.detail, event.traceback,
-             _occurrence_context(event)),
+             _occurrence_context(event, ingest_identity)),
         )
         await db.commit()
         return issue_id, is_new, is_regression

@@ -4,6 +4,7 @@ import json
 import sqlite3
 import subprocess
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock, AsyncMock
@@ -14,6 +15,7 @@ from fastapi import FastAPI
 
 from app.models.config import AppRepoConfig, MonitorConfig
 from app.models.event import ErrorEvent
+from app.services.ingest_identity import VerifiedIngestIdentity
 from app.services import autonomy_service, codex_cli_service, incident_team_service as team
 
 
@@ -39,6 +41,7 @@ async def setup(initialized_db, tmp_path, monkeypatch):
     cfg.autonomy.kill_switch = False
     limits = cfg.autonomy.incident_team
     limits.enabled = limits.execution_enabled = limits.isolated_worker_confirmed = True
+    limits.authenticated_ingest_confirmed = True
     limits.upstream_spend_cap_confirmed = limits.legacy_dispatch_excluded_confirmed = True
     limits.max_reserved_cost_cents_per_day = 900
     limits.session_cost_ceiling_cents = 100
@@ -71,7 +74,9 @@ async def setup(initialized_db, tmp_path, monkeypatch):
 async def occurrence(db, *, tenant="a", environment="test", release="r1", source="active", message="failure", detail=None):
     await db.upsert_event(ErrorEvent(service_id="svc", service_name="Service", level="ERROR", message=message,
                                     tags=json.dumps({"tenant_id": tenant}), environment=environment,
-                                    release=release, source=source, detail=detail))
+                                    release=release, source=source, detail=detail),
+                          ingest_identity=VerifiedIngestIdentity(service_id="svc", tenant_id=tenant,
+                              environment=environment, release=release, source=source))
     with sqlite3.connect(db.DB_PATH) as conn:
         return conn.execute("SELECT MAX(id) FROM occurrences").fetchone()[0]
 
@@ -165,7 +170,7 @@ async def test_atomic_claim_and_daily_budget_reserve_before_work(setup):
         assert conn.execute("SELECT SUM(sessions),SUM(cost_cents) FROM incident_reservations").fetchone() == (3, 300)
 
 
-@pytest.mark.parametrize("setting", ["execution_enabled", "isolated_worker_confirmed", "upstream_spend_cap_confirmed", "legacy_dispatch_excluded_confirmed"])
+@pytest.mark.parametrize("setting", ["execution_enabled", "isolated_worker_confirmed", "authenticated_ingest_confirmed", "upstream_spend_cap_confirmed", "legacy_dispatch_excluded_confirmed"])
 async def test_disabled_controls_fail_before_model(setup, setting):
     db, cfg, model = setup
     setattr(cfg.autonomy.incident_team, setting, False)
@@ -341,3 +346,183 @@ async def test_revoked_scope_and_kill_switch_stop_at_boundaries(setup):
     team.execute(run_id)
     assert model.call_count == 1
     assert team.get_run(run_id)["status"] == "blocked"
+
+
+async def test_fifo_worker_and_ui_pagination_do_not_hide_old_pending_work(setup):
+    db, _, _ = setup
+    oldest = team.enqueue(await occurrence(db, message="oldest pending"))
+    second = team.enqueue(await occurrence(db, message="second pending"))
+    recent = [team.enqueue(await occurrence(db, message=f"recent incident {index}")) for index in range(60)]
+    with sqlite3.connect(db.DB_PATH) as conn:
+        conn.executemany("UPDATE incident_runs SET status='blocked' WHERE id=?", [(i,) for i in recent])
+    first_page = team.list_runs()
+    assert len(first_page) == 50 and oldest not in {r["id"] for r in first_page}
+    second_page = team.list_runs(before_id=first_page[-1]["id"])
+    assert oldest in {r["id"] for r in second_page}
+    assert not {r["id"] for r in first_page} & {r["id"] for r in second_page}
+    assert team.next_pending_id() == oldest
+
+    barrier = threading.Barrier(8)
+    def select_and_claim(_):
+        selected = team.next_pending_id()
+        barrier.wait(timeout=10)
+        return selected, team.claim(selected)
+    with ThreadPoolExecutor(8) as pool:
+        claims = list(pool.map(select_and_claim, range(8)))
+    assert all(selected == oldest for selected, _ in claims)
+    assert sum(claimed for _, claimed in claims) == 1
+    assert team.next_pending_id() == second
+
+
+async def test_fifo_permission_revocation_blocks_without_spending_or_starving_next(setup):
+    db, cfg, model = setup
+    unauthorized = team.enqueue(await occurrence(db, tenant="a", message="older revoked scope"))
+    allowed = team.enqueue(await occurrence(db, tenant="b", message="next authorized scope"))
+    cfg.app_repos[0].incident_tenant_ids = ["b"]
+    assert team.next_pending_id() == unauthorized
+    team.execute(unauthorized)
+    assert team.get_run(unauthorized)["status"] == "blocked"
+    assert not model.called
+    with sqlite3.connect(db.DB_PATH) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM incident_reservations").fetchone()[0] == 0
+    assert team.next_pending_id() == allowed
+    team.execute(allowed)
+    assert team.get_run(allowed)["status"] == "awaiting_ci"
+    assert model.call_count == 3
+
+
+def test_quoted_json_credentials_are_redacted_recursively():
+    original = json.dumps({"message": "safe evidence", "nested": {"password": "plain-secret-value",
+        "API_Key": "opaque-key-value", "items": [{"clientSecret": "nested-secret-value"}]}})
+    redacted = team.redact(original)
+    for secret in ("plain-secret-value", "opaque-key-value", "nested-secret-value"):
+        assert secret not in redacted
+    assert "safe evidence" in redacted
+
+
+async def test_generic_quoted_dict_credential_is_blocked_before_review_or_commit(setup):
+    db, cfg, model = setup
+    original = model.side_effect
+    def prepare(prompt, **kwargs):
+        result = original(prompt, **kwargs)
+        if not kwargs["read_only"]:
+            Path(kwargs["cwd"], "backend/app/sample.py").write_text('config = {"password": "plain-secret-value"}\n')
+        return result
+    model.side_effect = prepare
+    run_id = team.enqueue(await occurrence(db))
+    team.execute(run_id)
+    run = team.get_run(run_id)
+    assert run["status"] == "blocked" and run["candidate_sha"] is None
+    assert model.call_count == 2
+
+
+@pytest.mark.parametrize("alias", ["password", "api_key", "API-Key", "clientSecret", "access_token",
+    "refreshToken", "Authorization", "Cookie", "private_key", "db.password", "awsSecretAccessKey"])
+@pytest.mark.parametrize("format", ["json", "python", "embedded"])
+def test_recursive_redaction_key_aliases_and_diff_gate_share_policy(alias, format):
+    from app.services.secret_redaction import contains_literal_credentials
+    data = {"code": "SAFE_CODE", "nested": [{alias: "opaque-synthetic-value", "safe_count": 7}]}
+    text = repr(data) if format == "python" else json.dumps(data)
+    if format == "embedded":
+        text = "diagnostic prefix: "+text+" diagnostic suffix"
+    redacted = team.redact(text)
+    assert "opaque-synthetic-value" not in redacted and "SAFE_CODE" in redacted
+    assert "safe_count" in redacted
+    assert contains_literal_credentials("+config = "+text)
+    assert not contains_literal_credentials(redacted)
+
+
+def test_redaction_preserves_safe_json_and_handles_escaped_or_encoded_credentials():
+    safe = '{ "message": "business mismatch", "expected": 12.5, "actual": 11, "rows": [1, 2] }'
+    assert team.redact(safe) == safe
+    value = json.dumps({"message": json.dumps({"password": "encoded-synthetic-value"}), "safe": True})
+    result = json.loads(team.redact(value))
+    assert result["safe"] is True
+    assert "encoded-synthetic-value" not in result["message"]
+    escaped = '{"pass\\u0077ord":"escaped-synthetic-value","safe_count":3}'
+    assert "escaped-synthetic-value" not in team.redact(escaped)
+    assert json.loads(team.redact(escaped))["safe_count"] == 3
+    assert "truncated-synthetic-value" not in team.redact('{"password":"truncated-synthetic-value')
+
+
+async def test_new_context_snapshot_prompts_and_model_evidence_are_redacted(setup):
+    db, _, model = setup
+    secret = "nested-synthetic-value"
+    message = json.dumps({"message": "safe incident evidence", "fields": [{"password": secret}]})
+    oid = await occurrence(db, message=message, detail=repr({"api_key": secret}))
+    with sqlite3.connect(db.DB_PATH) as conn:
+        context = conn.execute("SELECT context FROM occurrences WHERE id=?", (oid,)).fetchone()[0]
+    assert secret not in context and "safe incident evidence" in context
+    original = model.side_effect
+    def answer(prompt, **kwargs):
+        assert secret not in prompt
+        result = original(prompt, **kwargs)
+        if kwargs["read_only"] and "DIFF:" not in prompt:
+            return 0, json.dumps({"password": secret, "cause": "safe hypothesis"})
+        return result
+    model.side_effect = answer
+    run_id = team.enqueue(oid)
+    team.execute(run_id)
+    run = team.get_run(run_id)
+    assert run["status"] == "awaiting_ci"
+    assert secret not in json.dumps(run)
+    assert "safe hypothesis" in json.dumps(run)
+
+
+async def test_public_ingest_cannot_spoof_identity_or_spend_worker_budget(setup, monkeypatch):
+    from app.routers import ingest
+    db, cfg, model = setup
+    monkeypatch.setattr(ingest, "load_config", lambda: cfg)
+    monkeypatch.setattr(ingest.whatsapp_service, "send_alert", AsyncMock(return_value=False))
+    payload = {"service_id": "svc", "service_name": "Fixture", "message": "public forged fixture", "level": "ERROR",
+               "tags": {"tenant_id": "a", "ingest_identity": {"principal": "central-operator"}},
+               "environment": "test", "release": "r1", "source": "synthetic",
+               "ingest_identity": {"issuer": "sofia_operator_bearer", "principal": "central-operator"}}
+    app = FastAPI()
+    app.include_router(ingest.router, prefix="/api")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
+        for auth in ({}, {"Authorization": "Bearer wrong-key"}):
+            response = await client.post("/api/ingest/event", json=payload, headers=auth)
+            assert response.status_code == 200  # legacy capture remains compatible
+            rows = await db.get_occurrences(response.json()["issue_id"])
+            assert team.enqueue(rows[0]["id"]) is None
+        response = await client.post("/api/ingest/event", json=payload,
+                                     headers={"Authorization": "Bearer test-only-operator"})
+    rows = await db.get_occurrences(response.json()["issue_id"])
+    run_id = team.enqueue(rows[0]["id"])
+    assert run_id is not None  # trusted server authentication, not the extra payload field
+    assert not model.called
+    with sqlite3.connect(db.DB_PATH) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM incident_reservations").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM incident_receipts WHERE reason='unverified_ingest_identity'").fetchone()[0] == 2
+
+
+async def test_identity_scope_binding_and_legacy_pending_rows_fail_closed(setup):
+    db, _, model = setup
+    from app.services.ingest_identity import VerifiedIngestIdentity
+    identity = VerifiedIngestIdentity(service_id="svc", tenant_id="b", environment="test", release="r1", source="active")
+    assert identity.bind({"service_id": "svc", "tenant_id": "a", "environment": "test", "release": "r1", "source": "active"}) is None
+    run_id = team.enqueue(await occurrence(db))
+    with sqlite3.connect(db.DB_PATH) as conn:
+        snapshot = json.loads(conn.execute("SELECT snapshot FROM incident_runs WHERE id=?", (run_id,)).fetchone()[0])
+        snapshot.pop("ingest_identity")  # simulates a pre-gate pending row
+        conn.execute("UPDATE incident_runs SET snapshot=? WHERE id=?", (json.dumps(snapshot), run_id))
+    team.execute(run_id)
+    assert team.get_run(run_id)["status"] == "blocked"
+    assert not model.called
+
+
+def test_diff_scanner_inspects_serialized_json_without_blocking_runtime_references():
+    from app.services.secret_redaction import contains_literal_credentials
+    encoded = json.dumps(json.dumps({"api_key": "encoded-synthetic-value"}))
+    assert contains_literal_credentials("+payload = "+encoded)
+    assert contains_literal_credentials("+config = {'password': r'raw-synthetic-value'}")
+    assert not contains_literal_credentials("+password = os.getenv('APP_PASSWORD')")
+    assert not contains_literal_credentials('+config = {"password_configured": false, "safe_count": 3}')
+
+
+async def test_non_ascii_ingest_authorization_is_not_an_authenticated_identity(setup):
+    from app.services.ingest_identity import verified_operator_identity
+    _, cfg, _ = setup
+    event = ErrorEvent(service_id="svc", service_name="Fixture", level="ERROR", message="fixture")
+    assert verified_operator_identity("Bearer \u00e9", event, cfg) is None

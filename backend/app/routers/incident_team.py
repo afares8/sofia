@@ -3,7 +3,7 @@ import asyncio
 import hmac
 import os
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.services import incident_team_service as team
@@ -32,8 +32,8 @@ async def invoke(fn, *args):
 
 
 @router.get("")
-async def incidents():
-    return await invoke(team.list_runs)
+async def incidents(limit: int = Query(50, ge=1, le=100), before_id: int | None = Query(None, ge=1)):
+    return await invoke(team.list_runs, limit, before_id)
 
 
 @router.get("/status")
