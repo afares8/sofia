@@ -165,19 +165,26 @@ def test_early_exit_big_prompt_no_broken_pipe_mask(codex_env):
 def test_kill_oserror_race_still_returns_timeout(codex_env):
     procs, set_cmd = codex_env
     real_popen = subprocess.Popen
+    cleanup = []
     def tracking_kill_broken(*args, **kwargs):
         p = real_popen(*args, **kwargs)
+        cleanup.append((p, p.kill))
         p.kill = mock.Mock(side_effect=OSError("process already gone"))
         procs.append(p)
         return p
     m1, m2 = set_cmd([sys.executable, "-c", HUNG_NO_READ])
-    with m1, m2, mock.patch.object(svc.subprocess, "Popen", side_effect=tracking_kill_broken):
-        rc, output = svc.run_codex("prompt", read_only=True, timeout=1)
-    assert rc == -1
-    assert "TIMEOUT" in output
-    if procs and procs[0].poll() is None:
-        subprocess.Popen.kill(procs[0])
-        procs[0].wait(timeout=5)
+    try:
+        with m1, m2, mock.patch.object(svc.subprocess, "Popen", side_effect=tracking_kill_broken):
+            rc, output = svc.run_codex("prompt", read_only=True, timeout=1)
+        assert rc == -1
+        assert "TIMEOUT" in output
+    finally:
+        # subprocess.Popen is patched by the fixture. Keep the real bound kill
+        # before replacing it, and clean up only the process created by this test.
+        for proc, kill in cleanup:
+            if proc.poll() is None:
+                kill()
+            proc.wait(timeout=5)
 
 
 def test_grandchild_with_inherited_stdout_reaped(codex_env):
@@ -212,6 +219,7 @@ def test_no_binary_no_popen(tracked_popen):
 def test_resolver_env_override_valid(tmp_path, monkeypatch):
     fake = tmp_path / "codex-custom.exe"
     fake.write_bytes(b"MZ")
+    fake.chmod(0o700)  # Resolver metadata fixture; no fake binary is executed.
     monkeypatch.setenv("SOFIA_CODEX_BIN", str(fake))
     assert svc.codex_bin() == str(fake)
     assert svc.codex_available() is True
@@ -236,6 +244,7 @@ def test_resolver_absent_uses_path(monkeypatch):
 def test_command_flags_unchanged(tmp_path, monkeypatch):
     fake = tmp_path / "codex.exe"
     fake.write_bytes(b"MZ")
+    fake.chmod(0o700)
     monkeypatch.setenv("SOFIA_CODEX_BIN", str(fake))
     monkeypatch.delenv("SOFIA_CODEX_MODEL", raising=False)
     cmd = svc.build_codex_cmd(read_only=True, cwd=str(tmp_path))
