@@ -11,7 +11,7 @@ import re
 
 MASK = "[CREDENTIAL]"
 MAX_TEXT = 64000
-KEY_VALUE = re.compile(r'''(?P<key>"(?:\\.|[^"\\]){1,120}"|'(?:\\.|[^'\\]){1,120}'|[A-Za-z_][A-Za-z0-9_.-]{0,119})\s*[:=]\s*''')
+KEY_VALUE = re.compile(r'''(?P<key>"(?:\\.|[^"\\]){1,120}"|'(?:\\.|[^'\\]){1,120}'|[A-Za-z_][A-Za-z0-9_.-]{0,119})\s*(?P<separator>[:=])\s*''')
 ALIASES = {"pass", "password", "passwd", "pwd", "dbpass", "secret", "secrets", "key", "apikey", "apikeys",
            "token", "tokens", "authorization", "proxyauthorization", "cookie", "setcookie", "credential",
            "credentials", "connectionstring", "dsn", "privatekey", "consumerkey", "accesskey", "awsaccesskeyid"}
@@ -33,10 +33,21 @@ def decoded_key(raw: str) -> str:
     return raw
 
 
+def jsx_identity_key(text: str, match) -> bool:
+    # React's key attribute identifies a rendered element; it is not an API key.
+    # Explicit credential fields nested inside the expression are still scanned.
+    prefix = text[text.rfind("\n", 0, match.start())+1:match.start()]
+    return (decoded_key(match["key"]) == "key" and match["separator"] == "=" and
+            re.search(r"<[A-Za-z][^>]*\s\Z", prefix) is not None)
+
+
 def value_end(text: str, start: int) -> int:
     """Find one value without interpreting code; unterminated secrets consume rest."""
     if start >= len(text):
         return start
+    prefix = re.match(r"(?i)(?:br|rb|r|b|f)(?=['\"])", text[start:])
+    if prefix:
+        return value_end(text, start+prefix.end())
     if text[start] in {'"', "'", "`"}:
         quote = text[start]
         delimiter = quote*3 if text.startswith(quote*3, start) else quote
@@ -76,7 +87,7 @@ def value_end(text: str, start: int) -> int:
 def assignments(text: str):
     consumed = 0
     for match in KEY_VALUE.finditer(text):
-        if match.start() < consumed or not sensitive_key(decoded_key(match["key"])):
+        if match.start() < consumed or not sensitive_key(decoded_key(match["key"])) or jsx_identity_key(text, match):
             continue
         end = value_end(text, match.end())
         consumed = end
@@ -101,6 +112,15 @@ def _text(value: str, depth: int) -> str:
         return "[REDACTED_DEPTH_LIMIT]"
     truncated = len(value) > MAX_TEXT
     value = value[:MAX_TEXT]
+    # A complete quoted literal can itself contain serialized JSON evidence.
+    try:
+        literal = ast.literal_eval(value)
+    except (ValueError, SyntaxError, RecursionError):
+        literal = None
+    if isinstance(literal, str):
+        safe_literal = _text(literal, depth+1)
+        if safe_literal != literal:
+            return json.dumps(safe_literal, ensure_ascii=False)+("\n[TRUNCATED]" if truncated else "")
     # Decode complete or embedded JSON once per outer fragment; nested keys and
     # escaped/camelCase aliases are then visited structurally, not by regex.
     decoder = json.JSONDecoder()
@@ -127,19 +147,42 @@ def _text(value: str, depth: int) -> str:
                 cursor = start+1
                 continue
         safe = _walk(original, depth+1)
-        pieces.append(_plain(value[plain_start:start]))
+        pieces.append(_plain(value[plain_start:start], depth))
         pieces.append(value[start:end] if safe == original else json.dumps(safe, ensure_ascii=False))
         cursor = end
         plain_start = end
-    pieces.append(_plain(value[plain_start:]))
+    pieces.append(_plain(value[plain_start:], depth))
     return "".join(pieces)+("\n[TRUNCATED]" if truncated else "")
 
 
-def _plain(value: str) -> str:
+def _plain(value: str, depth: int) -> str:
     pieces = []
     cursor = 0
-    for start, end in assignments(value):
-        pieces.extend((value[cursor:start], json.dumps(MASK)))
+    for match in KEY_VALUE.finditer(value):
+        if match.start() < cursor:
+            continue
+        start = match.end()
+        end = value_end(value, start)
+        sensitive = sensitive_key(decoded_key(match["key"])) and not jsx_identity_key(value, match)
+        replacement = None
+        if sensitive:
+            replacement = json.dumps(MASK)
+        else:
+            # Decode ordinary literal assignments too: log="{\"password\":...}"
+            # must receive the same recursive redaction as a standalone object.
+            try:
+                literal = ast.literal_eval(value[start:end])
+            except (ValueError, SyntaxError, RecursionError):
+                literal = None
+            if isinstance(literal, str):
+                safe_literal = _text(literal, depth+1)
+                if safe_literal != literal:
+                    replacement = json.dumps(safe_literal, ensure_ascii=False)
+            elif isinstance(literal, bytes):
+                replacement = json.dumps("[UNSUPPORTED_VALUE]")
+        if replacement is None:
+            continue
+        pieces.extend((value[cursor:start], replacement))
         cursor = end
     pieces.append(value[cursor:])
     value = "".join(pieces)
@@ -198,10 +241,11 @@ def _contains_text(text: str, depth: int) -> bool:
             try:
                 value = json.loads(literal)
             except (ValueError, RecursionError):
-                if sensitive_key(decoded_key(match["key"])):
+                if sensitive_key(decoded_key(match["key"])) and text[quote_start:quote_start+1] not in {"{", "[", "("}:
                     return True
                 continue
-        if sensitive_key(decoded_key(match["key"])) and value and value not in (MASK, "[REDACTED]", "***"):
+        if (sensitive_key(decoded_key(match["key"])) and not jsx_identity_key(text, match) and
+            value and value not in (MASK, "[REDACTED]", "***")):
             return True
         if _contains_value(value, depth+1):
             return True

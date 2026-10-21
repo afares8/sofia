@@ -526,3 +526,36 @@ async def test_non_ascii_ingest_authorization_is_not_an_authenticated_identity(s
     _, cfg, _ = setup
     event = ErrorEvent(service_id="svc", service_name="Fixture", level="ERROR", message="fixture")
     assert verified_operator_identity("Bearer \u00e9", event, cfg) is None
+
+
+@pytest.mark.parametrize("value,secret", [
+    ('log = "{\\"password\\":\\"serialized-secret-value\\"}"', "serialized-secret-value"),
+    ("password = r'raw-synthetic value with spaces'", "raw-synthetic value with spaces"),
+])
+def test_prefixed_serialized_json_and_raw_strings_redact_whole_values(value, secret):
+    from app.services.secret_redaction import contains_literal_credentials
+    assert contains_literal_credentials(value)
+    redacted = team.redact(value)
+    assert secret not in redacted
+    assert "value with spaces" not in redacted
+    assert not contains_literal_credentials(redacted)
+
+
+@pytest.mark.parametrize("diff", [
+    '+return <li key={item.id}>{item.name}</li>',
+    '+return <li key="row">{item.name}</li>',
+    '+return <Item\n+ key={item.id} />',
+])
+def test_jsx_identity_keys_are_not_credential_literals(diff):
+    from app.services.secret_redaction import contains_literal_credentials
+    assert not contains_literal_credentials(diff)
+
+
+@pytest.mark.parametrize("diff", [
+    '+config = {"key": "opaque-synthetic-value"}',
+    '+return <Item key={{password: "opaque-synthetic-value"}} />',
+    '+const config = {api_key: "opaque-synthetic-value"}',
+])
+def test_credential_literals_remain_blocked_next_to_jsx_or_generic_keys(diff):
+    from app.services.secret_redaction import contains_literal_credentials
+    assert contains_literal_credentials(diff)
