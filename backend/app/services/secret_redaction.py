@@ -36,7 +36,9 @@ def decoded_key(raw: str) -> str:
 def jsx_identity_key(text: str, match) -> bool:
     # React's key attribute identifies a rendered element; it is not an API key.
     # Explicit credential fields nested inside the expression are still scanned.
-    prefix = text[text.rfind("\n", 0, match.start())+1:match.start()]
+    # A JSX opening tag may span multiple source/diff lines. Do not generalize
+    # this exception to every unparseable brace/array/parenthesized expression.
+    prefix = text[:match.start()]
     return (decoded_key(match["key"]) == "key" and match["separator"] == "=" and
             re.search(r"<[A-Za-z][^>]*\s\Z", prefix) is not None)
 
@@ -66,7 +68,7 @@ def value_end(text: str, start: int) -> int:
         pairs = {"[": "]", "{": "}", "(": ")"}
         while pos < len(text):
             ch = text[pos]
-            if ch in {'"', "'"}:
+            if ch in {'"', "'", "`"}:
                 pos = value_end(text, pos)
                 continue
             if ch in pairs:
@@ -241,7 +243,10 @@ def _contains_text(text: str, depth: int) -> bool:
             try:
                 value = json.loads(literal)
             except (ValueError, RecursionError):
-                if sensitive_key(decoded_key(match["key"])) and text[quote_start:quote_start+1] not in {"{", "[", "("}:
+                # Unknown syntax under a credential field is not proof of a
+                # runtime reference: JS objects and template literals may carry
+                # literal secrets. Only an identified React key is exempt.
+                if sensitive_key(decoded_key(match["key"])) and not jsx_identity_key(text, match):
                     return True
                 continue
         if (sensitive_key(decoded_key(match["key"])) and not jsx_identity_key(text, match) and

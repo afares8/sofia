@@ -559,3 +559,49 @@ def test_jsx_identity_keys_are_not_credential_literals(diff):
 def test_credential_literals_remain_blocked_next_to_jsx_or_generic_keys(diff):
     from app.services.secret_redaction import contains_literal_credentials
     assert contains_literal_credentials(diff)
+
+
+@pytest.mark.parametrize("snippet", [
+    '<Input password={`opaque-synthetic-value`} />',
+    'const credentials = { value: "opaque-synthetic-value" }',
+    'password = [lookup("opaque-synthetic-value")]',
+    'credentials = (lookup("opaque-synthetic-value"))',
+])
+def test_unparsed_sensitive_containers_fail_closed(snippet):
+    from app.services.secret_redaction import contains_literal_credentials
+    assert contains_literal_credentials("+"+snippet)
+    assert "opaque-synthetic-value" not in team.redact(snippet)
+
+
+@pytest.mark.parametrize("snippet", [
+    '<Item key={item.id} />',
+    '<Item\n key={item.id} />',
+    '<Item\n key="row" />',
+    'const config = { value: "ordinary-label" }',
+    'password = os.getenv("APP_PASSWORD")',
+])
+def test_container_exception_does_not_block_identity_keys_or_non_credentials(snippet):
+    from app.services.secret_redaction import contains_literal_credentials
+    assert not contains_literal_credentials("+"+snippet)
+
+
+@pytest.mark.parametrize("snippet", [
+    '<Input password={`opaque-synthetic-value`} />',
+    'const credentials = { value: "opaque-synthetic-value" }',
+])
+async def test_sensitive_container_is_blocked_by_pipeline_before_review_or_commit(setup, snippet):
+    db, _, model = setup
+    original = model.side_effect
+    def prepare(prompt, **kwargs):
+        result = original(prompt, **kwargs)
+        if not kwargs["read_only"]:
+            target = Path(kwargs["cwd"], "frontend/src/CredentialFixture.tsx")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(snippet)
+        return result
+    model.side_effect = prepare
+    run_id = team.enqueue(await occurrence(db))
+    team.execute(run_id)
+    run = team.get_run(run_id)
+    assert run["status"] == "blocked" and run["candidate_sha"] is None
+    assert model.call_count == 2
