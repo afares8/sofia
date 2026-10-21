@@ -5,7 +5,7 @@ Errors are grouped by fingerprint — same error = increment count, not duplicat
 """
 import json
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Literal
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -19,6 +19,7 @@ router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 
 class IngestPayload(BaseModel):
+    source: Literal["active", "business_invariant", "synthetic"] = "active"
     service_id: str
     service_name: str
     level: str
@@ -69,7 +70,7 @@ async def ingest_event(payload: IngestPayload):
         traceback=traceback_str,
         url=payload.url,
         user_info=payload.user_info,
-        source="active",
+        source=payload.source,
         timestamp=payload.timestamp or datetime.utcnow(),
         tags=tags_str,
         environment=payload.environment,

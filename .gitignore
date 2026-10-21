@@ -13,6 +13,7 @@ backend/data/
 
 # Env
 .env
+.test-tmp/
 !.env.example
 
 # Node

@@ -26,6 +26,48 @@ SPAWN_GRANDCHILD = (
 )
 
 
+def test_incident_commands_never_request_full_access(monkeypatch, tmp_path):
+    monkeypatch.setattr(svc, "codex_bin", lambda: "codex-fixture")
+    for readonly, expected in ((True, "read-only"), (False, "workspace-write")):
+        command = svc.build_codex_cmd(readonly, str(tmp_path), safe_workspace=True)
+        assert command[command.index("-s")+1] == expected
+        assert "danger-full-access" not in command
+        assert "sandbox_workspace_write.network_access=false" in command
+
+
+def test_isolated_runner_strips_tokens_and_does_not_log_output(codex_env, monkeypatch, caplog):
+    procs, set_cmd = codex_env
+    monkeypatch.setenv("SOFIA_API_KEY", "operator-test-only")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-test-only")
+    script = 'import os; print("private-output"); print(os.getenv("SOFIA_API_KEY","absent")); print(os.getenv("GITHUB_TOKEN","absent"))'
+    m1, m2 = set_cmd([sys.executable, "-c", script])
+    with m1, m2, caplog.at_level("INFO"):
+        rc, output = svc.run_codex("fixture", True, safe_workspace=True, log_output=False)
+    assert rc == 0 and output.count("absent") == 2
+    assert "operator-test-only" not in output and "github-test-only" not in output
+    assert "private-output" not in caplog.text
+
+
+def test_output_without_newline_is_bounded(codex_env):
+    procs, set_cmd = codex_env
+    m1, m2 = set_cmd([sys.executable, "-c", 'import sys; sys.stdout.write("x"*200000); sys.stdout.flush()'])
+    with m1, m2:
+        rc, output = svc.run_codex("fixture", True, max_output_chars=1000, log_output=False, timeout=5)
+    assert rc != 0 and len(output) < 1500
+    assert procs[0].poll() is not None
+
+
+def test_final_message_channel_ignores_cli_banner(codex_env, tmp_path, monkeypatch):
+    procs, set_cmd = codex_env
+    monkeypatch.setattr(svc.tempfile, "tempdir", str(tmp_path))
+    script = 'import sys,pathlib; print("banner"); pathlib.Path(sys.argv[sys.argv.index("--output-last-message")+1]).write_text("{\\\"approved\\\":true}")'
+    m1, m2 = set_cmd([sys.executable, "-c", script, "-"])
+    with m1, m2:
+        rc, output = svc.run_codex("fixture", True, final_message_only=True, log_output=False)
+    assert rc == 0 and output == '{"approved":true}'
+    assert not list(tmp_path.glob("sofia-codex-*.txt"))
+
+
 @pytest.fixture
 def tracked_popen():
     """Wrap subprocess.Popen to record every spawned process."""

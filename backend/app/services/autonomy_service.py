@@ -422,6 +422,10 @@ async def run_job(job_id: int) -> None:
         return
     repo_path = str(Path(repo_cfg.path).expanduser())
 
+    if cfg.incident_team.enabled and repo_cfg.incident_team_enabled and job.get("mode") == "fix":
+        await db_service.update_ai_job(job_id, status="blocked", blocked_reason="Servicio gestionado por el equipo de incidentes; usar su cola protegida.")
+        return
+
     if cfg.kill_switch or not cfg.enabled:
         await db_service.update_ai_job(
             job_id,
@@ -631,6 +635,8 @@ async def promote_job(job_id: int) -> dict:
         raise RuntimeError("Repo no configurado para este job.")
 
     real_repo = str(Path(repo_cfg.path).expanduser())
+    if cfg.incident_team.enabled and repo_cfg.incident_team_enabled:
+        raise RuntimeError("Servicio gestionado por el equipo de incidentes; no promover jobs legacy.")
     sandbox = job.get("sandbox_path")
     work_branch = job.get("work_branch")
     base_branch = job.get("base_branch") or repo_cfg.branch or "main"
@@ -692,13 +698,9 @@ async def promote_job(job_id: int) -> dict:
     )
     await db_service.add_audit_event("ai_job", "promoted", job_id, message)
 
-    # 4. Resolve the associated issue so the autofix loop stops re-spawning it.
-    if job.get("issue_id"):
-        try:
-            await db_service.resolve_issue(int(job["issue_id"]))
-            await db_service.add_audit_event("issue", "resolved", int(job["issue_id"]), f"Resuelto por job #{job_id}.")
-        except Exception as exc:
-            logger.warning(f"[AUTONOMY] No se pudo resolver issue del job #{job_id}: {exc}")
+    # Publishing a branch/PR is not proof that the deployed incident recovered.
+    await db_service.add_audit_event("ai_job", "awaiting_deployment_observation", job_id,
+                                     "Issue retenido hasta validar release y flujo de negocio.")
 
     return {"ok": True, "job_id": job_id, "pr_url": pr_url, "message": message}
 

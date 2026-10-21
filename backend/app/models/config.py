@@ -2,7 +2,7 @@
 Config models - all settings editable from UI and persisted to JSON.
 """
 import os
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 
 
@@ -60,7 +60,23 @@ class AlertRule(BaseModel):
     cooldown_minutes: int = 30
 
 
+class IncidentTeamConfig(BaseModel):
+    # Separate opt-in: legacy autonomy/Devin policies do not enable this worker.
+    enabled: bool = False
+    execution_enabled: bool = False
+    isolated_worker_confirmed: bool = False
+    legacy_dispatch_excluded_confirmed: bool = False
+    upstream_spend_cap_confirmed: bool = False
+    max_runs_per_day: int = Field(default=3, ge=0, le=20)
+    max_actions_per_hour: int = Field(default=12, ge=0, le=100)
+    max_sessions_per_day: int = Field(default=9, ge=0, le=60)
+    max_reserved_cost_cents_per_day: int = Field(default=0, ge=0)
+    session_cost_ceiling_cents: int = Field(default=0, ge=0)
+    stage_timeout_seconds: int = Field(default=300, ge=10, le=600)
+
+
 class AutonomyConfig(BaseModel):
+    incident_team: IncidentTeamConfig = IncidentTeamConfig()
     enabled: bool = False
     kill_switch: bool = True
     default_level: int = 0
@@ -128,6 +144,12 @@ class AppRepoConfig(BaseModel):
     smoke_urls: List[str] = []
     allowed_paths: List[str] = []
     blocked_paths: List[str] = []
+    incident_team_enabled: bool = False
+    incident_github_repo: str = ""
+    incident_tenant_ids: List[str] = []
+    incident_environments: List[str] = []
+    incident_required_checks: List[str] = []
+    incident_ci_workflow: str = ".github/workflows/ci.yml"
 
 
 class GithubSyncRepo(BaseModel):
