@@ -22,8 +22,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
-      SOFIA_DB_PATH: ${{ runner.temp }}/sofia-ci.db
-      SOFIA_CONFIG_PATH: ${{ runner.temp }}/sofia-ci-config.json
       SOFIA_CODEX_BIN: /nonexistent/sofia-ci-no-model
       SOFIA_API_KEY: ''
     steps:
@@ -37,6 +35,9 @@ jobs:
       - run: python -m pip install -r backend/requirements-dev.txt
       - name: Test isolated contracts and guardrails
         working-directory: backend
+        env:
+          SOFIA_DB_PATH: ${{ runner.temp }}/sofia-ci.db
+          SOFIA_CONFIG_PATH: ${{ runner.temp }}/sofia-ci-config.json
         run: python -m pytest tests/test_incident_team.py tests/test_business_contracts.py tests/test_codex_cli_service.py tests/test_db_service.py tests/test_models.py tests/test_ingest.py tests/test_restore_health.py tests/test_self_health.py -q
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
