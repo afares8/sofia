@@ -53,6 +53,15 @@ MAX_COMPLETED = 1000
 # (policy: batch_hold_seconds) antes de mandar el lote a Devin, para que una
 # rafaga de eventos relacionados llegue en UN solo reporte en vez de varios.
 BATCH_HOLD_SECONDS = 60.0
+# Con mas de `backlog_digest_threshold` avisos en cola se manda UN solo mensaje
+# resumido (agrupado por issue) en vez de N lotes; policy: backlog_digest*.
+DIGEST_MAX_CHARS = 32000
+# La consola se cierra sola tras este tiempo sin trabajo (sesion guardada);
+# policy: idle_close_minutes.
+IDLE_CLOSE_MINUTES = 60.0
+# Si el agente ACP muere sin turno en curso, el worker sale limpio y el watcher
+# lo reabre tras esta espera para retomar la sesion.
+DISCONNECT_RETRY_SECONDS = 60.0
 STATE_REPLACE_ATTEMPTS = 8
 STATE_REPLACE_DELAY = 0.2
 STATE_REPLACE_MAX_DELAY = 2.0
@@ -60,6 +69,10 @@ STALL_SECONDS = 900.0
 MAX_STALL_RETRIES = 1
 STALL_WAIT_SLICE = 0.25
 HEALTH_STALE_SECONDS = 120.0
+# El CLI ACP acumula contexto y puede retener varios GB aun inactivo. Entre
+# turnos se recicla la conexion (session/load conserva la conversacion) cuando
+# el commit del proceso supera este umbral; policy: agent_commit_limit_mb.
+MAX_AGENT_COMMIT_MB = 4096
 CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
 SW_SHOWMINNOACTIVE = getattr(subprocess, "SW_SHOWMINNOACTIVE", 7)
 WORKER_FAIL_STATUS = {
@@ -253,13 +266,13 @@ def _initial_state() -> Dict[str, Any]:
         "status": "ok", "status_at": 0.0, "last_error": None,
         "spawn_failures": 0, "next_retry_after": 0.0, "last_spawn": 0.0,
         "spawn_counted": False, "worker_ready": False, "circuit_open": False,
-        "hold_until": 0.0,
+        "hold_until": 0.0, "pause_cursor": 0,
     }
 
 
 # Claves agregadas despues de la version 1 inicial: los state.json existentes
 # no las traen y cargar debe seguir funcionando (se completan con el default).
-_OPTIONAL_STATE_KEYS = {"hold_until"}
+_OPTIONAL_STATE_KEYS = {"hold_until", "pause_cursor"}
 
 
 def _valid_event(ev: Any) -> bool:
@@ -291,7 +304,7 @@ def validate_state(state: Any, existing: bool = True) -> Dict[str, Any]:
         ("status_at", (int, float)), ("spawn_failures", int),
         ("next_retry_after", (int, float)), ("last_spawn", (int, float)),
         ("spawn_counted", bool), ("worker_ready", bool), ("circuit_open", bool),
-        ("hold_until", (int, float)),
+        ("hold_until", (int, float)), ("pause_cursor", int),
     )
     for key, typ in checks:
         if not isinstance(state[key], typ):
@@ -636,10 +649,121 @@ def render_report(events: List[Dict[str, Any]], day: str) -> str:
     return "\n".join(lines)
 
 
+_LEVEL_ORDER = {"CRITICAL": 0, "ERROR": 1, "WARNING": 2}
+_VOLATILE_RE = re.compile(r"[0-9a-fA-F]{8,}|\d+")
+_SPACES_RE = re.compile(r"\s+")
+
+
+def _short_ts(value: Any) -> str:
+    return str(value or "").replace("T", " ")[:19]
+
+
+def _hhmmss(value: Any) -> str:
+    return str(value or "").replace("T", " ")[11:19] or "?"
+
+
+def _message_signature(message: Any) -> str:
+    """Firma estable del mensaje: ignora ids, numeros y ruido variable."""
+    text = _VOLATILE_RE.sub("#", redact_text(message or ""))
+    return _SPACES_RE.sub(" ", text).strip()[:140]
+
+
+def render_digest(events: List[Dict[str, Any]], day: str,
+                  max_chars: int = DIGEST_MAX_CHARS) -> str:
+    """Resumen de una cola grande en UN solo mensaje.
+
+    Agrupa por issue_id, ordena por severidad y volumen, y conserva el id de
+    occurrence para que el agente consulte el detalle completo en sofia.db.
+    """
+    if not events:
+        return f"Reportes del dia {day}: sin avisos."
+    levels: Dict[str, int] = {}
+    services: Dict[str, int] = {}
+    groups: Dict[Any, Dict[str, Any]] = {}
+    for ev in events:
+        levels[ev["level"]] = levels.get(ev["level"], 0) + 1
+        services[ev["service_id"]] = services.get(ev["service_id"], 0) + 1
+        key = (ev["service_id"], ev["level"],
+               _message_signature(ev.get("message")))
+        grp = groups.get(key)
+        if grp is None:
+            groups[key] = grp = {
+                "count": 0, "dups": 0, "ev": ev, "ids": [],
+                "issues": set(),
+                "first": str(ev["timestamp"]), "last": str(ev["timestamp"])}
+        grp["count"] += 1
+        grp["dups"] += int(ev.get("duplicates") or 0)
+        if ev.get("issue_id") is not None:
+            grp["issues"].add(ev["issue_id"])
+        if len(grp["ids"]) < 8:
+            grp["ids"].append(ev["occurrence_id"])
+        grp["first"] = min(grp["first"], str(ev["timestamp"]))
+        grp["last"] = max(grp["last"], str(ev["timestamp"]))
+    rows = sorted(
+        groups.values(),
+        key=lambda g: (_LEVEL_ORDER.get(g["ev"]["level"], 3),
+                       -g["count"], g["last"]))
+    stamps = [str(e["timestamp"]) for e in events]
+    lines = [
+        f"Reportes del dia {day} - RESUMEN DE COLA: {len(events)} avisos, "
+        f"{len(rows)} issues distintos.",
+        f"Ventana: {_short_ts(min(stamps))} a {_short_ts(max(stamps))} (UTC).",
+        "Por nivel: " + ", ".join(
+            f"{k} {levels[k]}" for k in
+            sorted(levels, key=lambda k: _LEVEL_ORDER.get(k, 3))),
+        "Por servicio: " + ", ".join(
+            f"{k} {v}" for k, v in
+            sorted(services.items(), key=lambda kv: -kv[1])),
+        "",
+        "Avisos agrupados por servicio, nivel y mensaje (orden: CRITICAL, "
+        "ERROR, WARNING). El detalle completo de cada aviso esta en la tabla "
+        "occurrences de sofia.db, id = occurrence; consultala read-only.",
+        "",
+    ]
+    omitted = 0
+    for grp in rows:
+        ev = grp["ev"]
+        extra = f" (+{grp['dups']} agrupadas)" if grp["dups"] else ""
+        ids = ", ".join(str(i) for i in sorted(grp["ids"]))
+        if grp["count"] > len(grp["ids"]):
+            ids += f", +{grp['count'] - len(grp['ids'])} mas"
+        service = ev["service_name"] or ev["service_id"]
+        span = f"{_hhmmss(grp['first'])}-{_hhmmss(grp['last'])}"
+        if ev["level"] == "WARNING":
+            # Ruido repetitivo: una linea, sin ids (se consultan en sofia.db).
+            block = [
+                f"- [WARNING] {service} x{grp['count']}{extra} {span}: "
+                f"{redact_text(ev['message'])[:120]}"]
+        else:
+            issues = len(grp["issues"])
+            block = [
+                f"- [{ev['level']}] {service} x{grp['count']}{extra} "
+                f"{span} ({issues} issue(s))",
+                f"  occurrences: {ids}",
+                f"  mensaje: {redact_text(ev['message'])[:200]}",
+            ]
+            detail = (ev.get("detail") or "").strip()
+            if detail and ev["level"] == "CRITICAL":
+                block.append(
+                    f"  detalle: {redact_text(detail.splitlines()[0])[:160]}")
+        block.append("")
+        if sum(len(x) + 1 for x in lines) + sum(len(x) + 1 for x in block) \
+                > max_chars:
+            omitted += grp["count"]
+            continue
+        lines.extend(block)
+    if omitted:
+        lines.append(
+            f"... {omitted} aviso(s) omitidos por tamano; consultalos en "
+            "sofia.db por rango de occurrence.")
+    return "\n".join(lines)
+
+
 def build_initial_prompt(template: str, day: str,
-                         events: List[Dict[str, Any]]) -> str:
-    return template.replace("{day}", day).replace(
-        "{report}", render_report(events, day))
+                         events: List[Dict[str, Any]],
+                         report: Optional[str] = None) -> str:
+    body = report if report is not None else render_report(events, day)
+    return template.replace("{day}", day).replace("{report}", body)
 
 
 def default_spawn_worker(policy: Dict[str, Any], group: str,
@@ -667,6 +791,55 @@ def default_spawn_agent(executable: str, mode: str,
     return subprocess.Popen(
         argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, bufsize=0, cwd=cwd or None, env=env)
+
+
+def process_commit_bytes(pid: Optional[int]) -> Optional[int]:
+    """Commit privado del proceso (stdlib, solo Windows). None si no se pudo."""
+    if os.name != "nt" or not pid:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS_EX),
+            wintypes.DWORD]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(
+            0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            counters = PROCESS_MEMORY_COUNTERS_EX()
+            counters.cb = ctypes.sizeof(counters)
+            if not psapi.GetProcessMemoryInfo(
+                    handle, ctypes.byref(counters), counters.cb):
+                return None
+            return int(counters.PrivateUsage)
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return None
 
 
 class AcpTransport:
@@ -997,14 +1170,16 @@ class Watcher:
             state = {}
         age = None if self._last_poll_at is None else self.now() - self._last_poll_at
         stale = age is None or age > HEALTH_STALE_SECONDS
+        status = state.get("status")
+        ok = not stale and status == "ok"
         return ({
-            "ok": not stale,
+            "ok": ok,
             "group": self.group,
             "last_poll_age_seconds": None if age is None else round(age, 1),
-            "status": state.get("status"),
+            "status": status,
             "worker_alive": bool(self.is_worker_alive(self.group)),
             "pending": len(state.get("pending") or []),
-        }, (503 if stale else 200))
+        }, (200 if ok else 503))
 
     def poll_once(self) -> Dict[str, Any]:
         decision: Dict[str, Any] = {"spawn_day": None, "queued": 0,
@@ -1067,6 +1242,7 @@ class Watcher:
                             state["status"] = "ok"
                             state["last_error"] = None
                 if decision["early"] is None:
+                    self._heal_stale_pause_locked(state)
                     decision["spawn_day"] = self._spawn_day_locked(state)
         if decision["early"] is not None:
             return decision["early"]
@@ -1093,6 +1269,28 @@ class Watcher:
         if float(state.get("hold_until") or 0.0) <= self.now():
             state["hold_until"] = self.now() + hold
 
+    def _heal_stale_pause_locked(self, state) -> None:
+        """Levanta la pausa por consola cerrada cuando llego un reporte nuevo
+        despues de pausar (occurrence_id > pause_cursor).
+
+        No depende de que el poll actual haya encolado algo: si el aviso se
+        encolo en un ciclo anterior y la pausa no se limpio, el watcher se
+        recupera solo en el siguiente ciclo.
+        """
+        if not state["paused"] or state["circuit_open"] \
+                or state["status"] != "paused":
+            return
+        cursor = int(state.get("pause_cursor") or 0)
+        if not cursor:
+            return
+        if any(int(e.get("occurrence_id") or 0) > cursor
+               for e in state["pending"]):
+            state["paused"] = False
+            state["pause_cursor"] = 0
+            state["status"] = "ok"
+            state["status_at"] = self.now()
+            state["last_error"] = None
+
     def _spawn_day_locked(self, state) -> Optional[str]:
         if not state["pending"] or state["paused"] or state["circuit_open"]:
             return None
@@ -1116,6 +1314,7 @@ class Watcher:
                 state["paused"] = True
                 state["status"] = "paused"
                 state["status_at"] = self.now()
+                state["pause_cursor"] = int(state["cursor"])
                 state["last_error"] = \
                     "consola cerrada por el usuario con reportes pendientes"
             return
@@ -1234,13 +1433,15 @@ class ConsoleWorker:
                  verify_elevation_fn=verify_elevation,
                  mutex_factory=HeldMutex,
                  auth_fn=devin_authenticated,
-                 title_fn=set_console_title):
+                 title_fn=set_console_title,
+                 commit_fn=process_commit_bytes):
         self.policy = policy
         self.group = group
         self.group_cfg = policy["groups"][group]
         self.day = day
         self.store = store
         self.spawn_agent = spawn_agent
+        self.commit_fn = commit_fn
         self.now = now
         self.today = today
         self.poll_state_seconds = poll_state_seconds
@@ -1573,16 +1774,16 @@ class ConsoleWorker:
             # Ventana de acumulacion activa: esperar a que llegue todo el lote.
             return []
         completed = set(state["completed"])
-        out = []
-        for e in state["pending"]:
-            if e["received_day"] != self.day:
-                continue
-            if e["occurrence_id"] in completed:
-                continue
-            out.append(e)
-            if len(out) >= int(self.policy.get("batch_size", 50)):
-                break
-        return out
+        available = [
+            e for e in state["pending"]
+            if e["received_day"] == self.day
+            and e["occurrence_id"] not in completed]
+        # Backlog grande: se manda completo (hasta MAX_PENDING) en un solo
+        # mensaje resumido en vez de N lotes de batch_size.
+        if self._digest_enabled() \
+                and len(available) > self._digest_threshold():
+            return available[:MAX_PENDING]
+        return available[:int(self.policy.get("batch_size", 50))]
 
     def run(self) -> int:
         try:
@@ -1745,6 +1946,30 @@ class ConsoleWorker:
         except (TypeError, ValueError):
             return STALL_SECONDS
 
+    def _digest_enabled(self) -> bool:
+        return bool(self.policy.get("backlog_digest", True))
+
+    def _digest_threshold(self) -> int:
+        try:
+            return max(1, int(self.policy.get(
+                "backlog_digest_threshold", 50)))
+        except (TypeError, ValueError):
+            return 50
+
+    def _digest_max_chars(self) -> int:
+        try:
+            return max(2000, int(self.policy.get(
+                "backlog_digest_max_chars", DIGEST_MAX_CHARS)))
+        except (TypeError, ValueError):
+            return DIGEST_MAX_CHARS
+
+    def _idle_close_seconds(self) -> float:
+        try:
+            return max(0.0, float(self.policy.get(
+                "idle_close_minutes", IDLE_CLOSE_MINUTES)) * 60.0)
+        except (TypeError, ValueError):
+            return IDLE_CLOSE_MINUTES * 60.0
+
     def _recover_after_stall(self) -> bool:
         """Cierra la conexion colgada y reconecta la misma sesion guardada."""
         try:
@@ -1759,6 +1984,39 @@ class ConsoleWorker:
             self._print("*** No se pudo reconectar con Devin tras el cuelgue. "
                         "Usa /reintentar o /salir. ***")
             self._mark_status("stall_reconnect_failed", "reconexion fallida")
+            return False
+        return True
+
+    def _agent_commit_limit(self) -> int:
+        try:
+            mb = float(self.policy.get("agent_commit_limit_mb",
+                                       MAX_AGENT_COMMIT_MB))
+        except (TypeError, ValueError):
+            mb = MAX_AGENT_COMMIT_MB
+        return int(mb * 1024 * 1024)
+
+    def _should_recycle_agent(self) -> bool:
+        """True si el ACP inactivo retiene mas commit que el limite."""
+        if self._turn_active or self._permission_pending.is_set():
+            return False
+        if self._transport is None or self._transport.closed:
+            return False
+        pid = getattr(self._transport._proc, "pid", None)
+        commit = self.commit_fn(pid)
+        return commit is not None and commit > self._agent_commit_limit()
+
+    def _recycle_agent(self) -> bool:
+        """Recicla el proceso ACP entre turnos conservando la sesion."""
+        self._print("\nMemoria del agente alta; reciclo la conexion "
+                    "(la conversacion se conserva).")
+        self._ui_event("agent_recycled")
+        self._close_transport()
+        self._turn_active = False
+        self._disconnect_notified = False
+        if not self._connect():
+            self._mark_status("agent_recycle_failed", "reconexion fallida")
+            self._print("*** No se pudo reciclar el agente; la sesion "
+                        "sigue guardada. ***")
             return False
         return True
 
@@ -1808,21 +2066,31 @@ class ConsoleWorker:
         if not events:
             return True
         event_ids = [e["occurrence_id"] for e in events]
+        digest = self._digest_enabled() \
+            and len(events) > self._digest_threshold()
+        body = render_digest(events, self.day, self._digest_max_chars()) \
+            if digest else render_report(events, self.day)
         if use_initial:
             text = build_initial_prompt(
-                self.group_cfg["_initial_template"], self.day, events)
+                self.group_cfg["_initial_template"], self.day, events,
+                report=body)
         else:
-            text = render_report(events, self.day)
+            text = body
         with self.store.transaction() as state:
             state["inflight"] = {
                 "event_ids": event_ids, "prompt_sent": False,
                 "uncertain": False, "use_initial": use_initial,
                 "day": self.day, "stop_reason": None}
-        self._print(f"\n--- Enviando {len(events)} reporte(s) a Devin ---")
+        if digest:
+            self._print(f"\n--- Enviando un resumen de {len(events)} aviso(s) "
+                        f"a Devin (un solo mensaje) ---")
+        else:
+            self._print(f"\n--- Enviando {len(events)} reporte(s) a Devin ---")
         self._print(text)
         self._print("Devin está analizando este lote...")
         self._active_event_ids = list(event_ids)
-        self._ui_event("prompt_started", event_ids=list(event_ids))
+        self._ui_event("prompt_started", event_ids=list(event_ids),
+                       digest=digest)
         try:
             with self.store.transaction() as state:
                 if state["inflight"]:
@@ -1887,7 +2155,7 @@ class ConsoleWorker:
             state["status_at"] = self.now()
             state["last_error"] = None
         self._ui_event("prompt_completed", event_ids=list(event_ids),
-                       stop_reason="end_turn")
+                       stop_reason="end_turn", digest=digest)
         self._print("\nDevin terminó este lote. Sigo escuchando a Sofía.")
         return True
 
@@ -2139,9 +2407,40 @@ class ConsoleWorker:
                 st["last_error"] = None
             self._print("Turno previo cortado por max_tokens: lo reintento.")
 
+    def _mark_clean_exit(self, retry_after: float = 0.0) -> None:
+        """Sale sin marcar pausa: el watcher reabre cuando haya trabajo."""
+        try:
+            with self.store.transaction() as st:
+                st["worker_ready"] = False
+                st["spawn_counted"] = True
+                st["last_spawn"] = 0.0
+                if retry_after > 0:
+                    st["next_retry_after"] = max(
+                        float(st.get("next_retry_after") or 0.0),
+                        self.now() + retry_after)
+        except Exception:
+            pass
+
+    def _has_inflight_work(self) -> bool:
+        try:
+            st = self.store.load()
+        except Exception:
+            return True
+        return bool(st["uncertain"] or st["inflight"])
+
+    def _has_open_work(self) -> bool:
+        try:
+            st = self.store.load()
+        except Exception:
+            return True
+        if st["uncertain"] or st["inflight"]:
+            return True
+        return any(e["received_day"] == self.day for e in st["pending"])
+
     def _main_loop(self) -> int:
         self._start_dispatchers()
         self._heal_truncated_turn()
+        last_activity = time.time()
         try:
             while not self._stop.is_set():
                 if self._eof_defer and not self._has_sendable():
@@ -2149,22 +2448,31 @@ class ConsoleWorker:
                 if self.today() != self.day and not self._has_day_work():
                     self._print("Cambio de dia: esta sesion pertenece a "
                                 f"{self.day}. Cerrando sin interrumpir turnos.")
-                    try:
-                        with self.store.transaction() as st:
-                            st["worker_ready"] = False
-                            st["spawn_counted"] = True
-                            st["last_spawn"] = 0.0
-                    except Exception:
-                        pass
+                    self._mark_clean_exit()
                     break
                 if self._transport and self._transport.closed:
                     self._handle_disconnect()
                     self._drain_backlog()
                     if self._stop.is_set():
                         break
+                    if not self._has_inflight_work():
+                        # El agente murio entre turnos (p. ej. la guardia de
+                        # memoria): salir limpio para que el watcher abra una
+                        # consola nueva y retome la sesion guardada.
+                        self._print("\nLa conexion con Devin se cerro sin turno "
+                                    "en curso; cierro esta consola y el "
+                                    "vigilante la reabre para retomar la "
+                                    "sesion.")
+                        self._ui_event("agent_lost", phase="idle")
+                        self._mark_clean_exit(DISCONNECT_RETRY_SECONDS)
+                        break
                     time.sleep(self.poll_state_seconds)
                     continue
                 if not self._turn_active:
+                    if self._should_recycle_agent():
+                        if not self._recycle_agent():
+                            time.sleep(self.poll_state_seconds)
+                            continue
                     self._drain_backlog()
                     if self._stop.is_set():
                         break
@@ -2178,7 +2486,18 @@ class ConsoleWorker:
                         except Exception:
                             use_initial = True
                         self._send_batch(events, use_initial=use_initial)
+                        last_activity = time.time()
                         continue
+                idle = self._idle_close_seconds()
+                if idle > 0 and not self._has_open_work() \
+                        and time.time() - last_activity >= idle:
+                    self._print(f"\nSin reportes nuevos hace "
+                                f"{int(idle // 60)} min; cierro esta consola. "
+                                "Se reabre sola cuando Sofia registre un aviso "
+                                "nuevo.")
+                    self._ui_event("idle_close")
+                    self._mark_clean_exit()
+                    break
                 time.sleep(self.poll_state_seconds)
             if self._stop.is_set():
                 try:
@@ -2188,6 +2507,7 @@ class ConsoleWorker:
                             if st["status"] == "ok":
                                 st["status"] = "paused"
                                 st["status_at"] = self.now()
+                                st["pause_cursor"] = int(st["cursor"])
                 except Exception:
                     pass
             return 0

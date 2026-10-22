@@ -66,6 +66,25 @@ _PY_LOGGING_RE = re.compile(
     re.IGNORECASE | re.S,
 )
 _LOGGER_PREFIX_RE = re.compile(r"^[^\s:]{1,80}:")
+# .NET (vms-api) console logger: "warn: VmsSofia.Api.DeviceService[0]" y la
+# linea siguiente, indentada, trae el mensaje real. Sin unirlas, Sofia guardaba
+# solo la categoria ("VmsSofia.Api.DeviceService[0]") y se perdia la causa
+# (caso real 2026-10-21: encrypted_main_capacity_reached).
+_DOTNET_HEAD_RE = re.compile(
+    r"^(trace|debug|info|warn|fail|crit):\s*\S*\[\d+\]\s*$", re.IGNORECASE
+)
+_DOTNET_LEVEL_RE = re.compile(
+    r"^(trace|debug|info|warn|fail|crit):\s*(.*)$", re.IGNORECASE | re.S
+)
+_DOTNET_LEVELS = {
+    "trace": "TRACE",
+    "debug": "DEBUG",
+    "info": "INFO",
+    "warn": "WARNING",
+    "fail": "ERROR",
+    "crit": "CRITICAL",
+}
+_DOTNET_MAX_MERGE_CHARS = 8000
 
 
 def _norm_path(p) -> str:
@@ -123,6 +142,9 @@ def _resolve_log_path(service_id: str, configured_path: str) -> Optional[Path]:
 
 def _split_line(line: str):
     """Return (reported_level|None, canonical_message) for a raw log line."""
+    m = _DOTNET_LEVEL_RE.match(line)
+    if m:
+        return _DOTNET_LEVELS[m.group(1).lower()], (m.group(2) or "").strip()
     m = _PY_LOGGING_RE.match(line) or _TS_LEVEL_RE.match(line)
     if m:
         return m.group(1).upper(), (m.group(2) or "").strip()
@@ -158,6 +180,42 @@ def _classify_level(line: str) -> Optional[str]:
     if level == "WARN":
         level = "WARNING"
     return normalize_reported_level(level, line)
+
+
+def _decode_line(raw: bytes) -> str:
+    return _ANSI_RE.sub("", raw.decode("utf-8", errors="replace")).strip()
+
+
+def _merge_dotnet_continuations(lines):
+    """Une un encabezado .NET ('warn: Category[EventId]') con su payload indentado.
+
+    Devuelve la misma forma (raw, was_truncated, pos_after); el cursor avanza
+    hasta la ultima linea consumida para no reingerir el payload.
+    """
+    merged = []
+    i = 0
+    while i < len(lines):
+        raw, was_truncated, pos_after = lines[i]
+        text = _decode_line(raw)
+        if _DOTNET_HEAD_RE.match(text) and i + 1 < len(lines):
+            nraw, _, npos = lines[i + 1]
+            ntext = _decode_line(nraw)
+            if ntext and nraw[:1].isspace() and not _DOTNET_LEVEL_RE.match(ntext):
+                merged_text = f"{text} {ntext}"
+                i += 2
+                while i < len(lines) and len(merged_text) < _DOTNET_MAX_MERGE_CHARS:
+                    craw, _, cpos = lines[i]
+                    ctext = _decode_line(craw)
+                    if not ctext or not craw[:1].isspace() or _DOTNET_LEVEL_RE.match(ctext):
+                        break
+                    merged_text = f"{merged_text} {ctext}"
+                    npos = cpos
+                    i += 1
+                merged.append((merged_text.encode("utf-8"), was_truncated, npos))
+                continue
+        merged.append((raw, was_truncated, pos_after))
+        i += 1
+    return merged
 
 
 def get_monitor_status() -> dict:
@@ -287,11 +345,13 @@ async def tail_log(service_id: str, service_name: str, log_path: str, tail_lines
             src["drain_backlog"] = False
             return events
 
+        lines = _merge_dotnet_continuations(lines)
+
         for raw, was_truncated, pos_after in lines:
             try:
                 # Quitar codigos ANSI (p. ej. WPPConnect escribe \x1b[31merror\x1b[39m)
                 # para que el nivel se clasifique y el mensaje quede legible.
-                text = _ANSI_RE.sub("", raw.decode("utf-8", errors="replace")).strip()
+                text = _decode_line(raw)
             except Exception:
                 text = ""
             if not text:

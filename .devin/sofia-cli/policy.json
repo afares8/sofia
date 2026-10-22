@@ -7,7 +7,12 @@
   "poll_seconds": 15,
   "batch_size": 50,
   "batch_hold_seconds": 60,
+  "backlog_digest": true,
+  "backlog_digest_threshold": 50,
+  "backlog_digest_max_chars": 32000,
+  "idle_close_minutes": 60,
   "stall_seconds": 900,
+  "agent_commit_limit_mb": 4096,
   "health_ports": {
     "local": 5185,
     "elenatec": 5186

@@ -619,3 +619,59 @@ def test_poll_loop_removes_disabled_source_status(monkeypatch, clean_log_state):
     with pytest.raises(RuntimeError):
         asyncio.run(log_service.log_poll_loop())
     assert "ghost" not in log_service.get_monitor_status()["sources"]
+
+
+def test_dotnet_console_header_merges_with_indented_payload(tmp_path, clean_log_state):
+    # vms-api escribe "warn: Category[EventId]" y el mensaje en la linea indentada.
+    # Antes Sofia guardaba solo la categoria y se perdia la causa.
+    log = tmp_path / "vms-api.log"
+    log.write_text(
+        "info: VmsSofia.Api.DeviceService[0]\n"
+        "      stream started device=75 channel=6 streamType=0\n"
+        "warn: VmsSofia.Api.DeviceService[0]\n"
+        "      encrypted stream capacity rejected device=75 channel=6 streamType=0 "
+        "reason=encrypted_main_capacity_reached\n"
+        "fail: VmsSofia.Api.DeviceService[0]\n"
+        "      device 75 login failed\n",
+        encoding="utf-8",
+    )
+
+    events = asyncio.run(
+        log_service.tail_log("vms-api", "Vision vms-api", str(log), tail_lines=50)
+    )
+
+    assert [e.level for e in events] == ["WARNING", "ERROR"]
+    assert "encrypted_main_capacity_reached" in events[0].detail
+    assert "VmsSofia.Api.DeviceService[0]" in events[0].detail
+    assert "device 75 login failed" in events[1].detail
+    assert log_service._file_positions[str(log)] == log.stat().st_size
+
+
+def test_dotnet_levels_are_classified():
+    assert log_service._classify_level(
+        "warn: VmsSofia.Api.DeviceService[0] capacity rejected") == "WARNING"
+    assert log_service._classify_level(
+        "fail: VmsSofia.Api.DeviceService[0] boom") == "ERROR"
+    assert log_service._classify_level(
+        "crit: VmsSofia.Api.DeviceService[0] boom") == "CRITICAL"
+    assert log_service._classify_level(
+        "info: VmsSofia.Api.DeviceService[0] ok") is None
+    assert log_service._classify_level(
+        "debug: VmsSofia.Api.DeviceService[0] detail") is None
+
+
+def test_dotnet_header_without_payload_is_not_merged_with_next_header(tmp_path, clean_log_state):
+    log = tmp_path / "vms-api.log"
+    log.write_text(
+        "warn: VmsSofia.Api.DeviceService[0]\n"
+        "info: VmsSofia.Api.DeviceService[0]\n"
+        "      stream started device=76 channel=5\n",
+        encoding="utf-8",
+    )
+
+    events = asyncio.run(
+        log_service.tail_log("vms-api", "Vision vms-api", str(log), tail_lines=50)
+    )
+
+    assert [e.level for e in events] == ["WARNING"]
+    assert "stream started" not in events[0].detail

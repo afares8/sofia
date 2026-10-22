@@ -334,7 +334,8 @@ class FakeAcpProc:
 
 
 def make_worker(env, group="local", day="2026-01-01", agent=None, stdin_lines=None,
-                elevated=True, today="2026-01-01", store=None, agent_factory=None):
+                elevated=True, today="2026-01-01", store=None, agent_factory=None,
+                commit_fn=None):
     store = store or bridge.StateStore(env.state_root / group)
     out = io.StringIO()
     q = queue.Queue()
@@ -363,7 +364,8 @@ def make_worker(env, group="local", day="2026-01-01", agent=None, stdin_lines=No
         mutex_factory=lambda n: bridge.HeldMutex(
             "Local\\T-" + os.urandom(6).hex()),
         auth_fn=lambda e: True,
-        title_fn=lambda t: None)
+        title_fn=lambda t: None,
+        **({"commit_fn": commit_fn} if commit_fn is not None else {}))
     return w, store, out, proc_holder
 
 
@@ -2301,6 +2303,80 @@ def test_health_snapshot_ok_and_stale(env):
     assert w.health_snapshot()[1] == 503
 
 
+def test_health_snapshot_paused_is_503(env):
+    w, store, spawns = make_watcher(env)
+    w._last_poll_at = w.now()
+    with store.transaction() as st:
+        st["paused"] = True
+        st["status"] = "paused"
+    payload, status = w.health_snapshot()
+    assert status == 503 and payload["ok"] is False
+    assert payload["status"] == "paused"
+
+
+def test_pause_self_heals_when_report_arrived_after_pause(env):
+    w, store, spawns = make_watcher(env)
+    w.poll_once()
+    add_occurrence(env.db, level="ERROR")  # id 1
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["cursor"] = 1
+        st["paused"] = True
+        st["status"] = "paused"
+        st["pause_cursor"] = 1
+        st["pending"] = [ev(2)]  # encolado en un ciclo previo a la pausa
+    w.poll_once()  # no hay filas nuevas: la curacion no depende de queued
+    st = store.load()
+    assert st["paused"] is False and st["status"] == "ok"
+    assert len(spawns) == 1
+
+
+def test_pause_stays_without_report_after_pause(env):
+    w, store, spawns = make_watcher(env)
+    w.poll_once()
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["cursor"] = 5
+        st["paused"] = True
+        st["status"] = "paused"
+        st["pause_cursor"] = 5
+        st["pending"] = [ev(4)]
+    w.poll_once()
+    st = store.load()
+    assert st["paused"] is True and spawns == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="psapi solo Windows")
+def test_process_commit_bytes_current_process(env):
+    commit = bridge.process_commit_bytes(os.getpid())
+    assert commit is not None and commit > 0
+
+
+def test_worker_recycles_agent_over_commit_limit(env):
+    procs = []
+
+    def factory():
+        p = FakeAcpProc()
+        procs.append(p)
+        return p
+
+    worker, wstore, out, ph = make_worker(
+        env, agent_factory=factory,
+        commit_fn=lambda pid: 8 * 1024 ** 3)
+    assert worker._connect()
+    assert worker._should_recycle_agent() is True
+    assert worker._recycle_agent() is True
+    assert len(procs) == 2
+    assert worker._session_id is not None
+
+
+def test_worker_keeps_agent_under_commit_limit(env):
+    worker, wstore, out, ph = make_worker(
+        env, commit_fn=lambda pid: 1024 ** 2)
+    assert worker._connect()
+    assert worker._should_recycle_agent() is False
+
+
 def test_health_server_serves_json(env):
     import urllib.request
     w, store, spawns = make_watcher(env)
@@ -2381,6 +2457,121 @@ def test_worker_heals_truncated_turn_on_start(env):
     st = wstore.load()
     assert st["completed"] == [1] and st["pending"] == []
     assert st["uncertain"] is False and st["inflight"] is None
+
+
+def test_render_digest_groups_orders_and_redacts(env):
+    crit = ev(10, message="backend caido", level="CRITICAL")
+    err = ev(11, message="column branch_id no existe", level="ERROR")
+    dup = ev(12, message="column branch_id no existe", level="ERROR")
+    dup["issue_id"] = err["issue_id"]
+    warn = ev(13, message="warning ruidoso", level="WARNING")
+    text = bridge.render_digest([warn, dup, err, crit], "2026-01-01")
+    assert "RESUMEN DE COLA: 4 avisos" in text
+    assert text.index("[CRITICAL]") < text.index("[ERROR]") \
+        < text.index("[WARNING]")
+    assert "x2" in text
+    assert "occurrences: 11, 12" in text
+    assert "occurrences: 10" in text
+    assert "sofia.db" in text
+
+
+def test_render_digest_caps_size(env):
+    events = [ev(i, message="mensaje " + chr(97 + i % 26) + "x" * 200)
+              for i in range(1, 41)]
+    text = bridge.render_digest(events, "2026-01-01", max_chars=2000)
+    assert len(text) <= 2600
+    assert "omitidos por tamano" in text
+
+
+def test_worker_sends_single_digest_for_backlog(env):
+    store = bridge.StateStore(env.state_root / "local")
+    events = [ev(i, message="aviso %d" % i) for i in range(1, 61)]
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["cursor"] = 60
+        st["pending"] = events
+    agent = FakeAcpProc()
+    worker, wstore, out, _ = make_worker(env, agent=agent)
+    assert worker.run() == 0
+    prompts = [m for m in agent.received if m["method"] == "session/prompt"]
+    assert len(prompts) == 1
+    text = prompts[0]["params"]["prompt"][0]["text"]
+    assert "RESUMEN DE COLA: 60 avisos" in text
+    st = wstore.load()
+    assert st["pending"] == []
+    assert st["completed"] == list(range(1, 61))
+
+
+def test_worker_keeps_normal_batches_below_threshold(env):
+    store = bridge.StateStore(env.state_root / "local")
+    events = [ev(i, message="aviso %d" % i) for i in range(1, 51)]
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["cursor"] = 50
+        st["pending"] = events
+    agent = FakeAcpProc()
+    worker, wstore, out, _ = make_worker(env, agent=agent)
+    assert worker.run() == 0
+    prompts = [m for m in agent.received if m["method"] == "session/prompt"]
+    assert len(prompts) == 1
+    assert "RESUMEN DE COLA" not in prompts[0]["params"]["prompt"][0]["text"]
+    assert wstore.load()["pending"] == []
+
+
+def test_worker_closes_after_idle_timeout(env):
+    env.policy["idle_close_minutes"] = 0.001
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["worker_ready"] = True
+        st["last_spawn"] = time.time()
+        st["spawn_counted"] = True
+        st["sessions"]["2026-01-01"] = {"session_id": "sess-1",
+                                        "initial_prompt_sent": True}
+    agent = FakeAcpProc()
+    q = queue.Queue()
+    out = io.StringIO()
+    worker = bridge.ConsoleWorker(
+        env.policy, "local", "2026-01-01", store,
+        spawn_agent=lambda e, m, c: agent, stdin_queue=q, stdout=out,
+        poll_state_seconds=0.02, today=lambda: "2026-01-01",
+        verify_elevation_fn=lambda c: None,
+        mutex_factory=lambda n: bridge.HeldMutex(
+            "Local\\T6-" + os.urandom(6).hex()),
+        auth_fn=lambda e: True, title_fn=lambda t: None)
+    assert worker.run() == 0
+    st = store.load()
+    assert st["worker_ready"] is False
+    assert st["last_spawn"] == 0.0
+    assert st["paused"] is False
+    assert "cierro esta consola" in out.getvalue()
+
+
+def test_worker_exits_clean_when_agent_dies_between_turns(env):
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["worker_ready"] = True
+        st["last_spawn"] = time.time() - 30
+        st["spawn_counted"] = True
+    q = queue.Queue()
+    out = io.StringIO()
+    worker = bridge.ConsoleWorker(
+        env.policy, "local", "2026-01-01", store,
+        spawn_agent=lambda e, m, c: FakeAcpProc(), stdin_queue=q,
+        stdout=out, poll_state_seconds=0.02, today=lambda: "2026-01-01",
+        verify_elevation_fn=lambda c: None,
+        mutex_factory=lambda n: bridge.HeldMutex(
+            "Local\\T7-" + os.urandom(6).hex()),
+        auth_fn=lambda e: True, title_fn=lambda t: None)
+    worker._transport = Simple(closed=True)
+    assert worker._main_loop() == 0
+    st = store.load()
+    assert st["worker_ready"] is False
+    assert st["last_spawn"] == 0.0
+    assert st["next_retry_after"] > time.time()
+    assert st["paused"] is False
+    assert "cierro esta consola" in out.getvalue()
 
 
 def test_default_spawn_worker_starts_minimized_console(monkeypatch, tmp_path):

@@ -151,6 +151,20 @@ en la UI de IA) quedo suprimido con el patron `vision-stale-ai-jobs-after-restar
   levantar; healthy 17:34:40, connected WALIGMAG). Causa probable: presion de commit
   (WindowsTerminal ~28 GB commit + 6 procesos devin ~19 GB; disponible cayo a ~3 GB) — son
   procesos del dueno/sesiones, NO del stack: no tocarlos; flag al dueno.
+  En esa misma ventana (18-oct 17:32:14 local = 22:32:15Z) los DOS watchers del puente
+  loguearon UNA vez `error de ciclo: disk I/O error` (SQLITE_IOERR de sqlite3 leyendo
+  sofia.db en mode=ro), en el mismo segundo que un fallo del motor de IA de Vision y en
+  medio de los crashes de ChatGPT/PackingSapDiService/llama-mtmd-cli (Application Error
+  1000) y de un `cv2.error` de memoria. Es transitorio y auto-recuperado: el bucle del
+  watcher reintenta al siguiente ciclo (15 s) sin avanzar cursor (`poll_once` corre dentro
+  de `StateStore.transaction()`; si la lectura falla, el estado no se guarda), no se perdio
+  ningun reporte y no reaparecio (una sola linea en cada watcher.log; 0 eventos
+  disk/Ntfs/volmgr en el Event Log de 24 h). NO es fallo de codigo ni de disco: no aplicar
+  fix. Genera los issues 82427/82428; las occurrences posteriores (82451/82452 tras el
+  reinicio 17:34:23, 82708/82709 tras el 23:34:24 y 82784/82785 tras el 00:50:42 del
+  19-oct) son SOLO re-ingestas del mismo texto por cada reinicio coordinado de
+  SofiaBackend (at-least-once; el watcher.log es una sola linea, asi que el tail de 8 KiB
+  la relee completo) — no reabrir por ellas.
 
 ## Salud del puente y recuperacion (2026-10-16)
 
@@ -228,6 +242,38 @@ Familias que se repiten y son esperadas o artefactos de parsing, no fallos de la
   verificado 2026-10-16: `POST /api/v1/packing/logistica/crear-entrega` = **80.9 s** para el pedido
   8056 (creacion de lineas SAP + backfill del pedido complejo que genero la rafaga de warnings de
   deficit/lineas); responde 200. `GET /api/v1/packing/logistica/resumen-pedidos` ~5 s (reporte pesado).
+- **Mayor modulo elenatec (nuevo): `POST /api/v1/elenatec/price-rules/{id}/preview` ~27 s es
+  inherente** — `preview_price_rule` re-baja el catalogo remoto COMPLETO paginado
+  (`build_remote_product_index` + `_remote_price_items`; verificado 2026-10-19 01:39 local:
+  re-auth + ~25 paginas de `/products` (offsets hasta 12500) + ~22 de `/price-lists/57/items`
+  (hasta 10500+), ~500-750 ms por pagina; frontend 27.2 s y backend 26.9 s coinciden). Es la
+  familia "Slow request" de un endpoint manual ("Vista previa"); 200 OK. No hay fix minimo:
+  una mejora seria cachear/prefetch del indice remoto (decision del modulo, que sigue en
+  desarrollo por otra sesion).
+- **Mayor elenatec `GET /api/v1/elenatec/remote/price-lists` (issues 82815/82816, 19-oct 01:46
+  local, 8.5-14.3 s; el frontend lo llama al abrir "Vista previa")**: el tiempo se reparte
+  entre el ciclo de auth del cliente (`login` + `switch-tenant` cuando el token cacheado no
+  sirve) y el GET remoto a app.elenatec.com, que ese dia tardo ~7 s bajo la carga del crawl
+  del preview (el probe `tec` estaba sano, ~360 ms). ADEMAS se observo THRASH de tokens: dos
+  flujos concurrentes (crawl del preview + price-lists) se invalidan mutuamente — un 401
+  dispara `clear_token_cache` (global por base_url+email) y `switch-tenant` re-emite token ->
+  el otro flujo recibe 401 y re-loguea (verificado: 3 login+switch-tenant en ~7 s y 401 en
+  products offset=3500 a mitad del crawl). No es crash (todo reintenta y devuelve 200).
+  Mejoras posibles (NO aplicadas, modulo de otra sesion): single-flight y no limpiar el
+  cache global en 401, reusar token por tenant.
+- **Vision `time sync <equipo> failed: /ISAPI/System/time/ntpServers/1: el equipo respondio
+  networkError` (issues 79360-79364, counts 3-11 desde 17-oct, cada ~2-4 h)**: el
+  `networkError` es la respuesta del PROPIO equipo (statusString del ISAPI NTP) al intento
+  de fijar servidores NTP (timesync best-effort de Vision). Equipos vistos: WM-DESPACHO2,
+  Bodega WM 03, Wm-tienda, WM-Domo Bodega, Bodega FF-2. No es un fallo de Vision ni afecta
+  video/eventos; si el dueno quiere que sincronicen, revisar red/NTP del lado del equipo.
+- **Distinguir "Slow fetch" (frontend) de "Slow request" (backend)**: el SDK del navegador
+  (`mayor/frontend/src/sofia-browser.js`, `slowMs: 8000`) mide el fetch COMPLETO en el browser;
+  el `sofia_sdk.py` del backend mide solo el request en el servidor (umbral 5 s). Si aparece el
+  "Slow fetch" pero NO su "Slow request" parejo, el servidor respondio <5 s y el stall fue del
+  lado cliente (caso verificado 2026-10-19 01:38: `GET .../elenatec/sap/price-lists` 14.8 s en el
+  browser; backend con `SELECT ... FROM OPLN` trivial, sin evento lento, idle en la ventana, y el
+  proxy 5175 medido despues ~34 ms). No buscar el problema en el backend en ese caso.
 - **Packing `[DATOS] ApTaxCode column not available`**: `OARG.ApTaxCode` no existe en esta BD SAP;
   el codigo cae a la consulta basica y responde OK (warning esperado).
 - **Packing `[SAP-DI] Could not set U_*`**: faltan UDFs en la BD SAP (confirmado por
@@ -416,6 +462,28 @@ Familias que se repiten y son esperadas o artefactos de parsing, no fallos de la
   propio logger de requests lentos (`vision.perf`); p. ej. `POST /vms-api/api/devices/discovery/sadp`
   (descubrimiento SADP = escaneo de red, inherentemente lento) en 4.1 s. Es la familia "slow request"
   de Vision: responde 200, no es un fallo. Mismo patron que el "Slow request" de Mayor/Packing.
+- **Packing Frontend DOWN (issue 11, CRITICAL) durante el `npm run build` de un deploy**: CRA
+  (`react-scripts build`) VACIA `build/` al empezar, asi que el servidor estatico
+  (`Packing/frontend/start-packing-static-server.js`, `sendFile` -> `fs.readFile` ENOENT)
+  responde 500 a todo lo que no sea `/health` mientras dura el build (~2 min). El probe
+  `https://127.0.0.1:3000` (302 -> http; sigue el redirect y exige 200) acumula 3 fallos y
+  declara DOWN. Verificado 2026-10-19 00:51:18-00:52:49 local (deploy del commit 8e81e421
+  "liquidaciones"; build terminado 00:52:50, probe 200 a las 00:53:20). Es esperado y se
+  recupera solo: NO reiniciar servicios ni "arreglar" el static server; si coincide con un
+  deploy de frontend (mtime de `build/index.html` reciente), no es fallo.
+- **Packing `/api/v1/dmc/*` "Slow request" (issues 14525/15762/18650/18656, counts 18-31 desde
+  sep)**: los 4 endpoints (zona-libre-companies/names, portal/{ports,drivers,vehicles}) son
+  proxies finos a Mayor (`Packing/backend/app/routers/commercial_invoices.py`, `_mayor_api_get`,
+  timeout 15 s, reintentos) y la pagina DMC los pide en rafaga. Verificado 2026-10-19 01:42 local
+  (5.9-7.4 s): en la misma rafaga `/health` tardo 1.9 s y otros endpoints 1.7-3 s -> el backend
+  de Packing (UN worker) estaba encolado con operaciones pesadas (liquidaciones/facturas + PDF
+  por Playwright + loops de SAP) sobre el MISMO SQL Server SAP que consulta el DMC de Mayor;
+  Mayor NO registro ningun lento en esa ventana (sus DMC <5 s) -> el tiempo extra es cola de
+  Packing + ida/vuelta del proxy. No es defecto puntual; mejora posible (NO aplicada): cachear
+  los catalogos en el frontend o reducir trabajo sincrono en el event loop. Nota: con el token
+  de Mayor expirado (cache 7 h, sin single-flight) las 4 llamadas hacen 4 logins concurrentes
+  (verificado en el out de Mayor: 4 POST /auth/login seguidos de los 4 GET); impacto menor
+  (login de Mayor ~12-15 ms medido con usuario invalido), higiene pendiente.
 
 ### Falso positivo del clasificador pasivo (verificado 2026-10-15; CORREGIDO 2026-10-16)
 `_classify_level` en `backend/app/services/log_service.py` clasificaba lineas SIN prefijo de nivel
@@ -485,9 +553,16 @@ Verificado 2026-10-16 (12:36Z): recuperado en <1 min, sin QR, y el probe volvio 
 
 Alternativa nativa: Mayor ya tiene `_auto_recover_session` (misma secuencia close+start) que
 dispara `_track_abnormal_and_maybe_recover` (grace `_STUCK_CONNECTED_GRACE_S=90s`) al final de
-`get_full_status`. PERO solo corre cuando alguien pollea `/status`/`/health` de Mayor (el
-frontend cada ~5s); fuera de horario no se dispara y el probe queda DOWN hasta que alguien
-recupere. No hay job periodico que lo dispare. Mejora posible (NO aplicada): un trigger
+`get_full_status`. Ademas el CAMINO DE ENVIO tambien lo dispara: `_send_with_reconnect`
+(`client.py:926`, con lock/cooldown cross-worker) detecta "Session Disconnected" y corre la
+auto-recuperacion, y tras reconectar REINTENTA el envio (verificado 2026-10-19 fuera de
+horario: envio fallido 03:02:27 -> check-connection 1/3 y 2/3 -> auto-recovery 03:03:46 ->
+recovered 03:04:25 -> "retrying send" -> "Message sent successfully after reconnect"
+03:04:26). Es decir: sin frontend polleando, un envio fallido igual recupera la sesion (~80 s);
+solo queda DOWN indefinido si no hay envios NI polls de `/status`. Un close+start manual
+(como el de arriba) puede solaparse con esa auto-recuperacion (el lock de Mayor no cubre
+actores manuales); en el episodio del 19-oct ambos corrieron casi simultaneos y convergieron
+sin daño (una sola "Started Session", probe UP). Mejora posible (NO aplicada): un trigger
 periodico en Mayor (o un probe de Sofia a `/api/v1/wppconnect/status`).
 
 No reiniciar el servicio NSSM como primera opcion: close+start es mas suave y suficiente para
@@ -500,6 +575,30 @@ si el probe `wppconnect` esta UP (200) al momento, es historico. ADEMAS: las mis
 2026-10-16T19:32:37Z se reingirieron varias veces (issues 77959/77961 re-creados con nuevas
 occurrences 78050/78051, 78166/78167) -> el CURSOR del log de WPPConnect no avanza / relee tramos;
 revisar el cursor de `WPPConnect.out.log` (identidad de archivo / from_now).
+
+### Episodio 2026-10-19 03:00-03:04 local (recuperado con close+start; verificado)
+- Watchdog del wrapper: `Chromium unresponsive (1/3)` 03:01:06 -> `recovered` 03:02:07
+  (no escalo a 3/3, no mato node).
+- Probe de Sofia: 6 chequeos fallidos por timeout de `check-connection-session`
+  (03:00:12-03:03:07) -> DOWN CRITICAL (issue 81, occurrence 82823) a las 03:01:22.
+  `status-session` decia CONNECTED (stale) mientras `check-connection-session` colgaba
+  (ReadTimeout 25 s) — el modo ya documentado.
+- Consecuencia real: el `collections_scheduler` de Mayor intento enviar a las 03:01:24;
+  el POST send-message tardo ~62 s y murio con 404 "A sessao do WhatsApp nao esta ativa"
+  (issues 23190/72561). El camino de envio de Mayor NO lo perdio: disparo su auto-recovery
+  (send-path, 03:03:46) y tras reconectar REINTENTO el envio -> "Message sent successfully
+  after reconnect" 03:04:26 (entregado con ~2 min de retraso).
+- Recuperacion aplicada (misma secuencia que Mayor; preserva pairing): generate-token ->
+  close-session (200 "Session successfully closed") -> start-session
+  `{"waitQrCode":true,"createOptions":{"autoClose":0}}` (200 INITIALIZING, qrcode null) ->
+  `check-connection-session` True a las 03:04:24 (~63 s). `WPPConnect.out.log`: isLogged +
+  "Started Session: default" 03:04:21 SIN QR. Probe de Sofia: 200 a las 03:04:12/03:04:43.
+- Nota (actualizada 2026-10-21): desde el fix del watchdog (ver "WPPConnect: watchdog
+  semantico" al final), un 200 con `{"status":false}` cuenta como fallo, asi que este modo
+  SI escala. Si el watchdog no escala (p.ej. guardia anti-bucle activa), la sesion puede
+  recuperarse sola por el auto-recovery de Mayor (~80 s tras un envio fallido, ver arriba);
+  si no hay envios y el probe lleva >5 min DOWN, aplicar esta secuencia manual (o reiniciar
+  WPPConnect).
 
 ## Vision: ola de 502 WHEP en MUCHAS camaras (2026-10-16 ~21:21-22:28 local)
 
@@ -562,14 +661,20 @@ Comprobado en vivo (solo lectura) el 2026-10-17 ~09:14:
 ## WPPConnect: auto-recuperacion por WATCHDOG y webhook 502 por reinicios de Mayor (2026-10-17)
 
 - `start_wppconnect_nssm.ps1` ya trae un WATCHDOG (chequeo cada 60s): `show-all-sessions` (HTTP, sin
-  Chromium) y `check-connection-session` (Chromium). Tras 3 fallos consecutivos de Chromium mata el node
-  y el loop externo lo relanza. Log: `C:\Users\ahmed\apps\service-logs\watchdog.log`.
+  Chromium) y `check-connection-session` (Chromium). Politica desde 2026-10-21: el chequeo de Chromium
+  exige cuerpo `status:true` (un 200 `{"status":false}` es fallo) y se escala con ventana deslizante de
+  5 chequeos (>=3 fallos) ademas de 3 consecutivos; mata el node y el loop externo lo relanza. Guardia
+  anti-bucle: si ya hubo 3 reinicios en 30 min no mata y pide revision manual. Log:
+  `C:\Users\ahmed\apps\service-logs\watchdog.log`.
   -> El "frame colgado" de Puppeteer se auto-recupera; ya NO hay que hacer close+start a mano si el
   watchdog esta vivo. Verificado 2026-10-17: episodio de "Chromium unresponsive (1/3)-(2/3)-recovered"
   cada ~90 s entre ~00:48 y ~01:31 local, luego silencio (sano). El watchdog NO loguea cuando todo va bien.
+  Las lineas nuevas incluyen el conteo de ventana: `Chromium unresponsive (2/3; 2/5 en ventana)`.
 - `WEBHOOK_URL` de WPPConnect se define en `start_wppconnect_nssm.ps1` (NO en el registro NSSM):
-  `http://127.0.0.1:8075/api/v1/whatsapp/webhook/wpp` (Mayor). El secretKey del API NO es el placeholder
-  por defecto (generate-token con `THISISMYSECURETOKEN` da 404); esta en `src/config.ts` (env SECRET_KEY).
+  `http://127.0.0.1:8075/api/v1/whatsapp/webhook/wpp` (Mayor). Verificado 2026-10-21: el `secretkey`
+  del path SI es el placeholder por defecto (`POST /api/<secretkey>/generate-token` -> 201 y
+  `/api/<secretkey>/show-all-sessions` -> 200); la nota del 2026-10-17 que decia 404 ya NO aplica.
+  No imprimir el valor: basta confirmar que el watchdog lo usa desde `src/config.ts`.
 - **`warn: Error calling Webhook ... status code 502`** = Mayor estaba reiniciando en ese instante.
   Correlacion verificado 2026-10-17: 502 a las 09:06:28/35 y 09:54:17/40 <-> arranques de Mayor a las
   09:06:53 y 09:54:55 (log `MayorBackend.out.log`, marca `SAP DI API Middleware is now running!`).
@@ -733,3 +838,212 @@ un reinicio).
   0 filas serian enviadas al reactivar (las 103 pendientes son
   `delivery_uncertain` o superan las 24 h de `get_pending_alerts`), asi que
   no habra rafaga al volver a activar WhatsApp.
+
+## Puente Sofia-Devin: salud, auto-sanacion y memoria (2026-10-20)
+
+- `health_snapshot` responde 503 cuando `status != "ok"` (antes 200 aunque estuviera `paused`). Sofia ahora alerta si el canal de auto-fix queda pausado; `sofia-devin-local`/`elenatec` en config esperan 200.
+- Pausa por consola cerrada: se guarda `pause_cursor` (cursor al pausar) y `_heal_stale_pause_locked` levanta la pausa cuando llega un reporte con `occurrence_id > pause_cursor`, aunque el poll no haya encolado nada (caso 2026-10-20: 415 reportes encolados y la pausa no se limpio).
+- El worker recicla el proceso ACP entre turnos cuando su commit privado supera `agent_commit_limit_mb` (policy, default 4096): cierra el transporte y reconecta con `session/load`; no corta turnos. Helper `process_commit_bytes` (ctypes/psapi, solo stdlib).
+- Guardia de host: tarea SYSTEM `ServerSofia-DevinMemoryGuard` cada 5 min (`C:\ProgramData\ServerSofia\Watch-DevinMemory.ps1`, log `Logs\DevinMemoryGuard-YYYY-MM-DD.log`). Aviso a Sofia (`service_id=devin-memory-guard`) si el commit libre < 8192 MB; con < 4096 MB cierra las sesiones `devin.exe` mas antiguas (>= 120 min) hasta recuperar 8192 MB. Las 4 sesiones Devin del 19-oct (~34 GB de commit) causaron el agotamiento que tumbo Vision y SofiaBackend el 20-oct.
+- Tests: `test_health_snapshot_paused_is_503`, `test_pause_self_heals_when_report_arrived_after_pause`, `test_pause_stays_without_report_after_pause`, `test_process_commit_bytes_current_process`, `test_worker_recycles_agent_over_commit_limit`, `test_worker_keeps_agent_under_commit_limit` (108 passed).
+
+## Puente Sofia-Devin: digest de cola, cierre por inactividad y auto-recuperacion (2026-10-20)
+
+- Cola grande en UN mensaje: con mas de `backlog_digest_threshold` (policy, default 50) avisos
+  del dia, `_take_pending_events` entrega todo (hasta MAX_PENDING=500) y `_send_batch` usa
+  `render_digest` en vez de N lotes. El digest agrupa por servicio+nivel+firma del mensaje
+  (ids/numeros normalizados), ordena CRITICAL, ERROR, WARNING, incluye conteos por nivel y
+  servicio, ventana, occurrences (hasta 8 por grupo) y detalle de CRITICAL; cap
+  `backlog_digest_max_chars` (default 32000). Los WARNING van en una linea sin ids. Tras
+  `end_turn` todos los ids del digest pasan a `completed` en ese unico turno; el agente
+  consulta el detalle completo en `sofia.db` (occurrences.id, read-only).
+- Cierre por inactividad: `idle_close_minutes` (policy, default 60). Sin turno, sin
+  inflight/uncertain y sin pendientes del dia durante ese tiempo, el worker marca
+  `worker_ready=false`, `spawn_counted=true`, `last_spawn=0` y sale sin marcar pausa; el watcher
+  reabre consola cuando llegue un aviso y retoma la sesion con `session/load`. Ya no queda una
+  consola abierta todo el dia.
+- Auto-recuperacion si muere el ACP: si el transporte se cierra sin turno en curso (p. ej. la
+  guardia de memoria mato `devin.exe`), el worker sale limpio y fija `next_retry_after=now+60 s`;
+  el watcher abre una consola nueva y retoma la sesion. Si el cierre ocurre con `prompt_sent` se
+  mantiene `uncertain` y NO se reenvia (requiere /reintentar).
+- Caso 2026-10-20: la guardia cerro 4 `devin.exe` a las 13:00:47-13:00:58 (commit libre
+  3091 MB); el worker de ElenaTec quedo desconectado con la consola abierta y 237+ avisos
+  retenidos (4 CRITICAL) sin que `status` cambiara. Con este cambio el worker habria salido y el
+  watcher habria reconectado en ~1 min.
+- Tests nuevos: `test_render_digest_groups_orders_and_redacts`, `test_render_digest_caps_size`,
+  `test_worker_sends_single_digest_for_backlog`, `test_worker_keeps_normal_batches_below_threshold`,
+  `test_worker_closes_after_idle_timeout`, `test_worker_exits_clean_when_agent_dies_between_turns`
+  (114 passed).
+
+## WPPConnect: watchdog semantico y ventana de fallos (2026-10-21)
+
+Incidente de referencia: issue 81 (occurrence 89461), DOWN CRITICAL 2026-10-21T05:08:24Z =
+00:08:24 local. El probe de Sofia (timeout 5 s, umbral 3, 90 s de gracia) acumulo 24 fallos
+seguidos: del primer fallo (~00:07:54) al ultimo (00:20:03) hubo **~12 min sin una sola
+respuesta valida** para Sofia, mientras el watchdog (timeout 30 s) veia "recovered" varias
+veces. Causa demostrada: el renderer de WhatsApp Web se bloquea por rachas (no es red ni el
+proceso node: `show-all-sessions` responde en ~55-110 ms y `/json/list` del DevTools contesta,
+pero `Runtime.callFunctionOn`/`Network.enable` sobre la pagina expiran). No hay evidencia de
+presion de memoria del host en ese momento (commit libre 10.9-14.2 GB).
+
+Dos defectos del watchdog demostrados y corregidos en `start_wppconnect_nssm.ps1`:
+1. `Test-WppChromium` solo miraba `StatusCode -eq 200`; WPPConnect responde 200
+   `{"status":false,"message":"Disconnected"}` (observado 00:11:38) y el watchdog lo contaba
+   como sano y reseteaba el contador. Ahora exige `status:true` (mismo contrato que Sofia).
+2. El contador solo sumaba fallos CONSECUTIVOS: con el patron real F,F,OK,F,OK,F nunca
+   llegaba a 3/3 y no reiniciaba nada. Ahora ademas evalua una ventana deslizante de 5
+   chequeos (>=3 fallos). "Recovered" exige 2 chequeos buenos seguidos.
+   Guardia anti-bucle: 3 reinicios en 30 min -> no mata y loguea que requiere revision manual
+   (evita un ciclo si la sesion esta realmente deslogueada y necesita QR).
+
+Aplicado 2026-10-21 00:19-00:20 local: `nssm restart WPPConnect`. Pairing preservado:
+`[default:browser] Using browser folder './userDataDir/default'`, `isLogged`, "Started
+Session: default" y `check-connection-session` -> `{"status":true,"message":"Connected"}` en
+97 ms; Sofia registro "WppConnect recovered after 24 failure(s)" a las 00:21:04. Sin QR.
+
+Pruebas del cambio (aisladas, sin tocar el servicio): se extraen las funciones reales del
+script con el parser de PowerShell y se mockea `Invoke-WebRequest`; 16 aserciones OK
+(200 status:true/false, status string, 401, cuerpo no JSON, timeout, patron alternante,
+fallos aislados, 3 consecutivos, guardia anti-bucle). Verificacion en vivo (solo lectura) de
+`Test-WppHealth`/`Test-WppChromium` contra el servicio real: True/True en 55/228 ms.
+
+Observacion operativa (medida, no causa probada): el tiempo hasta el primer cuelgue tras
+arrancar el browser bajo de ~18 h (13-sep) a ~4-8 h (finales de sep) y ~6 h el 20-oct; cada
+reinicio del browser lo resetea. Es la razon por la que el episodio de las 00:08 aparecio
+~6 h despues del browserClose de las 18:07. No se agrego ningun reinicio programado (el dueno
+pidio no tener scripts automaticos); el watchdog es la unica recuperacion automatica.
+
+### `showAllSessions` sin `return` (issue 89462, 2026-10-21 00:11 local)
+
+- Sintoma: `error: Unhandled Rejection: Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers after
+  they are sent to the client` en el out de WPPConnect, agrupado como issue 89462.
+- Causa demostrada: en `src/controller/sessionController.ts` (y el `dist/` compilado) el
+  handler `showAllSessions` responde `400 {response:false,...}` si el `secretkey` del path no
+  coincide, pero **no retorna** y sigue hasta `res.status(200).json(...)` -> segunda respuesta.
+  Se dispara con cualquier llamada del tipo `GET /api/<secretkey-invalido>/show-all-sessions`
+  (p.ej. usar Bearer en el path en vez del secretkey). El watchdog usa el path correcto, por eso
+  no lo veia en operacion normal.
+- Fix minimo aplicado (2026-10-21 00:26): `return res.status(400)...` en `src` y en
+  `dist/controller/sessionController.js` (se parcheo el compilado para no hacer `rimraf dist`
+  con el servicio en marcha; ambos quedan equivalentes). Verificado en vivo: path invalido ->
+  HTTP 400 en 19 ms **sin** Unhandled Rejection; path del watchdog -> 200 en 33 ms;
+  `check-connection-session` -> `{"status":true}` en 81 ms y sesion restaurada SIN QR.
+- `startAllSessions` tiene el mismo patron (400 sin return y luego 201) y NO se toco: ahi el
+  cambio alteraria si arranca sesiones con token invalido. Si aparece el mismo error desde ese
+  endpoint, decidir antes de aplicar.
+- Evento Windows `nssm` 1026 "Failed to open process handle for process with PID ... when
+  terminating service WPPConnect: The parameter is incorrect" (issue 24315): ESPERADO en cada
+  stop de WPPConnect; NSSM mata el arbol y algun `chrome.exe` hijo ya habia terminado. Verificado
+  2026-10-21 00:19:49 (PID 43580, un renderer) durante el restart del watchdog.
+
+### Log de vms-api: encabezado .NET sin su payload (2026-10-21)
+
+- Sintoma: issues de `vms-api` con mensaje `VmsSofia.Api.DeviceService[0]` y detail de 35
+  caracteres (issue 89261/89530); la causa real no llegaba al reporte.
+- Causa demostrada: `C:/ProgramData/VmsSofia/Api/vms-api.log` usa el logger de consola de .NET
+  (`warn: Category[EventId]` en una linea y el mensaje indentado en la siguiente). El tail
+  clasificaba la primera linea y descartaba la segunda por `_CONTINUATION_RE`.
+- Fix aplicado en `backend/app/services/log_service.py`: `_DOTNET_LEVEL_RE`/`_DOTNET_LEVELS`
+  (`trace/debug/info` -> INFO, `warn` -> WARNING, `fail` -> ERROR, `crit` -> CRITICAL) y
+  `_merge_dotnet_continuations()` une el encabezado con sus lineas indentadas antes de
+  clasificar (cursor hasta la ultima linea consumida). Antes `fail:` no se ingeria en absoluto.
+- Verificado: 3 tests nuevos en `tests/test_log_service.py` + suite completa 373 passed.
+  En vivo, tras reiniciar SofiaBackend (00:51), las re-lecturas del tail ya traen
+  `... encrypted stream capacity rejected device=75 channel=6 ... reason=encrypted_main_capacity_reached`.
+  Ojo: el reinicio reingesta el tail y crea issues nuevos (89534/89535) con el texto corregido;
+  son duplicados historicos, no eventos nuevos.
+
+### Vision: 409 `encrypted_main_capacity_reached` es por diseno (2026-10-21)
+
+- `private protocol: device 75 channel 6 -> 409 encrypted_main_capacity_reached` (issue 89528) y
+  el `warn` equivalente de vms-api (issue 89261) son el MISMO evento, ingerido por dos fuentes.
+- Device 75 es hybrid/encrypted (`stream.hybrid.device_ids`); `EncryptedAdmission` limita a
+  `MaxDecryptMainPerDevice` (default 1) los mains cifrados por equipo y nunca corta una sesion
+  en curso: solo rechaza el nuevo main. El sub/low sigue funcionando y el visor reintenta.
+  Secuencia real 00:46:56: ch6 main rechazado mientras ch4 tenia el slot -> `stream started`
+  de ch6 al reintentar. No es un fallo; no tocar el presupuesto sin decision del dueno.
+
+
+
+
+### Pendiente detectado: drift de despliegue en Packing (2026-10-21)
+
+`/api/health/sofia` -> `deploy_drift.drifted = ["packing"]`. Evidencia:
+- Proceso de `PackingBackend` creado 2026-10-20 10:36:18.
+- Commits posteriores: `da6dd437` 10:37:39 "fix(kardex): fallback defensivo si el backend no
+  devuelve stock_by_warehouse" y `1c805c88` 10:42:40 "fix(sap-di): recuperar el middleware tras
+  la carrera shutdown/startup".
+- `git status` en `C:/Users/ahmed/apps/Packing` no muestra cambios en esos archivos: el working
+  tree coincide con HEAD, pero el servicio arranco ANTES de ambos commits.
+- No es un falso positivo de mtime: el drift se calcula con `drift_service.py` comparando el
+  archivo de codigo mas nuevo (excluye .venv/node_modules/dist/data/logs) con el arranque NSSM.
+
+NO se desplego en la sesion del 2026-10-21: reiniciar PackingBackend obliga a parar antes
+SofiaBackend/SofiaFrontend (dependencia SCM) y PackingFrontend, y es una decision de despliegue
+del dueno, no un fix de un aviso. Queda como item abierto.
+
+### WMS Mayor/Packing: "no bin with sufficient stock" (issues 87643/7122, 2026-10-21)
+
+El ERROR de Mayor (`WMS API HTTP error 400 ... No inventory for 818459 in bin
+1-Z01-U01-R02-L01-B01`) y el `WMS deduction failed` NO son un fallo de Mayor: son el sintoma de
+un estado de inventario. Evidencia read-only (2026-10-21 01:00, `wms_event` + `wms_bin_inventory`):
+- Orden 9286 (SAP DocEntry 8109, DocNum 244974, status 'SAP', facturada). Mayor reintenta la
+  deduccion de 6 uds de 818459 en bin 8871; el bin ya no tiene fila de inventario de ese SKU.
+- 2026-10-19 15:52:17 RESERVE +6 (order 8109) -> reserved 0->6 en ese bin.
+- 2026-10-19 15:54:00 `system_auto_cleanup` RELEASE -6 con order_reference **PV-10439**
+  (old_reserved 6 -> 0) y 15:59:04 RELEASE -1 (old 6 -> 5). PV-10439 habia reservado 12 el
+  2026-10-12, con PICK_CONFIRM 7 y RELEASE -5: su neto REAL era 0, pero el neto por EVENTOS
+  (12-5=7) seguia >0, asi que el cleanup libero 6 uds que pertenecian a la orden 8109.
+- 2026-10-19 18:06:54 `valerie` ADMIN_CLEAR -6 (order 8109) y 18:07:04 `valerie` ADJUST -6252
+  EDIT "CORRECCION" (on_hand 6252 -> 0): correccion manual del bin.
+
+DEFECTO DEMOSTRADO (Packing, NO corregido en esta sesion): `cleanup_stale_reservations`
+(`app/modules/wms/services/inventory_service.py` ~4133) calcula el neto por orden solo con
+RESERVE - RELEASE e ignora PICK_CONFIRM, que reduce `reserved` sin generar RELEASE (el propio
+comentario del codigo lo dice). Resultado: libera reservas de OTRAS ordenes (viola "conservar
+reservas ajenas"). Dry-run read-only del 2026-10-21 sobre bodega 3: 2799 combinaciones
+orden+SKU, **1 cambia** con el fix propuesto (PV-04162 / 903148: 12 reservado, 12 pickeado,
+0 released; hoy el cleanup lo liberaria).
+- Fix propuesto (minimo): incluir `PICK_CONFIRM` en el agregado y en el monto a liberar
+  (`SUM(CASE WHEN event_type='PICK_CONFIRM' THEN ABS(qty) ELSE 0 END)`), y restarlo del neto.
+- Por que NO se aplico: flujo financiero/inventario delicado, sin DB de test para el SQL,
+  y PackingBackend arrastra drift de despliegue (ver mas abajo). Requiere el ciclo del
+  AGENTS de Packing (test que falle + verificacion + commit atomico).
+- Mientras tanto: la orden 9286 sigue con un reintento cada ~640 min y el cleanup puede
+  repetir el patron. No re-reservar ni ajustar datos sin decision del dueno.
+
+Nota de monitoreo: el reporte mostro issue 7122 como "order 6675, item 737996" porque
+`_fingerprint` normaliza los numeros de 4+ digitos a N; todas las ordenes/items de esa familia
+caen en el MISMO issue y el mensaje visible es el primero visto. El `detail` de la ocurrencia
+pasiva trae la linea real (9286/818459). No tomar el mensaje del issue como el pedido actual.
+
+Nota de monitoreo (2026-10-21 00:52): la regla `[REGLA] Spike de errores (3x normal)` (issue
+78175) conto los duplicados que el reinicio de SofiaBackend reingesto (ERR_HTTP_HEADERS_SENT
+viejo de las 00:11 + DOWN de las 00:08) y disparo un falso spike. Es el comportamiento
+at-least-once ya documentado, no errores nuevos: verificar `occurrences.timestamp` contra el
+`detail` y el mtime del log antes de tratarlo como incidente.
+
+Validacion en vivo del fix (2026-10-21 06:18-06:22 local): el renderer se colgo ~6 h despues
+del arranque del browser (node PID 39060, arrancado 00:25). El watchdog nuevo escalo
+1/3 (1/5 en ventana) 06:18:02 -> 2/3 (2/5) 06:19:19 -> 3/3 (3/5) 06:20:49 y mato el node;
+el loop relanzo PID 32252 a las 06:21:24 y la sesion volvio sola (`isLogged` + "Started
+Session" 06:22:00, SIN QR). `check-connection-session` {"status":true} en 79 ms y Sofia
+"WppConnect recovered after 9 failure(s)" 06:22:24. Caida total ~5 min (3.5 de escalado +
+35 s de reinicio).
+
+### WMS: el auto-cleanup libera la reserva ANTES de la deduccion (guard, 2026-10-21)
+
+Issue 89665 (nuevo) + familia: `adjust_inventory: ORDER_FULFILL ... this order has 0 net reserved
+... but bin still has current_reserved=... from other orders. Preserving reserved guard ...`.
+Evidencia en bin 8863 / sku 075073 (orden 8122, 48 uds):
+- 2026-10-20 15:45:15 RESERVE +48 (orden 8122).
+- 2026-10-21 09:13:08 `system_auto_cleanup` RELEASE -48 con order_reference **8122** (515 -> 467).
+- 2026-10-21 09:13:59 `wms_system` ADJUST -48 ORDER_FULFILL -> guard: 0 net reserved para 8122, el
+  bin aun tiene 467 reservados de OTRAS ordenes; se preserva `reserved` y se pide revision manual.
+Resultado: el guard protege reservas ajenas (correcto), pero la deduccion de la orden facturada NO
+se aplica -> `on_hand` queda sobrestimado por esas unidades. Misma familia vista en ordenes 8098
+(16 SKUs, 20-oct 21:41), 8101 (5 SKUs, 19-oct 21:51) y 7973 (12/13-oct).
+Causa: carrera/orden entre `cleanup_stale_reservations` (libera la reserva de una orden ya
+facturada/entregada) y `wms_deduction_scheduler` (deduce despues). Arreglo de diseno pendiente:
+el cleanup no deberia liberar reservas de ordenes con deduccion pendiente (o la deduccion debe
+ser atomica con el release). No se toco codigo ni datos.
