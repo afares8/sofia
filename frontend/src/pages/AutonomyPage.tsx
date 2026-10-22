@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import clsx from 'clsx'
+import IncidentTeamPanel from '../components/IncidentTeamPanel'
 import {
   Bot, Shield, Power, RefreshCw, Play, GitBranch, AlertTriangle,
   CheckCircle, XCircle, Loader2,
@@ -117,6 +118,7 @@ export default function AutonomyPage() {
         </button>
       </div>
 
+      <IncidentTeamPanel />
       <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">
         <div className="flex items-center gap-2 text-white font-semibold">
           <Shield size={16} className="text-purple-400" /> Repos controlados

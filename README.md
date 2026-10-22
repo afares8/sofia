@@ -1,5 +1,7 @@
 # Sofia Monitor
 
+Mejora opcional: [equipo de incidentes, controles, operación y rollback](docs/incident-team.md). Ejecución deshabilitada por defecto; no incluye despliegue productivo automático.
+
 Sistema de monitoreo centralizado para todas tus aplicaciones. Inspirado en Sentry pero 100% local, tuyo y con alertas por WhatsApp.
 
 ---

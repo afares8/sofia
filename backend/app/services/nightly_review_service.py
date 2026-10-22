@@ -354,6 +354,11 @@ async def apply_proposal(
 
     target_proposal = proposals[proposal_index]
     target_service = target_proposal.get("service_id")
+    cfg = load_config()
+    if cfg.autonomy.incident_team.enabled and any(
+        r.id == target_service and r.incident_team_enabled for r in cfg.app_repos
+    ):
+        return False, "Servicio gestionado por el equipo de incidentes; usar su cola protegida."
 
     # Find repo path for this service
     repo_path = _repo_path_for_service(target_service)
@@ -487,12 +492,7 @@ async def apply_proposal(
             duration_s=round(duration_s / len(grouped), 1),
         )
 
-        if success and issue_id:
-            try:
-                await db_service.resolve_issue(int(issue_id))
-                logger.info(f"[NIGHTLY] Resolved issue #{issue_id} after successful fix.")
-            except Exception as exc:
-                logger.warning(f"[NIGHTLY] Could not resolve issue #{issue_id}: {exc}")
+        # A local fix does not prove deployment or recovery. Keep the issue open.
 
     return success, output
 

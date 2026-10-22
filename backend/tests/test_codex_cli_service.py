@@ -26,6 +26,48 @@ SPAWN_GRANDCHILD = (
 )
 
 
+def test_incident_commands_never_request_full_access(monkeypatch, tmp_path):
+    monkeypatch.setattr(svc, "codex_bin", lambda: "codex-fixture")
+    for readonly, expected in ((True, "read-only"), (False, "workspace-write")):
+        command = svc.build_codex_cmd(readonly, str(tmp_path), safe_workspace=True)
+        assert command[command.index("-s")+1] == expected
+        assert "danger-full-access" not in command
+        assert "sandbox_workspace_write.network_access=false" in command
+
+
+def test_isolated_runner_strips_tokens_and_does_not_log_output(codex_env, monkeypatch, caplog):
+    procs, set_cmd = codex_env
+    monkeypatch.setenv("SOFIA_API_KEY", "operator-test-only")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-test-only")
+    script = 'import os; print("private-output"); print(os.getenv("SOFIA_API_KEY","absent")); print(os.getenv("GITHUB_TOKEN","absent"))'
+    m1, m2 = set_cmd([sys.executable, "-c", script])
+    with m1, m2, caplog.at_level("INFO"):
+        rc, output = svc.run_codex("fixture", True, safe_workspace=True, log_output=False)
+    assert rc == 0 and output.count("absent") == 2
+    assert "operator-test-only" not in output and "github-test-only" not in output
+    assert "private-output" not in caplog.text
+
+
+def test_output_without_newline_is_bounded(codex_env):
+    procs, set_cmd = codex_env
+    m1, m2 = set_cmd([sys.executable, "-c", 'import sys; sys.stdout.write("x"*200000); sys.stdout.flush()'])
+    with m1, m2:
+        rc, output = svc.run_codex("fixture", True, max_output_chars=1000, log_output=False, timeout=5)
+    assert rc != 0 and len(output) < 1500
+    assert procs[0].poll() is not None
+
+
+def test_final_message_channel_ignores_cli_banner(codex_env, tmp_path, monkeypatch):
+    procs, set_cmd = codex_env
+    monkeypatch.setattr(svc.tempfile, "tempdir", str(tmp_path))
+    script = 'import sys,pathlib; print("banner"); pathlib.Path(sys.argv[sys.argv.index("--output-last-message")+1]).write_text("{\\\"approved\\\":true}")'
+    m1, m2 = set_cmd([sys.executable, "-c", script, "-"])
+    with m1, m2:
+        rc, output = svc.run_codex("fixture", True, final_message_only=True, log_output=False)
+    assert rc == 0 and output == '{"approved":true}'
+    assert not list(tmp_path.glob("sofia-codex-*.txt"))
+
+
 @pytest.fixture
 def tracked_popen():
     """Wrap subprocess.Popen to record every spawned process."""
@@ -123,19 +165,26 @@ def test_early_exit_big_prompt_no_broken_pipe_mask(codex_env):
 def test_kill_oserror_race_still_returns_timeout(codex_env):
     procs, set_cmd = codex_env
     real_popen = subprocess.Popen
+    cleanup = []
     def tracking_kill_broken(*args, **kwargs):
         p = real_popen(*args, **kwargs)
+        cleanup.append((p, p.kill))
         p.kill = mock.Mock(side_effect=OSError("process already gone"))
         procs.append(p)
         return p
     m1, m2 = set_cmd([sys.executable, "-c", HUNG_NO_READ])
-    with m1, m2, mock.patch.object(svc.subprocess, "Popen", side_effect=tracking_kill_broken):
-        rc, output = svc.run_codex("prompt", read_only=True, timeout=1)
-    assert rc == -1
-    assert "TIMEOUT" in output
-    if procs and procs[0].poll() is None:
-        subprocess.Popen.kill(procs[0])
-        procs[0].wait(timeout=5)
+    try:
+        with m1, m2, mock.patch.object(svc.subprocess, "Popen", side_effect=tracking_kill_broken):
+            rc, output = svc.run_codex("prompt", read_only=True, timeout=1)
+        assert rc == -1
+        assert "TIMEOUT" in output
+    finally:
+        # subprocess.Popen is patched by the fixture. Keep the real bound kill
+        # before replacing it, and clean up only the process created by this test.
+        for proc, kill in cleanup:
+            if proc.poll() is None:
+                kill()
+            proc.wait(timeout=5)
 
 
 def test_grandchild_with_inherited_stdout_reaped(codex_env):
@@ -170,6 +219,7 @@ def test_no_binary_no_popen(tracked_popen):
 def test_resolver_env_override_valid(tmp_path, monkeypatch):
     fake = tmp_path / "codex-custom.exe"
     fake.write_bytes(b"MZ")
+    fake.chmod(0o700)  # Resolver metadata fixture; no fake binary is executed.
     monkeypatch.setenv("SOFIA_CODEX_BIN", str(fake))
     assert svc.codex_bin() == str(fake)
     assert svc.codex_available() is True
@@ -194,6 +244,7 @@ def test_resolver_absent_uses_path(monkeypatch):
 def test_command_flags_unchanged(tmp_path, monkeypatch):
     fake = tmp_path / "codex.exe"
     fake.write_bytes(b"MZ")
+    fake.chmod(0o700)
     monkeypatch.setenv("SOFIA_CODEX_BIN", str(fake))
     monkeypatch.delenv("SOFIA_CODEX_MODEL", raising=False)
     cmd = svc.build_codex_cmd(read_only=True, cwd=str(tmp_path))

@@ -5,20 +5,22 @@ Errors are grouped by fingerprint — same error = increment count, not duplicat
 """
 import json
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Header
 from pydantic import BaseModel
 
 from app.models.event import ErrorEvent
 from app.services import db_service, whatsapp_service, sourcemap_service
 from app.services.config_service import load_config
 from app.services.event_classification import normalize_reported_level
+from app.services.ingest_identity import verified_operator_identity
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 
 class IngestPayload(BaseModel):
+    source: Literal["active", "business_invariant", "synthetic"] = "active"
     service_id: str
     service_name: str
     level: str
@@ -35,7 +37,7 @@ class IngestPayload(BaseModel):
 
 
 @router.post("/event")
-async def ingest_event(payload: IngestPayload):
+async def ingest_event(payload: IngestPayload, authorization: str = Header(default="")):
     cfg = load_config()
 
     # Normalize tags into a JSON string (DB column is TEXT)
@@ -69,14 +71,15 @@ async def ingest_event(payload: IngestPayload):
         traceback=traceback_str,
         url=payload.url,
         user_info=payload.user_info,
-        source="active",
+        source=payload.source,
         timestamp=payload.timestamp or datetime.utcnow(),
         tags=tags_str,
         environment=payload.environment,
         release=payload.release,
     )
 
-    issue_id, is_new, is_regression = await db_service.upsert_event(event)
+    identity = verified_operator_identity(authorization, event, cfg)
+    issue_id, is_new, is_regression = await db_service.upsert_event(event, ingest_identity=identity)
 
     if issue_id == 0:
         # Familia conocido-esperada (ruido): no se crea issue ni alerta.

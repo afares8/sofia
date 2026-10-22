@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
-from app.routers import health, events, ingest, logs, config, webhook, restore, nightly, autonomy
+from app.routers import health, events, ingest, logs, config, webhook, restore, nightly, autonomy, incident_team
 from app.services.alert_queue import alert_queue_loop
 from app.services.analytics_service import spike_detection_loop
 from app.services.config_service import load_config
@@ -23,6 +23,7 @@ from app.services.log_service import log_poll_loop
 from app.services.nightly_review_service import nightly_loop
 from app.services.rules_engine import rules_loop
 from app.services.autonomy_service import autofix_loop, job_watchdog_loop
+from app.services.incident_team_service import incident_loop
 
 logging.basicConfig(
     level=logging.INFO,
@@ -102,6 +103,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(nightly_loop())
     asyncio.create_task(autofix_loop())
     asyncio.create_task(job_watchdog_loop())
+    asyncio.create_task(incident_loop())
     asyncio.create_task(droplet_docker_loop())
     asyncio.create_task(local_host_loop())
     asyncio.create_task(_auto_purge_loop())
@@ -160,6 +162,7 @@ app.include_router(webhook.router, prefix="/api")
 app.include_router(restore.router, prefix="/api")
 app.include_router(nightly.router, prefix="/api")
 app.include_router(autonomy.router, prefix="/api")
+app.include_router(incident_team.router, prefix="/api")
 
 
 @app.get("/api/ping")

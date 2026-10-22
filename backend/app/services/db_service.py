@@ -4,6 +4,7 @@ Errors are grouped by fingerprint (service + level + message hash) like Sentry.
 """
 import aiosqlite
 import hashlib
+import json
 import os
 import statistics
 from pathlib import Path
@@ -25,6 +26,23 @@ def _fingerprint(service_id: str, level: str, message: str) -> str:
     msg = re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', 'UUID', msg)
     key = f"{service_id}:{level}:{msg}"
     return hashlib.md5(key.encode()).hexdigest()
+
+
+def _occurrence_context(event: ErrorEvent, ingest_identity=None) -> str:
+    from app.services.secret_redaction import redact
+    from app.services.ingest_identity import VerifiedIngestIdentity, scope_identifier
+    try:
+        tags = json.loads(event.tags or "{}")
+        tenant = tags.get("tenant_id") if isinstance(tags, dict) else None
+    except (ValueError, TypeError):
+        tenant = None
+    scope = {key: scope_identifier(value) for key, value in {
+        "service_id": event.service_id, "source": event.source, "environment": event.environment,
+        "release": event.release, "tenant_id": tenant}.items()}
+    identity = ingest_identity.bind(scope) if isinstance(ingest_identity, VerifiedIngestIdentity) else None
+    return json.dumps({**scope, "ingest_identity": identity,
+                       "message": redact(event.message),
+                       "level": event.level if event.level in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"} else "UNKNOWN"})
 
 
 async def init_db():
@@ -238,6 +256,8 @@ async def init_db():
             )
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_events(entity_type, entity_id)")
+        from app.services.incident_team_service import SCHEMA
+        await db.executescript(SCHEMA)
         async with db.execute("PRAGMA table_info(alert_queue)") as cursor:
             queue_columns = {row[1] for row in await cursor.fetchall()}
         if "delivery_uncertain" not in queue_columns:
@@ -250,6 +270,7 @@ async def init_db():
             "ALTER TABLE issues ADD COLUMN environment TEXT",
             "ALTER TABLE issues ADD COLUMN release TEXT",
             "ALTER TABLE occurrences ADD COLUMN breadcrumbs TEXT",
+            "ALTER TABLE occurrences ADD COLUMN context TEXT",
             "ALTER TABLE ai_jobs ADD COLUMN repo_id TEXT",
             "ALTER TABLE ai_jobs ADD COLUMN sandbox_path TEXT",
             "ALTER TABLE ai_jobs ADD COLUMN base_branch TEXT",
@@ -272,7 +293,7 @@ async def init_db():
 # ── Issues / occurrences ─────────────────────────────────────────────────────
 
 
-async def upsert_event(event: ErrorEvent) -> Tuple[int, bool, bool]:
+async def upsert_event(event: ErrorEvent, *, ingest_identity=None) -> Tuple[int, bool, bool]:
     """
     Insert or update an issue by fingerprint.
     Returns (issue_id, is_new, is_regression).
@@ -341,9 +362,10 @@ async def upsert_event(event: ErrorEvent) -> Tuple[int, bool, bool]:
 
         # Always log raw occurrence (breadcrumbs passed separately via insert_occurrence)
         await db.execute(
-            """INSERT INTO occurrences (issue_id, timestamp, url, user_info, detail, traceback)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (issue_id, ts, event.url, event.user_info, event.detail, event.traceback),
+            """INSERT INTO occurrences (issue_id, timestamp, url, user_info, detail, traceback, context)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (issue_id, ts, event.url, event.user_info, event.detail, event.traceback,
+             _occurrence_context(event, ingest_identity)),
         )
         await db.commit()
         return issue_id, is_new, is_regression
@@ -917,7 +939,7 @@ async def get_open_ai_job_for_issue(issue_id: int) -> Optional[dict]:
         db.row_factory = aiosqlite.Row
         row = await (await db.execute(
             """SELECT * FROM ai_jobs
-               WHERE issue_id = ? AND status IN ('pending', 'running', 'verified', 'completed')
+               WHERE issue_id = ? AND status IN ('pending', 'running', 'verified', 'completed', 'promoted')
                ORDER BY id DESC LIMIT 1""",
             (issue_id,),
         )).fetchone()
