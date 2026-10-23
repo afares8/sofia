@@ -2596,3 +2596,178 @@ def test_default_spawn_worker_starts_minimized_console(monkeypatch, tmp_path):
         assert si.wShowWindow == bridge.SW_SHOWMINNOACTIVE
     else:
         assert kwargs["startupinfo"] is None
+
+
+def test_session_load_suppresses_history_replay(env):
+    class ReplayOnLoadProc(FakeAcpProc):
+        def _handle(self, msg):
+            if msg.get("method") == "session/load":
+                sid = msg["params"]["sessionId"]
+                for i in range(5):
+                    self._write({
+                        "jsonrpc": "2.0", "method": "session/update",
+                        "params": {"sessionId": sid, "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text",
+                                        "text": f"historial viejo {i}\n"}}}})
+                self._write({
+                    "jsonrpc": "2.0", "method": "session/update",
+                    "params": {"sessionId": sid, "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "old-tool", "title": "tool vieja",
+                        "status": "in_progress"}}})
+            super()._handle(msg)
+
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["sessions"]["2026-01-01"] = {"session_id": "sess-hist",
+                                        "initial_prompt_sent": True}
+        st["pending"] = [ev(1, message="nuevo aviso")]
+    agent = ReplayOnLoadProc()
+    worker, wstore, out, _ = make_worker(env, agent=agent, store=store)
+    assert worker.run() == 0
+    val = out.getvalue()
+    assert "historial viejo" not in val
+    assert "tool vieja" not in val
+    log = store.state_dir / "ui-events.jsonl"
+    events = [json.loads(l) for l in
+              log.read_text(encoding="utf-8").splitlines() if l.strip()]
+    msgs = [e for e in events if e["event"] == "agent_message"]
+    assert all("historial viejo" not in m["text"] for m in msgs)
+    assert all(m["event_ids"] == [1] for m in msgs)
+
+
+def test_recycle_does_not_loop_without_turn_or_while_uncertain(env):
+    procs = []
+
+    def factory():
+        p = FakeAcpProc()
+        procs.append(p)
+        return p
+
+    worker, wstore, out, _ = make_worker(
+        env, agent_factory=factory, commit_fn=lambda pid: 8 * 1024 ** 3)
+    assert worker._connect()
+    assert worker._should_recycle_agent() is True
+    assert worker._recycle_agent() is True
+    assert worker._should_recycle_agent() is False
+    with wstore.transaction() as st:
+        st["uncertain"] = True
+        st["inflight"] = {"event_ids": [1], "prompt_sent": True,
+                          "uncertain": True, "use_initial": False,
+                          "day": "2026-01-01", "stop_reason": None}
+    worker._recycled_since_turn = False
+    assert worker._should_recycle_agent() is False
+
+
+def test_poll_once_dedups_when_queue_at_max_pending_and_preserves_uncertain(env):
+    w, store, _ = make_watcher(env)
+    w.poll_once()
+    issue_id, _ = add_occurrence(env.db, level="ERROR", message="repetido")
+    for _ in range(5):
+        add_occurrence_for_issue(env.db, issue_id)
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["cursor"] = 1
+        st["pending"] = [ev(1)] + [
+            ev(10_000 + i) for i in range(bridge.MAX_PENDING - 1)]
+        st["pending"][0]["issue_id"] = issue_id
+        st["uncertain"] = True
+        st["status"] = "uncertain"
+        st["last_error"] = "entrega incierta; /reintentar manual"
+    res = w.poll_once()
+    st = store.load()
+    assert res["deduped"] == 5
+    assert st["cursor"] == 6
+    assert st["pending"][0]["duplicates"] == 5
+    assert st["status"] == "uncertain"
+    assert "entrega incierta" in (st["last_error"] or "")
+
+
+def test_pending_full_self_heals_and_health_ok_while_worker_alive(env):
+    alive = {"v": True}
+    w, store, _ = make_watcher(env, is_worker_alive=lambda g: alive["v"])
+    w.poll_once()
+    w._last_poll_at = w.now()
+    with store.transaction() as st:
+        st["status"] = "pending_full"
+        st["last_error"] = "cola llena; cursor detenido"
+        st["pending"] = [ev(i) for i in range(1, bridge.MAX_PENDING + 1)]
+    payload, code = w.health_snapshot()
+    assert code == 200 and payload["ok"] is True
+    assert payload["status"] == "pending_full"
+    alive["v"] = False
+    payload2, code2 = w.health_snapshot()
+    assert code2 == 503 and payload2["ok"] is False
+    with store.transaction() as st:
+        st["pending"] = [ev(1)]
+    w.poll_once()
+    st = store.load()
+    assert st["status"] == "ok" and st["last_error"] is None
+
+
+def test_occurrence_source_retries_transient_sqlite_error(env, monkeypatch):
+    source = bridge.OccurrenceSource(
+        env.db, env.policy["_occurrences_sql"], env.policy["_highwater_sql"])
+    add_occurrence(env.db, level="ERROR", message="transient")
+    real_connect = source._connect
+    calls = {"n": 0}
+
+    def flaky_connect():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_connect()
+
+    monkeypatch.setattr(source, "_connect", flaky_connect)
+    assert source.highwater() == 1
+    assert calls["n"] == 2
+
+
+def test_uncertain_idle_parks_agent_and_reintentar_reconnects(env):
+    env.policy["idle_close_minutes"] = 0.001
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["pending"] = [ev(1, message="incierto")]
+        st["inflight"] = {"event_ids": [1], "prompt_sent": True,
+                          "uncertain": True, "use_initial": False,
+                          "day": "2026-01-01", "stop_reason": None}
+        st["uncertain"] = True
+        st["status"] = "uncertain"
+        st["sessions"]["2026-01-01"] = {"session_id": "sess-park",
+                                        "initial_prompt_sent": True}
+    procs = []
+
+    def factory():
+        p = FakeAcpProc()
+        procs.append(p)
+        return p
+
+    q = queue.Queue()
+    out = io.StringIO()
+    worker = bridge.ConsoleWorker(
+        env.policy, "local", "2026-01-01", store,
+        spawn_agent=lambda e, m, c: factory(), stdin_queue=q, stdout=out,
+        poll_state_seconds=0.02, today=lambda: "2026-01-01",
+        verify_elevation_fn=lambda c: None,
+        mutex_factory=lambda n: bridge.HeldMutex(
+            "Local\\T8-" + os.urandom(6).hex()),
+        auth_fn=lambda e: True, title_fn=lambda t: None)
+    t = threading.Thread(target=worker.run, daemon=True)
+    t.start()
+    for _ in range(200):
+        if "liberar memoria" in out.getvalue():
+            break
+        time.sleep(0.02)
+    assert worker._transport is None
+    q.put("/reintentar")
+    q.put(None)
+    t.join(20)
+    assert not t.is_alive()
+    assert len(procs) == 2
+    st = store.load()
+    assert st["uncertain"] is False and st["completed"] == [1]
+
+

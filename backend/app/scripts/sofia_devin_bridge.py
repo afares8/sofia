@@ -44,11 +44,14 @@ DEFAULT_POLICY_DIR = REPO_ROOT / ".devin" / "sofia-cli"
 STATE_VERSION = 1
 MAX_PENDING = 500
 CONTROL_RPC_TIMEOUT = 60
+SESSION_LOAD_TIMEOUT = 180
 PROMPT_RESPONSE_WAIT = 24 * 3600
 STATE_POLL_SECONDS = 5.0
 MAX_SPAWN_FAILURES = 5
 SPAWN_GRACE_SECONDS = 15.0
 MAX_COMPLETED = 1000
+SQLITE_READ_ATTEMPTS = 3
+SQLITE_READ_DELAY = 0.15
 # Ventana de acumulacion: tras el primer aviso nuevo se espera este tiempo
 # (policy: batch_hold_seconds) antes de mandar el lote a Devin, para que una
 # rafaga de eventos relacionados llegue en UN solo reporte en vez de varios.
@@ -229,33 +232,49 @@ class OccurrenceSource:
         conn.execute("PRAGMA query_only=ON")
         return conn
 
+    def _with_retry(self, fn):
+        last_exc: Optional[Exception] = None
+        for attempt in range(SQLITE_READ_ATTEMPTS):
+            try:
+                return fn()
+            except sqlite3.OperationalError as exc:
+                last_exc = exc
+                if attempt + 1 < SQLITE_READ_ATTEMPTS:
+                    time.sleep(SQLITE_READ_DELAY * (attempt + 1))
+        assert last_exc is not None
+        raise last_exc
+
     def highwater(self) -> int:
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN")
-            row = conn.execute(self._hw_sql).fetchone()
-            return int(row[0] or 0)
-        finally:
-            conn.close()
+        def _op() -> int:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN")
+                row = conn.execute(self._hw_sql).fetchone()
+                return int(row[0] or 0)
+            finally:
+                conn.close()
+        return self._with_retry(_op)
 
     def fetch(self, after_id: int, batch_size: int) -> List[Dict[str, Any]]:
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN")
-            cur = conn.execute(
-                self._occ_sql,
-                {"after_id": int(after_id), "batch_size": int(batch_size)})
-            cols = {d[0] for d in cur.description or []}
-            if not self._validated:
-                missing = EXPECTED_OCCURRENCE_COLUMNS - cols
-                if missing:
-                    raise BridgeError(
-                        f"esquema occurrences inesperado, faltan: {sorted(missing)}")
-                self._validated = True
-            names = [d[0] for d in cur.description]
-            return [dict(zip(names, r)) for r in cur.fetchall()]
-        finally:
-            conn.close()
+        def _op() -> List[Dict[str, Any]]:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN")
+                cur = conn.execute(
+                    self._occ_sql,
+                    {"after_id": int(after_id), "batch_size": int(batch_size)})
+                cols = {d[0] for d in cur.description or []}
+                if not self._validated:
+                    missing = EXPECTED_OCCURRENCE_COLUMNS - cols
+                    if missing:
+                        raise BridgeError(
+                            f"esquema occurrences inesperado, faltan: {sorted(missing)}")
+                    self._validated = True
+                names = [d[0] for d in cur.description]
+                return [dict(zip(names, r)) for r in cur.fetchall()]
+            finally:
+                conn.close()
+        return self._with_retry(_op)
 
 
 def _initial_state() -> Dict[str, Any]:
@@ -609,7 +628,8 @@ def event_from_row(row: Dict[str, Any], received_day: str) -> Dict[str, Any]:
 
 
 def find_pending_duplicate(pending: List[Dict[str, Any]],
-                           ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                           ev: Dict[str, Any],
+                           exclude_ids: Optional[set] = None) -> Optional[Dict[str, Any]]:
     """Busca en la cola un evento del MISMO issue (misma familia de error).
 
     Una rafaga de lineas del mismo problema crea varias occurrences del mismo
@@ -621,6 +641,8 @@ def find_pending_duplicate(pending: List[Dict[str, Any]],
     if issue_id is None:
         return None
     for e in pending:
+        if exclude_ids and e.get("occurrence_id") in exclude_ids:
+            continue
         if e.get("issue_id") == issue_id:
             return e
     return None
@@ -1033,7 +1055,9 @@ class AcpSession:
 
     def load_session(self, session_id: str, cwd: str) -> str:
         result = self.transport.request("session/load", {
-            "sessionId": session_id, "cwd": cwd, "mcpServers": []})
+            "sessionId": session_id, "cwd": cwd, "mcpServers": []},
+            timeout=max(CONTROL_RPC_TIMEOUT, SESSION_LOAD_TIMEOUT),
+            idle_timeout=CONTROL_RPC_TIMEOUT)
         sid = str((result or {}).get("sessionId") or session_id)
         self.session_info[sid] = result or {}
         return sid
@@ -1171,19 +1195,25 @@ class Watcher:
         age = None if self._last_poll_at is None else self.now() - self._last_poll_at
         stale = age is None or age > HEALTH_STALE_SECONDS
         status = state.get("status")
-        ok = not stale and status == "ok"
+        worker_ok = bool(self.is_worker_alive(self.group))
+        blocked = bool(state.get("paused") or state.get("uncertain")
+                       or state.get("circuit_open")
+                       or state.get("source_reset"))
+        ok = not stale and not blocked and (
+            status == "ok" or (status == "pending_full" and worker_ok))
         return ({
             "ok": ok,
             "group": self.group,
             "last_poll_age_seconds": None if age is None else round(age, 1),
             "status": status,
-            "worker_alive": bool(self.is_worker_alive(self.group)),
+            "worker_alive": worker_ok,
             "pending": len(state.get("pending") or []),
         }, (200 if ok else 503))
 
     def poll_once(self) -> Dict[str, Any]:
         decision: Dict[str, Any] = {"spawn_day": None, "queued": 0,
-                                    "deduped": 0, "early": None}
+                                    "deduped": 0, "has_more": False,
+                                    "early": None}
         with self.store.transaction() as state:
             self._account_locked(state)
             if state["source_reset"]:
@@ -1196,8 +1226,9 @@ class Watcher:
                                      "queued": 0}
             else:
                 cursor = int(state["cursor"])
-                rows = self.source.fetch(
-                    cursor, int(self.policy.get("batch_size", 50)))
+                batch_limit = int(self.policy.get("batch_size", 50))
+                rows = self.source.fetch(cursor, batch_limit)
+                hit_pending_full = False
                 if not rows:
                     max_id = self.source.highwater()
                     if 0 < max_id < cursor:
@@ -1212,22 +1243,25 @@ class Watcher:
                     day = self.today()
                     had_pending = bool(state["pending"])
                     handled_last = cursor
+                    inflight_ids = set(
+                        (state.get("inflight") or {}).get("event_ids") or [])
                     for row in rows:
                         rid = int(row["occurrence_id"])
                         if route_event(self.policy, row) == self.group:
-                            if len(state["pending"]) >= MAX_PENDING:
-                                state["status"] = "pending_full"
-                                state["status_at"] = self.now()
-                                state["last_error"] = \
-                                    "cola llena; cursor detenido"
-                                break
                             ev = event_from_row(row, day)
                             duplicate = find_pending_duplicate(
-                                state["pending"], ev)
+                                state["pending"], ev, exclude_ids=inflight_ids)
                             if duplicate is not None:
                                 duplicate["duplicates"] = int(
                                     duplicate.get("duplicates") or 0) + 1
                                 decision["deduped"] += 1
+                            elif len(state["pending"]) >= MAX_PENDING:
+                                state["status"] = "pending_full"
+                                state["status_at"] = self.now()
+                                state["last_error"] = \
+                                    "cola llena; cursor detenido"
+                                hit_pending_full = True
+                                break
                             else:
                                 state["pending"].append(ev)
                                 decision["queued"] += 1
@@ -1235,20 +1269,38 @@ class Watcher:
                     state["cursor"] = handled_last
                     if decision["queued"]:
                         state["paused"] = False
+                        state["pause_cursor"] = 0
                         self._arm_hold_locked(state, had_pending)
-                        if not state["circuit_open"] and (
+                        if state["uncertain"]:
+                            if state["status"] in ("ok", "paused"):
+                                state["status"] = "uncertain"
+                        elif not state["circuit_open"] and (
                                 state["status"] != "pending_full" or
                                 len(state["pending"]) < MAX_PENDING):
                             state["status"] = "ok"
                             state["last_error"] = None
+                    if (len(rows) >= batch_limit and not hit_pending_full
+                            and len(state["pending"]) < MAX_PENDING
+                            and not state["circuit_open"]):
+                        decision["has_more"] = True
                 if decision["early"] is None:
+                    if (not hit_pending_full
+                            and state["status"] == "pending_full"
+                            and len(state["pending"]) < MAX_PENDING
+                            and not state["circuit_open"]):
+                        state["status"] = (
+                            "uncertain" if state["uncertain"] else "ok")
+                        state["status_at"] = self.now()
+                        if not state["uncertain"]:
+                            state["last_error"] = None
                     self._heal_stale_pause_locked(state)
                     decision["spawn_day"] = self._spawn_day_locked(state)
         if decision["early"] is not None:
             return decision["early"]
         self._maybe_spawn(decision.get("spawn_day"))
         return {"status": "ok", "queued": decision["queued"],
-                "deduped": decision["deduped"]}
+                "deduped": decision["deduped"],
+                "has_more": decision["has_more"]}
 
     def _hold_seconds(self) -> float:
         try:
@@ -1287,9 +1339,10 @@ class Watcher:
                for e in state["pending"]):
             state["paused"] = False
             state["pause_cursor"] = 0
-            state["status"] = "ok"
+            state["status"] = "uncertain" if state["uncertain"] else "ok"
             state["status_at"] = self.now()
-            state["last_error"] = None
+            if not state["uncertain"]:
+                state["last_error"] = None
 
     def _spawn_day_locked(self, state) -> Optional[str]:
         if not state["pending"] or state["paused"] or state["circuit_open"]:
@@ -1396,9 +1449,11 @@ class Watcher:
                          f"port {port}")
         cycles = 0
         while True:
+            has_more = False
             try:
                 result = self.poll_once()
                 self._last_poll_at = self.now()
+                has_more = bool(result.get("has_more"))
                 if result.get("status") not in ("idle", "ok"):
                     self.log(f"[watcher {self.group}] {result}")
             except (StateError, BridgeError) as exc:
@@ -1409,7 +1464,7 @@ class Watcher:
             cycles += 1
             if max_cycles is not None and cycles >= max_cycles:
                 return
-            sleep(interval)
+            sleep(min(0.05, interval) if has_more else interval)
 
 
 HELP_TEXT = (
@@ -1480,6 +1535,8 @@ class ConsoleWorker:
         self._ui_logger = None
         self._effective_mode: Optional[str] = None
         self._stall_retries = 0
+        self._loading_session = False
+        self._recycled_since_turn = False
 
     def _print(self, text: str = "") -> None:
         try:
@@ -1622,6 +1679,8 @@ class ConsoleWorker:
 
     def _on_notification(self, msg: Dict[str, Any]) -> None:
         if msg.get("method") != "session/update":
+            return
+        if self._loading_session or not self._turn_active:
             return
         update = (msg.get("params") or {}).get("update") or {}
         kind = update.get("sessionUpdate") or update.get("type") or ""
@@ -1999,6 +2058,8 @@ class ConsoleWorker:
         """True si el ACP inactivo retiene mas commit que el limite."""
         if self._turn_active or self._permission_pending.is_set():
             return False
+        if self._recycled_since_turn or self._has_inflight_work():
+            return False
         if self._transport is None or self._transport.closed:
             return False
         pid = getattr(self._transport._proc, "pid", None)
@@ -2018,6 +2079,7 @@ class ConsoleWorker:
             self._print("*** No se pudo reciclar el agente; la sesion "
                         "sigue guardada. ***")
             return False
+        self._recycled_since_turn = True
         return True
 
     def _ensure_session(self) -> Optional[str]:
@@ -2034,12 +2096,15 @@ class ConsoleWorker:
                             "recuperacion manual requerida.")
                 return None
             try:
+                self._loading_session = True
                 new_sid = self._session.load_session(sid, cwd)
             except Exception as exc:
                 self._mark_status("manual_gap", f"session/load fallo: {exc}")
                 self._print("Fallo la reanudacion; no se crea reemplazo "
                             "automatico.")
                 return None
+            finally:
+                self._loading_session = False
             with self.store.transaction() as st:
                 st["sessions"][self.day] = {
                     "session_id": new_sid,
@@ -2096,6 +2161,7 @@ class ConsoleWorker:
                 if state["inflight"]:
                     state["inflight"]["prompt_sent"] = True
             self._turn_active = True
+            self._recycled_since_turn = False
             result = self._session.prompt(
                 self._session_id, text, idle_timeout=self._stall_seconds())
         except AcpStallError as exc:
@@ -2160,15 +2226,18 @@ class ConsoleWorker:
         return True
 
     def _inflight_failed(self, exc: Exception) -> None:
+        detail = redact_text(exc)[:200]
         with self.store.transaction() as state:
             if state["inflight"] and state["inflight"].get("prompt_sent"):
                 state["uncertain"] = True
                 state["inflight"]["uncertain"] = True
                 state["status"] = "uncertain"
                 state["status_at"] = self.now()
-                state["last_error"] = "entrega incierta; /reintentar manual"
-                self._print("\n*** Entrega incierta: el agente no confirmo el "
-                            "turno. NO se reenvia automaticamente. "
+                state["last_error"] = (
+                    f"entrega incierta ({detail}); /reintentar manual"
+                    if detail else "entrega incierta; /reintentar manual")
+                self._print(f"\n*** Entrega incierta ({detail}): el agente no "
+                            "confirmo el turno. NO se reenvia automaticamente. "
                             "Usa /reintentar. ***")
             else:
                 state["inflight"] = None
@@ -2332,6 +2401,7 @@ class ConsoleWorker:
             stalled = False
             try:
                 self._turn_active = True
+                self._recycled_since_turn = False
                 self._print("\n--- Tu mensaje a Devin ---")
                 result = self._session.prompt(
                     self._session_id, line, idle_timeout=self._stall_seconds())
@@ -2489,15 +2559,25 @@ class ConsoleWorker:
                         last_activity = time.time()
                         continue
                 idle = self._idle_close_seconds()
-                if idle > 0 and not self._has_open_work() \
-                        and time.time() - last_activity >= idle:
-                    self._print(f"\nSin reportes nuevos hace "
-                                f"{int(idle // 60)} min; cierro esta consola. "
-                                "Se reabre sola cuando Sofia registre un aviso "
-                                "nuevo.")
-                    self._ui_event("idle_close")
-                    self._mark_clean_exit()
-                    break
+                if idle > 0 and time.time() - last_activity >= idle:
+                    if not self._has_open_work():
+                        self._print(f"\nSin reportes nuevos hace "
+                                    f"{int(idle // 60)} min; cierro esta consola. "
+                                    "Se reabre sola cuando Sofia registre un aviso "
+                                    "nuevo.")
+                        self._ui_event("idle_close")
+                        self._mark_clean_exit()
+                        break
+                    if (not self._turn_active and self._has_inflight_work()
+                            and self._transport is not None
+                            and not self._transport.closed):
+                        self._print(f"\nLote incierto sin actividad hace "
+                                    f"{int(idle // 60)} min; cierro el proceso "
+                                    "de Devin en segundo plano para liberar "
+                                    "memoria (se reconecta con /reintentar).")
+                        self._ui_event("idle_agent_parked")
+                        self._close_transport()
+                        self._disconnect_notified = True
                 time.sleep(self.poll_state_seconds)
             if self._stop.is_set():
                 try:
