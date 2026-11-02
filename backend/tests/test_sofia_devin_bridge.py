@@ -98,6 +98,14 @@ def env(tmp_path):
     # La ventana de acumulacion (espera de 1 min) se prueba en sus propios
     # tests con reloj controlado; el resto corre sin espera.
     policy["batch_hold_seconds"] = 0
+    # Base de tests: ERROR en tiempo real y sin digest forzado. Los tests del
+    # modo horario (WARNING+ERROR, sesion nueva por digest) lo activan aparte.
+    policy["digest_levels"] = ["WARNING"]
+    policy["digest_minutes"] = 60
+    policy["digest_fresh_session"] = False
+    policy["digest_force"] = False
+    # Los tests de mute cargan sus propias reglas; no heredar las de produccion.
+    policy["mute_rules"] = []
     policy.pop("health_ports", None)  # no abrir puertos reales en tests
     (policy_dir / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
     loaded = bridge.load_policy(policy_dir)
@@ -141,7 +149,9 @@ class FakeAcpProc:
                  die_on_prompt=False, load_error=None, init_error=None,
                  stop_reason="end_turn", init_protocol=1,
                  mode_value="accept-edits", mode_reject=False,
-                 mode_ack_mismatch=False, mode_option_missing=False):
+                 mode_ack_mismatch=False, mode_option_missing=False,
+                 model_value="deepseek-v4-1-flash-high",
+                 model_option_missing=False):
         self.load_session_supported = load_session
         self.hold_prompt = hold_prompt
         self.prompt_hook = prompt_hook
@@ -154,6 +164,8 @@ class FakeAcpProc:
         self.mode_reject = mode_reject
         self.mode_ack_mismatch = mode_ack_mismatch
         self.mode_option_missing = mode_option_missing
+        self.model_value = model_value
+        self.model_option_missing = model_option_missing
         self._in_r, self._in_w = os.pipe()
         self._out_r, self._out_w = os.pipe()
         self._err_r, self._err_w = os.pipe()
@@ -249,6 +261,11 @@ class FakeAcpProc:
                             "accept-edits", "smart", "bypass"):
                 self.mode_value = params["value"] \
                     if not self.mode_ack_mismatch else "accept-edits"
+            if params.get("configId") == "model" \
+                    and params.get("value") in (
+                            "deepseek-v4-1-flash-high", "adaptive",
+                            "swe-2-high"):
+                self.model_value = params["value"]
             self._write({"jsonrpc": "2.0", "id": rid,
                          "result": {
                              "configOptions": self._config_options()}})
@@ -275,6 +292,15 @@ class FakeAcpProc:
                     {"value": "ask", "name": "Ask"},
                     {"value": "plan", "name": "Plan"},
                     {"value": "bypass", "name": "Bypass Permissions"}]})
+        if not self.model_option_missing:
+            opts.append({
+                "id": "model", "name": "Model", "category": "model",
+                "type": "select", "currentValue": self.model_value,
+                "options": [
+                    {"value": "deepseek-v4-1-flash-high",
+                     "name": "DeepSeek V4.1 Flash High"},
+                    {"value": "adaptive", "name": "Adaptive"},
+                    {"value": "swe-2-high", "name": "SWE-2"}]})
         return opts
 
     def _session_result(self, sid):
@@ -719,31 +745,178 @@ def test_state_transaction_multiprocess(env):
     assert store.load()["cursor"] == 3
 
 
-def test_pending_full_exactly_once(env):
+def test_pending_full_never_freezes_cursor(env):
+    """La cola llena ya no congela el cursor: un CRITICAL nuevo siempre entra."""
     w, store, _ = make_watcher(env)
     w.poll_once()
     with store.transaction() as st:
-        st["pending"] = [ev(10_000 + i) for i in range(bridge.MAX_PENDING)]
-    for i in range(60):
-        add_occurrence(env.db, level="ERROR", message=f"e{i}")
+        st["pending"] = [ev(10_000 + i, level="WARNING")
+                         for i in range(bridge.MAX_PENDING)]
+    add_occurrence(env.db, level="CRITICAL", message="packing down")
+    res = w.poll_once()
+    st = store.load()
+    assert res["queued"] == 1
+    assert st["cursor"] == 1
+    assert any(e["level"] == "CRITICAL" for e in st["pending"])
+    assert len(st["pending"]) == bridge.MAX_PENDING
+    assert st["dropped"] == 1
+
+
+def test_pending_full_drops_noise_but_advances(env):
+    """Con la cola llena de ERROR, un WARNING nuevo se descarta (no bloquea)."""
+    w, store, _ = make_watcher(env)
+    w.poll_once()
+    with store.transaction() as st:
+        st["pending"] = [ev(10_000 + i, level="ERROR")
+                         for i in range(bridge.MAX_PENDING)]
+    add_occurrence(env.db, level="WARNING", message="ruido de vision")
     res = w.poll_once()
     st = store.load()
     assert res["queued"] == 0
-    assert st["status"] == "pending_full"
-    assert st["cursor"] == 0
+    assert res["dropped"] == 1
+    assert st["cursor"] == 1
+    assert len(st["pending"]) == bridge.MAX_PENDING
+    assert not any(e["message"] == "ruido de vision" for e in st["pending"])
+
+
+def test_pending_hard_cap_still_admits_critical(env):
+    w, store, _ = make_watcher(env)
+    w.poll_once()
     with store.transaction() as st:
-        st["pending"] = st["pending"][:100]
+        st["pending"] = [ev(10_000 + i, level="CRITICAL")
+                         for i in range(bridge.MAX_PENDING_HARD)]
+    add_occurrence(env.db, level="CRITICAL", message="critico nuevo")
     res = w.poll_once()
     st = store.load()
-    assert res["queued"] == 50
-    assert st["cursor"] == 50
+    assert res["queued"] == 1
+    assert st["cursor"] == 1
+    assert len(st["pending"]) == bridge.MAX_PENDING_HARD
+    assert any(e["message"] == "critico nuevo" for e in st["pending"])
+
+
+def test_inflight_failed_schedules_retry_ten_minutes(env):
+    w, store, _ = make_watcher(env)
+    worker, store, out, _ = make_worker(env)
     with store.transaction() as st:
-        st["pending"] = []
+        st["inflight"] = {
+            "event_ids": [1], "prompt_sent": True, "uncertain": False,
+            "use_initial": False, "day": "2026-01-01", "stop_reason": None}
+    worker._inflight_failed(RuntimeError("ACP error -32011: quota"))
+    st = store.load()
+    assert st["uncertain"] is True
+    assert st["retry_attempts"] == 1
+    assert st["retry_after"] == pytest.approx(worker.now() + 600.0)
+    assert "reintento automatico" in (st["last_error"] or "")
+
+
+def test_maybe_auto_retry_respects_retry_after(env):
+    w, store, _ = make_watcher(env)
+    worker, store, out, _ = make_worker(env)
+    with store.transaction() as st:
+        st["uncertain"] = True
+        st["inflight"] = {
+            "event_ids": [1], "prompt_sent": True, "uncertain": True,
+            "use_initial": False, "day": "2026-01-01", "stop_reason": None}
+        st["retry_attempts"] = 1
+        st["retry_after"] = worker.now() + 600.0
+    calls = []
+    worker._connect = lambda: True
+    worker._retry_inflight = lambda: calls.append(1)
+    assert worker._maybe_auto_retry() is False
+    with store.transaction() as st:
+        st["retry_after"] = worker.now() - 1.0
+    assert worker._maybe_auto_retry() is True
+    assert calls == [1]
+
+
+def test_escalation_after_three_attempts_once(env):
+    sent = []
+
+    class Sender:
+        def send(self, payload):
+            sent.append(payload)
+            return True
+
+    w, store, _ = make_watcher(env, alert_sender=Sender())
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["uncertain"] = True
+        st["inflight"] = {
+            "event_ids": [1], "prompt_sent": True, "uncertain": True,
+            "use_initial": False, "day": "2026-01-01", "stop_reason": None}
+        st["retry_attempts"] = 3
+    w.poll_once()
+    assert len(sent) == 1
+    assert sent[0]["group"] == "local"
+    assert sent[0]["attempts"] == 3
+    w.poll_once()
+    assert len(sent) == 1  # respeta la ventana de repeticion
+
+
+def test_escalation_not_sent_before_threshold(env):
+    sent = []
+
+    class Sender:
+        def send(self, payload):
+            sent.append(payload)
+            return True
+
+    w, store, _ = make_watcher(env, alert_sender=Sender())
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["uncertain"] = True
+        st["inflight"] = {
+            "event_ids": [1], "prompt_sent": True, "uncertain": True,
+            "use_initial": False, "day": "2026-01-01", "stop_reason": None}
+        st["retry_attempts"] = 2
+    w.poll_once()
+    assert sent == []
+
+
+def test_escalation_failure_retries_in_ten_minutes(env):
+    class Sender:
+        def send(self, payload):
+            return False
+
+    w, store, _ = make_watcher(env, alert_sender=Sender())
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["uncertain"] = True
+        st["inflight"] = {
+            "event_ids": [1], "prompt_sent": True, "uncertain": True,
+            "use_initial": False, "day": "2026-01-01", "stop_reason": None}
+        st["retry_attempts"] = 3
     w.poll_once()
     st = store.load()
-    assert st["cursor"] == 60
-    assert len([e for e in st["pending"]]) == 10
-    assert sorted(e["occurrence_id"] for e in st["pending"]) == list(range(51, 61))
+    assert st["escalated_at"] == pytest.approx(
+        w.now() - w._escalation_repeat() + 600.0)
+
+
+def test_take_pending_events_prioritizes_critical(env):
+    w, store, _ = make_watcher(env)
+    worker, store, out, _ = make_worker(env)
+    with store.transaction() as st:
+        st["pending"] = [ev(1, level="WARNING"), ev(2, level="ERROR"),
+                         ev(3, level="CRITICAL"), ev(4, level="WARNING")]
+    events = worker._take_pending_events()
+    assert [e["occurrence_id"] for e in events] == [3, 2, 1, 4]
+
+
+def test_state_without_new_retry_keys_loads(env):
+    w, store, _ = make_watcher(env)
+    with store.transaction() as st:
+        st["initialized"] = True
+    raw = json.loads((env.state_root / "local" / "state.json").read_text("utf-8"))
+    for key in ("retry_attempts", "retry_after", "escalated_at",
+                "escalation_count", "dropped"):
+        raw.pop(key, None)
+    (env.state_root / "local" / "state.json").write_text(
+        json.dumps(raw), encoding="utf-8")
+    st = store.load()
+    assert st["retry_attempts"] == 0
+    assert st["retry_after"] == 0.0
+    assert st["escalated_at"] == 0.0
+    assert st["dropped"] == 0
 
 
 def test_rollover_day_routing(env):
@@ -1174,6 +1347,7 @@ def test_uncertain_retry_reconnects_same_session(env):
                           "uncertain": True, "use_initial": False,
                           "day": "2026-01-01", "stop_reason": None}
         st["uncertain"] = True
+        st["retry_after"] = time.time() + 600.0
         st["sessions"]["2026-01-01"] = {"session_id": "sess-77",
                                         "initial_prompt_sent": True}
     agent1 = FakeAcpProc()
@@ -2736,6 +2910,7 @@ def test_uncertain_idle_parks_agent_and_reintentar_reconnects(env):
                           "day": "2026-01-01", "stop_reason": None}
         st["uncertain"] = True
         st["status"] = "uncertain"
+        st["retry_after"] = time.time() + 600.0
         st["sessions"]["2026-01-01"] = {"session_id": "sess-park",
                                         "initial_prompt_sent": True}
     procs = []
@@ -2757,7 +2932,7 @@ def test_uncertain_idle_parks_agent_and_reintentar_reconnects(env):
         auth_fn=lambda e: True, title_fn=lambda t: None)
     t = threading.Thread(target=worker.run, daemon=True)
     t.start()
-    for _ in range(200):
+    for _ in range(500):
         if "liberar memoria" in out.getvalue():
             break
         time.sleep(0.02)
@@ -2771,3 +2946,362 @@ def test_uncertain_idle_parks_agent_and_reintentar_reconnects(env):
     assert st["uncertain"] is False and st["completed"] == [1]
 
 
+
+
+def test_repeated_warning_signature_suppressed_after_send(env):
+    """Un WARNING de la misma firma que ya se envio no vuelve al CLI."""
+    env.policy["digest_minutes"] = 0
+    w, store, _ = make_watcher(env, now=lambda: time.time())
+    w.poll_once()
+    add_occurrence(
+        env.db, service_id="vision", service_name="Vision", level="WARNING",
+        message="slow request POST /api/cameras/928/register-stream "
+                "-> 200 in 4101 ms")
+    assert w.poll_once()["queued"] == 1
+    worker, _, _, _ = make_worker(env)
+    assert worker.run() == 0
+    st = store.load()
+    assert st["pending"] == [] and st["sig_sent"]
+    add_occurrence(
+        env.db, service_id="vision", service_name="Vision", level="WARNING",
+        message="slow request POST /api/cameras/928/register-stream "
+                "-> 200 in 4245 ms")
+    res = w.poll_once()
+    assert res["suppressed"] == 1
+    assert store.load()["pending"] == []
+
+
+def test_repeated_warning_escalates_after_threshold(env):
+    """Cada N ocurrencias suprimidas se deja pasar una recidiva."""
+    env.policy["digest_minutes"] = 0
+    env.policy["repeat_escalate_after"] = 2
+    w, store, _ = make_watcher(env, now=lambda: time.time())
+    w.poll_once()
+    add_occurrence(env.db, service_id="vision", service_name="Vision",
+                   level="WARNING", message="slow request -> 200 in 1000 ms")
+    assert w.poll_once()["queued"] == 1
+    worker, _, _, _ = make_worker(env)
+    assert worker.run() == 0
+    add_occurrence(env.db, service_id="vision", service_name="Vision",
+                   level="WARNING", message="slow request -> 200 in 2000 ms")
+    add_occurrence(env.db, service_id="vision", service_name="Vision",
+                   level="WARNING", message="slow request -> 200 in 3000 ms")
+    res = w.poll_once()
+    assert res["suppressed"] == 1 and res["queued"] == 1
+
+
+def test_repeated_critical_signature_suppressed_with_short_window(env):
+    """Una rafaga de CRITICAL identicos no abre un turno por cada uno."""
+    env.policy["digest_minutes"] = 0
+    env.policy["repeat_suppress_levels"] = ["WARNING", "ERROR", "CRITICAL"]
+    env.policy["repeat_suppress_minutes_by_level"] = {"CRITICAL": 10}
+    w, store, _ = make_watcher(env, now=lambda: time.time())
+    w.poll_once()
+    add_occurrence(env.db, service_id="devin-memory-guard",
+                   service_name="Devin Memory Guard", level="CRITICAL",
+                   message="Sesion Devin cerrada por presion de memoria (PID 100)")
+    assert w.poll_once()["queued"] == 1
+    worker, _, _, _ = make_worker(env)
+    assert worker.run() == 0
+    add_occurrence(env.db, service_id="devin-memory-guard",
+                   service_name="Devin Memory Guard", level="CRITICAL",
+                   message="Sesion Devin cerrada por presion de memoria (PID 200)")
+    add_occurrence(env.db, service_id="devin-memory-guard",
+                   service_name="Devin Memory Guard", level="CRITICAL",
+                   message="Otro critico distinto")
+    res = w.poll_once()
+    assert res["suppressed"] == 1 and res["queued"] == 1
+
+
+def test_mute_rule_drops_new_event_and_counts(env):
+    """Un aviso que cae en mute_rules no se encola ni se manda al CLI."""
+    env.policy["_mute_rules"] = bridge.compile_mute_rules([{
+        "id": "banistmo", "service_id": "mayor",
+        "pattern": "Banistmo file reception failed",
+        "expires_at": "2026-01-31"}])
+    w, store, _ = make_watcher(env)
+    w.poll_once()
+    add_occurrence(env.db, service_id="mayor", service_name="Mayor",
+                   level="WARNING",
+                   message="Banistmo file reception failed (MT942 incompleto)")
+    res = w.poll_once()
+    assert res["muted"] == 1 and res["queued"] == 0
+    st = store.load()
+    assert st["pending"] == [] and st["muted"] == 1
+
+
+def test_mute_rule_sweeps_already_queued_events(env):
+    """Al activar la regla, un aviso ya encolado se retira de la cola."""
+    env.policy["_mute_rules"] = bridge.compile_mute_rules([{
+        "id": "banistmo", "service_id": "mayor",
+        "pattern": "Banistmo file reception failed"}])
+    store = bridge.StateStore(env.state_root / "local")
+    queued = ev(1, level="WARNING",
+                message="Banistmo file reception failed (camt.052)")
+    queued["service_id"] = "mayor"
+    queued["service_name"] = "Mayor"
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["cursor"] = 1
+        st["pending"] = [queued]
+        st["warning_hold_until"] = 2000.0
+    w, _, _ = make_watcher(env)
+    res = w.poll_once()
+    assert res["muted"] == 1
+    st = store.load()
+    assert st["pending"] == [] and st["muted"] == 1
+    assert st["warning_hold_until"] == 0.0
+
+
+def test_mute_rule_keeps_critical_and_other_services(env):
+    """Por defecto la regla no silencia CRITICAL ni otros servicios."""
+    env.policy["_mute_rules"] = bridge.compile_mute_rules([{
+        "id": "banistmo", "service_id": "mayor",
+        "pattern": "Banistmo file reception failed"}])
+    w, store, _ = make_watcher(env)
+    w.poll_once()
+    add_occurrence(env.db, service_id="mayor", service_name="Mayor",
+                   level="CRITICAL",
+                   message="Banistmo file reception failed (CRITICAL)")
+    add_occurrence(env.db, service_id="packing", service_name="Packing",
+                   level="WARNING",
+                   message="Banistmo file reception failed (otro servicio)")
+    res = w.poll_once()
+    assert res["muted"] == 0 and res["queued"] == 2
+
+
+def test_mute_rule_expires(env):
+    """Pasada la fecha, la regla deja de silenciar."""
+    env.policy["_mute_rules"] = bridge.compile_mute_rules([{
+        "id": "banistmo", "service_id": "mayor",
+        "pattern": "Banistmo file reception failed",
+        "expires_at": "2026-01-01"}])
+    w, _, _ = make_watcher(env, today=lambda: "2026-01-02")
+    w.poll_once()
+    add_occurrence(env.db, service_id="mayor", service_name="Mayor",
+                   level="WARNING",
+                   message="Banistmo file reception failed (MT942)")
+    res = w.poll_once()
+    assert res["muted"] == 0 and res["queued"] == 1
+
+
+def test_mute_rule_invalid_regex_fails_closed():
+    with pytest.raises(bridge.BridgeError):
+        bridge.compile_mute_rules([{"pattern": "("}])
+
+
+def test_warning_digest_holds_warnings_until_window(env):
+    """Los WARNING esperan la ventana de digest; CRITICAL/ERROR no."""
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["cursor"] = 1
+        st["pending"] = [ev(1, level="WARNING")]
+        st["warning_hold_until"] = time.time() + 3600
+    worker, _, _, _ = make_worker(env)
+    assert worker._take_pending_events() == []
+    with store.transaction() as st:
+        st["warning_hold_until"] = 0.0
+    assert len(worker._take_pending_events()) == 1
+
+
+def test_critical_bypasses_warning_hold(env):
+    """Un CRITICAL no espera la ventana de acumulacion de WARNINGs."""
+    env.policy["batch_hold_seconds"] = 60
+    clock = {"t": 1000.0}
+    w, store, _ = make_watcher(env, now=lambda: clock["t"])
+    w.poll_once()
+    add_occurrence(env.db, level="WARNING", message="ruido")
+    w.poll_once()
+    assert store.load()["hold_until"] == 1060.0
+    add_occurrence(env.db, level="CRITICAL", message="caido")
+    w.poll_once()
+    st = store.load()
+    assert st["hold_until"] == 0.0
+    assert any(e["level"] == "CRITICAL" for e in st["pending"])
+
+
+def test_worker_rotates_session_after_prompt_limit(env):
+    """Al superar el limite de lotes se abre una sesion nueva con el prompt
+    inicial, para no reenviar todo el historial del dia."""
+    env.policy["session_recycle_prompts"] = 1
+    env.policy["session_recycle_minutes"] = 0
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["cursor"] = 1
+        st["pending"] = [ev(1, message="nuevo", level="ERROR")]
+        st["sessions"]["2026-01-01"] = {
+            "session_id": "sess-old", "initial_prompt_sent": True,
+            "prompts_sent": 1, "started_at": time.time()}
+    agent = FakeAcpProc()
+    worker, _, out, _ = make_worker(env, agent=agent)
+    assert worker.run() == 0
+    methods = [m["method"] for m in agent.received]
+    assert "session/new" in methods
+    prompts = [m for m in agent.received if m["method"] == "session/prompt"]
+    assert len(prompts) == 1
+    assert "Hola, Devin" in prompts[0]["params"]["prompt"][0]["text"]
+    st = store.load()
+    assert st["sessions"]["2026-01-01"]["session_id"] == "sess-1"
+    assert st["sessions"]["2026-01-01"]["initial_prompt_sent"] is True
+    assert "Renuevo la conversación" in out.getvalue()
+
+
+def test_state_without_sig_sent_loads(env):
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["initialized"] = True
+    raw = json.loads(store.path.read_text(encoding="utf-8"))
+    raw.pop("sig_sent", None)
+    raw.pop("warning_hold_until", None)
+    store.path.write_text(json.dumps(raw), encoding="utf-8")
+    st = store.load()
+    assert st["sig_sent"] == {}
+    assert st["warning_hold_until"] == 0.0
+
+
+def test_watcher_does_not_spawn_cli_for_held_warnings(env):
+    """Solo WARNINGs esperando digest: no se abre el CLI hasta la ventana."""
+    w, store, spawns = make_watcher(env)
+    w.poll_once()
+    add_occurrence(env.db, level="WARNING", message="ruido")
+    w.poll_once()
+    assert spawns == []
+    assert store.load()["warning_hold_until"] > 0
+    add_occurrence(env.db, level="CRITICAL", message="caido")
+    w.poll_once()
+    assert spawns == [("local", "2026-01-01")]
+
+
+def test_stale_warning_hold_clears_when_no_warnings(env):
+    """Una ventana de digest vieja no debe frenar el proximo lote."""
+    w, store, _ = make_watcher(env)
+    w.poll_once()
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["warning_hold_until"] = time.time() + 3600
+    w.poll_once()
+    assert store.load()["warning_hold_until"] == 0.0
+
+
+def test_new_warning_batch_resets_stale_hold(env):
+    """El primer WARNING de un lote nuevo arma su propia ventana."""
+    clock = {"t": 1000.0}
+    w, store, _ = make_watcher(env, now=lambda: clock["t"])
+    w.poll_once()
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["cursor"] = 0
+        st["warning_hold_until"] = 999999.0
+    add_occurrence(env.db, level="WARNING", message="nuevo")
+    w.poll_once()
+    assert store.load()["warning_hold_until"] == 4600.0
+
+
+def test_configure_model_sets_and_confirms(env):
+    """Si policy.model esta definido, se fija y se confirma en la sesion."""
+    env.policy["model"] = "adaptive"
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["cursor"] = 1
+        st["pending"] = [ev(1, message="nuevo")]
+    agent = FakeAcpProc()
+    worker, _, out, _ = make_worker(env, agent=agent)
+    assert worker.run() == 0
+    calls = [m for m in agent.received
+             if m["method"] == "session/set_config_option"
+             and m["params"].get("configId") == "model"]
+    assert calls and calls[0]["params"]["value"] == "adaptive"
+    assert "Modelo: adaptive" in out.getvalue()
+
+
+def test_model_not_announced_fails_closed(env):
+    """Un modelo configurado que la sesion no anuncia no se ignora."""
+    env.policy["model"] = "no-existe"
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["cursor"] = 1
+        st["pending"] = [ev(1, message="nuevo")]
+    agent = FakeAcpProc()
+    worker, _, _, _ = make_worker(env, agent=agent)
+    assert worker.run() == 5
+    assert store.load()["status"] == "model_error"
+
+
+def test_rotation_failure_does_not_block_batch(env):
+    """Si falla session/new, se sigue con la sesion actual (sin bucle)."""
+    env.policy["session_recycle_prompts"] = 1
+    env.policy["session_recycle_minutes"] = 0
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["cursor"] = 1
+        st["pending"] = [ev(1, message="nuevo", level="ERROR")]
+        st["sessions"]["2026-01-01"] = {
+            "session_id": "sess-old", "initial_prompt_sent": True,
+            "prompts_sent": 1, "started_at": time.time()}
+    agent = FakeAcpProc()
+    worker, _, _, _ = make_worker(env, agent=agent)
+    worker._rotate_session = lambda: False
+    assert worker.run() == 0
+    assert worker._rotation_disabled is True
+    assert not any(m["method"] == "session/new" for m in agent.received)
+    prompts = [m for m in agent.received if m["method"] == "session/prompt"]
+    assert len(prompts) == 1
+    assert "Hola, Devin" not in prompts[0]["params"]["prompt"][0]["text"]
+
+
+def test_error_waits_for_hourly_digest(env):
+    """En modo horario, ERROR se acumula; CRITICAL sigue saliendo ya."""
+    env.policy["digest_levels"] = ["WARNING", "ERROR"]
+    clock = {"t": 1000.0}
+    w, store, spawns = make_watcher(env, now=lambda: clock["t"])
+    w.poll_once()
+    add_occurrence(env.db, level="ERROR", message="error uno")
+    w.poll_once()
+    assert spawns == []
+    assert len(store.load()["pending"]) == 1
+    assert store.load()["warning_hold_until"] == 4600.0
+    add_occurrence(env.db, level="CRITICAL", message="critico")
+    w.poll_once()
+    assert spawns == [("local", "2026-01-01")]
+
+
+def test_hourly_digest_rotates_fresh_session(env):
+    """El lote horario abre sesion nueva y manda un solo digest."""
+    env.policy["digest_levels"] = ["WARNING", "ERROR"]
+    env.policy["digest_fresh_session"] = True
+    env.policy["digest_force"] = True
+    env.policy["session_recycle_prompts"] = 0
+    env.policy["session_recycle_minutes"] = 0
+    store = bridge.StateStore(env.state_root / "local")
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["cursor"] = 2
+        st["pending"] = [ev(1, message="error uno", level="ERROR"),
+                         ev(2, message="error dos", level="ERROR")]
+        st["sessions"]["2026-01-01"] = {
+            "session_id": "sess-old", "initial_prompt_sent": True,
+            "prompts_sent": 0, "started_at": time.time()}
+    agent = FakeAcpProc()
+    worker, _, out, _ = make_worker(env, agent=agent)
+    assert worker.run() == 0
+    assert any(m["method"] == "session/new" for m in agent.received)
+    prompts = [m for m in agent.received if m["method"] == "session/prompt"]
+    assert len(prompts) == 1
+    text = prompts[0]["params"]["prompt"][0]["text"]
+    assert "Hola, Devin" in text
+    assert "RESUMEN DE COLA" in text
+    assert "Renuevo la conversación" in out.getvalue()
+
+
+def test_repeat_suppress_window_by_level(env):
+    env.policy["repeat_suppress_levels"] = ["WARNING", "ERROR"]
+    env.policy["repeat_suppress_minutes"] = 240
+    env.policy["repeat_suppress_minutes_by_level"] = {"ERROR": 60}
+    assert bridge.repeat_suppress_seconds(env.policy, "WARNING") == 240 * 60
+    assert bridge.repeat_suppress_seconds(env.policy, "ERROR") == 60 * 60
+    assert bridge.repeat_suppress_seconds(env.policy) == 240 * 60

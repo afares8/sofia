@@ -10,8 +10,79 @@
   "backlog_digest": true,
   "backlog_digest_threshold": 50,
   "backlog_digest_max_chars": 32000,
+  "repeat_suppress_minutes": 360,
+  "repeat_suppress_levels": ["WARNING", "ERROR", "CRITICAL"],
+  "repeat_suppress_minutes_by_level": {"ERROR": 60, "CRITICAL": 10},
+  "repeat_escalate_after": 12,
+  "digest_levels": ["WARNING", "ERROR"],
+  "digest_minutes": 360,
+  "digest_fresh_session": true,
+  "digest_force": true,
+  "urgent_bypass_levels": ["CRITICAL"],
+  "mute_rules": [
+    {
+      "id": "mayor-banistmo-file-reception-sandbox",
+      "service_id": "mayor",
+      "pattern": "Banistmo file reception failed",
+      "levels": ["WARNING", "ERROR"],
+      "issue_ids": [115529, 115531],
+      "expires_at": "2026-11-15",
+      "note": "Sandbox del banco (MT942/camt.052 rotos desde 2026-10-26, sin perdida de datos): el puente no manda estos avisos a Devin. Las occurrences siguen en sofia.db. Revisar o ampliar expires_at cuando el banco se recupere."
+    },
+    {
+      "id": "operational-inventory-low-stock",
+      "pattern": "\"event\"\\s*:\\s*\"inventory\\.low_stock\"",
+      "levels": ["WARNING"],
+      "note": "Telemetria de inventario bajo: dato operativo del cliente, no un bug. Se sigue registrando en sofia.db."
+    },
+    {
+      "id": "operational-payment-verify",
+      "pattern": "\"event\"\\s*:\\s*\"sales\\.payment\\.verify\\.amount_unverifiable\"",
+      "levels": ["WARNING"],
+      "note": "Verificacion de pago Yappy que no puede cotejar el monto: operacion del cliente, no bug de codigo."
+    },
+    {
+      "id": "operational-fiscal-quota",
+      "pattern": "QUOTA_PLAN_UNDEFINED|fiscal\\.quota\\.check_failed",
+      "levels": ["WARNING"],
+      "note": "Cuota fiscal sin plan definido: configuracion/plan del cliente; el monitor falla cerrado por diseno."
+    },
+    {
+      "id": "operational-purchase-invoices-warnings",
+      "pattern": "\"entity\"\\s*:\\s*\"purchase_invoices\"",
+      "levels": ["WARNING"],
+      "note": "Warnings de validacion de datos de facturas de compra; no es un fallo de codigo."
+    },
+    {
+      "id": "tec-slow-request",
+      "service_id": "tec",
+      "pattern": "^Slow request",
+      "levels": ["WARNING"],
+      "note": "Latencia de endpoints de ElenaTec (respuestas 2xx): telemetria de rendimiento, no un bug. Los ERROR/CRITICAL siguen saliendo."
+    },
+    {
+      "id": "packing-di-api-url-fallback",
+      "service_id": "packing",
+      "pattern": "No working (API|SAP DI API) URL found",
+      "levels": ["WARNING"],
+      "note": "Packing prueba URLs candidatas al arrancar y cae a la configurada: fallback esperado, no un bug. Los fallos reales de conexion salen como ERROR."
+    },
+    {
+      "id": "operational-depreciation-account-config",
+      "pattern": "jobs\\.depreciation_failed|No se encontr. la cuenta de depreciaci.n acumulada",
+      "levels": ["WARNING"],
+      "note": "Falta accum_dep_account_id / catalogo de cuentas del cliente: configuracion operativa, no bug de codigo."
+    }
+  ],
+  "session_recycle_prompts": 80,
+  "session_recycle_minutes": 240,
+  "retry_interval_minutes": 10,
+  "escalate_after_attempts": 3,
+  "escalation_repeat_minutes": 360,
+  "alert_url": "http://127.0.0.1:5180/api/bridge/escalation",
+  "alert_token_file": "C:/ProgramData/ServerSofia/bridge-alert.token",
   "idle_close_minutes": 60,
-  "stall_seconds": 900,
+  "stall_seconds": 1800,
   "agent_commit_limit_mb": 4096,
   "health_ports": {
     "local": 5185,
@@ -19,6 +90,7 @@
   },
   "levels": ["WARNING", "ERROR", "CRITICAL"],
   "permission_mode": "dangerous",
+  "model": "",
   "first_start": "from_now",
   "groups": {
     "local": {

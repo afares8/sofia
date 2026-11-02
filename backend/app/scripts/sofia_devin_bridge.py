@@ -31,6 +31,7 @@ import tempfile
 import threading
 import time
 import traceback as tb_mod
+import urllib.request
 from contextlib import contextmanager
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,7 +43,22 @@ REPO_ROOT = SCRIPT_PATH.parents[3]
 DEFAULT_POLICY_DIR = REPO_ROOT / ".devin" / "sofia-cli"
 
 STATE_VERSION = 1
+# Tope blando de la cola: al llenarse NO se congela el cursor (eso dejaba a un
+# CRITICAL nuevo detras de cientos de WARNING viejos). Se desaloja el aviso de
+# menor prioridad mas antiguo; CRITICAL/ERROR solo se descartan en el tope duro.
 MAX_PENDING = 500
+MAX_PENDING_HARD = 2000
+LEVEL_PRIORITY = {"CRITICAL": 3, "ERROR": 2, "WARNING": 1}
+# Un lote incierto (el agente no confirmo end_turn) se reintenta solo cada
+# `retry_interval_minutes`; a los `escalate_after_attempts` fallos seguidos se
+# avisa por WhatsApp + correo (repitiendo como mucho cada
+# `escalation_repeat_minutes`) porque el CLI ya no esta entregando nada.
+RETRY_INTERVAL_SECONDS = 600.0
+ESCALATE_AFTER_ATTEMPTS = 3
+ESCALATION_REPEAT_SECONDS = 6 * 3600.0
+ALERT_URL_DEFAULT = "http://127.0.0.1:5180/api/bridge/escalation"
+ALERT_TOKEN_FILE_DEFAULT = r"C:\ProgramData\ServerSofia\bridge-alert.token"
+ALERT_HTTP_TIMEOUT = 10.0
 CONTROL_RPC_TIMEOUT = 60
 SESSION_LOAD_TIMEOUT = 180
 PROMPT_RESPONSE_WAIT = 24 * 3600
@@ -62,6 +78,36 @@ DIGEST_MAX_CHARS = 32000
 # La consola se cierra sola tras este tiempo sin trabajo (sesion guardada);
 # policy: idle_close_minutes.
 IDLE_CLOSE_MINUTES = 60.0
+# Un WARNING/ERROR con la misma firma (servicio + mensaje normalizado) que ya
+# se envio dentro de esta ventana NO se vuelve a mandar al CLI: se cuenta y se
+# manda como maximo una "recidiva" cada `repeat_escalate_after` ocurrencias.
+# policy: repeat_suppress_minutes / repeat_suppress_levels /
+# repeat_suppress_minutes_by_level / repeat_escalate_after. Los CRITICAL no se
+# suprimen por defecto, pero la policy puede incluirlos con una ventana corta
+# (p. ej. 10 min) para que una rafaga de CRITICAL identicos no abra N turnos.
+REPEAT_SUPPRESS_MINUTES = 240.0
+REPEAT_SUPPRESS_LEVELS = ("WARNING", "ERROR")
+REPEAT_ESCALATE_AFTER = 12
+MAX_SIGNATURES = 2000
+# Reglas de silencio temporal por servicio/mensaje (policy: mute_rules). Un
+# aviso que coincide NO se encola ni se manda al CLI; se cuenta en state.muted.
+# Las occurrences siguen en sofia.db (no se borra evidencia). `levels` por
+# defecto excluye CRITICAL; `expires_at` (YYYY-MM-DD) desactiva la regla sola.
+MUTE_RULE_DEFAULT_LEVELS = ("WARNING", "ERROR")
+# Los niveles de digest se acumulan y se mandan en UN lote/digest cada esta
+# ventana. CRITICAL sigue saliendo de inmediato.
+# policy: digest_levels / digest_minutes / digest_fresh_session / digest_force.
+DIGEST_MINUTES = 60.0
+DIGEST_LEVELS = ("WARNING", "ERROR")
+DIGEST_FRESH_SESSION = True
+DIGEST_FORCE = True
+# La conversacion del dia se renueva (session/new + prompt inicial) cuando
+# supera este numero de lotes o esta edad, para no reenviar 400-800k tokens de
+# historial en cada prompt. policy: session_recycle_prompts/_minutes.
+SESSION_RECYCLE_PROMPTS = 80
+SESSION_RECYCLE_MINUTES = 240.0
+# Niveles que rompen la ventana de acumulacion y salen de inmediato.
+URGENT_BYPASS_LEVELS = ("CRITICAL",)
 # Si el agente ACP muere sin turno en curso, el worker sale limpio y el watcher
 # lo reabre tras esta espera para retomar la sesion.
 DISCONNECT_RETRY_SECONDS = 60.0
@@ -155,6 +201,95 @@ def redact_text(text: Any) -> str:
 REQUIRED_POLICY_KEYS = ("source_db", "state_root", "devin_executable", "groups")
 
 
+def _mute_expiry(value: Any) -> Optional[date]:
+    if value in (None, ""):
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError as exc:
+        raise BridgeError(f"mute_rules.expires_at invalido: {value!r}") from exc
+
+
+def compile_mute_rules(raw: Any) -> List[Dict[str, Any]]:
+    """Compila `policy.mute_rules`; un error de configuracion falla cerrado.
+
+    Cada regla: {id, service_id?, pattern, levels?, issue_ids?, expires_at?,
+    note?}. `pattern` es regex case-insensitive contra el mensaje.
+    """
+    if raw in (None, ""):
+        return []
+    if not isinstance(raw, list):
+        raise BridgeError("policy.mute_rules debe ser una lista")
+    rules: List[Dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise BridgeError(f"mute_rules[{index}] debe ser un objeto")
+        pattern = str(item.get("pattern") or "")
+        if not pattern:
+            raise BridgeError(f"mute_rules[{index}] sin pattern")
+        try:
+            rx = re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            raise BridgeError(
+                f"mute_rules[{index}] regex invalido: {exc}") from exc
+        levels = item.get("levels", MUTE_RULE_DEFAULT_LEVELS)
+        if isinstance(levels, str):
+            levels = [levels]
+        if not isinstance(levels, (list, tuple)):
+            raise BridgeError(f"mute_rules[{index}].levels debe ser lista")
+        raw_ids = item.get("issue_ids") or []
+        if not isinstance(raw_ids, list):
+            raise BridgeError(f"mute_rules[{index}].issue_ids debe ser lista")
+        try:
+            issue_ids = {int(x) for x in raw_ids}
+        except (TypeError, ValueError) as exc:
+            raise BridgeError(
+                f"mute_rules[{index}].issue_ids invalido") from exc
+        service_id = item.get("service_id")
+        rules.append({
+            "id": str(item.get("id") or pattern),
+            "service_id": str(service_id).lower() if service_id else None,
+            "rx": rx,
+            "levels": {str(x).upper() for x in levels},
+            "issue_ids": issue_ids,
+            "expires_on": _mute_expiry(item.get("expires_at")),
+            "note": str(item.get("note") or ""),
+        })
+    return rules
+
+
+def mute_rule_for(policy: Dict[str, Any], ev: Dict[str, Any],
+                  today: Any = None) -> Optional[str]:
+    """Id de la regla que silencia este aviso, o None."""
+    rules = policy.get("_mute_rules") or []
+    if not rules:
+        return None
+    if isinstance(today, str):
+        try:
+            day = date.fromisoformat(today[:10])
+        except ValueError:
+            day = date.today()
+    else:
+        day = today or date.today()
+    service_id = str(ev.get("service_id") or "").lower()
+    level = str(ev.get("level") or "").upper()
+    issue_id = ev.get("issue_id")
+    message = str(ev.get("message") or "")
+    for rule in rules:
+        expires = rule.get("expires_on")
+        if expires is not None and day > expires:
+            continue
+        if rule["service_id"] and rule["service_id"] != service_id:
+            continue
+        if rule["levels"] and level not in rule["levels"]:
+            continue
+        if rule["issue_ids"] and issue_id not in rule["issue_ids"]:
+            continue
+        if rule["rx"].search(message):
+            return rule["id"]
+    return None
+
+
 def load_policy(policy_dir: Path) -> Dict[str, Any]:
     policy_dir = Path(policy_dir)
     try:
@@ -190,6 +325,7 @@ def load_policy(policy_dir: Path) -> Dict[str, Any]:
             str(s).lower() for s in route.get("exclude_service_ids", [])},
     }
     policy["_levels"] = {str(l).upper() for l in policy.get("levels", [])}
+    policy["_mute_rules"] = compile_mute_rules(policy.get("mute_rules"))
     return policy
 
 
@@ -286,12 +422,19 @@ def _initial_state() -> Dict[str, Any]:
         "spawn_failures": 0, "next_retry_after": 0.0, "last_spawn": 0.0,
         "spawn_counted": False, "worker_ready": False, "circuit_open": False,
         "hold_until": 0.0, "pause_cursor": 0,
+        "retry_attempts": 0, "retry_after": 0.0, "escalated_at": 0.0,
+        "escalation_count": 0, "dropped": 0, "muted": 0,
+        "sig_sent": {}, "warning_hold_until": 0.0,
     }
 
 
 # Claves agregadas despues de la version 1 inicial: los state.json existentes
 # no las traen y cargar debe seguir funcionando (se completan con el default).
-_OPTIONAL_STATE_KEYS = {"hold_until", "pause_cursor"}
+_OPTIONAL_STATE_KEYS = {
+    "hold_until", "pause_cursor", "retry_attempts", "retry_after",
+    "escalated_at", "escalation_count", "dropped", "muted",
+    "sig_sent", "warning_hold_until",
+}
 
 
 def _valid_event(ev: Any) -> bool:
@@ -324,10 +467,20 @@ def validate_state(state: Any, existing: bool = True) -> Dict[str, Any]:
         ("next_retry_after", (int, float)), ("last_spawn", (int, float)),
         ("spawn_counted", bool), ("worker_ready", bool), ("circuit_open", bool),
         ("hold_until", (int, float)), ("pause_cursor", int),
+        ("retry_attempts", int), ("retry_after", (int, float)),
+        ("escalated_at", (int, float)), ("escalation_count", int),
+        ("dropped", int), ("muted", int), ("sig_sent", dict),
+        ("warning_hold_until", (int, float)),
     )
     for key, typ in checks:
         if not isinstance(state[key], typ):
             raise StateError(f"campo de estado invalido: {key}")
+    for sig, rec in state["sig_sent"].items():
+        if not isinstance(sig, str) or not isinstance(rec, dict) \
+                or not isinstance(rec.get("last"), (int, float)) \
+                or not isinstance(rec.get("count"), int) \
+                or not isinstance(rec.get("suppressed"), int):
+            raise StateError("sig_sent invalido")
     if state["cursor"] < 0:
         raise StateError("cursor negativo")
     if state["completed"] and not all(
@@ -648,6 +801,78 @@ def find_pending_duplicate(pending: List[Dict[str, Any]],
     return None
 
 
+def retry_interval_seconds(policy: Dict[str, Any]) -> float:
+    """Espera entre reintentos automaticos de un lote incierto (10 min)."""
+    try:
+        minutes = float(policy.get("retry_interval_minutes", 10))
+    except (TypeError, ValueError):
+        minutes = 10.0
+    return max(60.0, minutes * 60.0)
+
+
+def _event_priority(ev: Dict[str, Any]) -> int:
+    return LEVEL_PRIORITY.get(str(ev.get("level") or "").upper(), 1)
+
+
+def _pick_eviction_victim(pending: List[Dict[str, Any]],
+                          incoming: int) -> Optional[Dict[str, Any]]:
+    """Aviso mas antiguo de MENOR prioridad que el entrante (o None)."""
+    victim = None
+    victim_prio = incoming
+    for e in pending:
+        prio = _event_priority(e)
+        if prio < victim_prio:
+            victim, victim_prio = e, prio
+            if prio == 1:
+                break
+    return victim
+
+
+def _oldest_with_priority(pending: List[Dict[str, Any]],
+                          priority: int) -> Optional[Dict[str, Any]]:
+    for e in pending:
+        if _event_priority(e) <= priority:
+            return e
+    return None
+
+
+def admit_event(state: Dict[str, Any], ev: Dict[str, Any]) -> str:
+    """Encola un aviso sin congelar nunca el cursor.
+
+    Devuelve "queued" | "evicted" (entro desalojando ruido) | "dropped" (se
+    descarta el entrante porque no hay nada menos importante que sacar).
+
+    Reglas: un CRITICAL/ERROR nuevo siempre entra (hasta el tope duro); el
+    ruido WARNING se descarta cuando la cola esta llena de cosas igual de
+    importantes, y refresca la cola desalojando el WARNING mas antiguo. Asi un
+    CRITICAL de hoy no queda detras de 500 WARNING de ayer, que es lo que
+    pasaba cuando la cola llena congelaba el cursor.
+    """
+    pending = state["pending"]
+    incoming = _event_priority(ev)
+    if len(pending) < MAX_PENDING:
+        pending.append(ev)
+        return "queued"
+    victim = _pick_eviction_victim(pending, incoming)
+    if victim is not None:
+        pending.remove(victim)
+        state["dropped"] = int(state.get("dropped") or 0) + 1
+        pending.append(ev)
+        return "evicted"
+    if incoming <= 1:
+        return "dropped"
+    if len(pending) < MAX_PENDING_HARD:
+        pending.append(ev)
+        return "queued"
+    victim = _oldest_with_priority(pending, incoming)
+    if victim is not None:
+        pending.remove(victim)
+        state["dropped"] = int(state.get("dropped") or 0) + 1
+        pending.append(ev)
+        return "evicted"
+    return "dropped"
+
+
 def render_report(events: List[Dict[str, Any]], day: str) -> str:
     lines = [f"Reportes del dia {day} ({len(events)}):", ""]
     for ev in events:
@@ -688,6 +913,98 @@ def _message_signature(message: Any) -> str:
     """Firma estable del mensaje: ignora ids, numeros y ruido variable."""
     text = _VOLATILE_RE.sub("#", redact_text(message or ""))
     return _SPACES_RE.sub(" ", text).strip()[:140]
+
+
+def event_signature(ev: Dict[str, Any]) -> str:
+    """Firma estable de un aviso: servicio + nivel + mensaje normalizado.
+
+    Dos occurrences de la misma familia (p. ej. `slow request ... 4101 ms` y
+    `... 4245 ms`) producen la misma firma, aunque cambien ids y numeros.
+    """
+    return "|".join((
+        str(ev.get("service_id") or "").lower(),
+        str(ev.get("level") or "").upper(),
+        _message_signature(ev.get("message"))))
+
+
+def _policy_minutes(policy: Dict[str, Any], key: str,
+                    default: float) -> float:
+    try:
+        return max(0.0, float(policy.get(key, default)))
+    except (TypeError, ValueError):
+        return max(0.0, default)
+
+
+def repeat_suppress_seconds(policy: Dict[str, Any],
+                            level: Optional[str] = None) -> float:
+    minutes = _policy_minutes(
+        policy, "repeat_suppress_minutes", REPEAT_SUPPRESS_MINUTES)
+    by_level = policy.get("repeat_suppress_minutes_by_level") or {}
+    if level and isinstance(by_level, dict):
+        try:
+            override = by_level.get(str(level).upper())
+            if override is not None:
+                minutes = max(0.0, float(override))
+        except (TypeError, ValueError):
+            pass
+    return minutes * 60.0
+
+
+def repeat_suppress_levels(policy: Dict[str, Any]) -> set:
+    raw = policy.get("repeat_suppress_levels", REPEAT_SUPPRESS_LEVELS)
+    if isinstance(raw, str):
+        raw = [raw]
+    return {str(x).upper() for x in raw or []}
+
+
+def repeat_escalate_after(policy: Dict[str, Any]) -> int:
+    try:
+        return max(0, int(policy.get(
+            "repeat_escalate_after", REPEAT_ESCALATE_AFTER)))
+    except (TypeError, ValueError):
+        return REPEAT_ESCALATE_AFTER
+
+
+def digest_seconds(policy: Dict[str, Any]) -> float:
+    return _policy_minutes(
+        policy, "digest_minutes", DIGEST_MINUTES) * 60.0
+
+
+def digest_levels(policy: Dict[str, Any]) -> set:
+    raw = policy.get("digest_levels", DIGEST_LEVELS)
+    if isinstance(raw, str):
+        raw = [raw]
+    return {str(x).upper() for x in raw or []}
+
+
+def digest_fresh_session(policy: Dict[str, Any]) -> bool:
+    return bool(policy.get("digest_fresh_session", DIGEST_FRESH_SESSION))
+
+
+def digest_force(policy: Dict[str, Any]) -> bool:
+    return bool(policy.get("digest_force", DIGEST_FORCE))
+
+
+def urgent_bypass_levels(policy: Dict[str, Any]) -> set:
+    raw = policy.get("urgent_bypass_levels", URGENT_BYPASS_LEVELS)
+    if isinstance(raw, str):
+        raw = [raw]
+    return {str(x).upper() for x in raw or []}
+
+
+def prune_signatures_locked(state: Dict[str, Any], now: float,
+                            window_seconds: float) -> None:
+    """Acota `sig_sent` para que el state.json no crezca sin limite."""
+    sigs = state.get("sig_sent") or {}
+    cutoff = now - max(window_seconds * 2.0, 24 * 3600.0)
+    for sig in [s for s, r in sigs.items()
+                if float((r or {}).get("last") or 0.0) < cutoff]:
+        sigs.pop(sig, None)
+    if len(sigs) > MAX_SIGNATURES:
+        keep = sorted(
+            sigs.items(), key=lambda kv: float((kv[1] or {}).get("last") or 0.0),
+            reverse=True)[:MAX_SIGNATURES]
+        state["sig_sent"] = dict(keep)
 
 
 def render_digest(events: List[Dict[str, Any]], day: str,
@@ -1063,12 +1380,17 @@ class AcpSession:
         return sid
 
     @staticmethod
-    def _mode_option(config_options: Any) -> Optional[Dict[str, Any]]:
+    def _select_option(config_options: Any,
+                       option_id: str) -> Optional[Dict[str, Any]]:
         for opt in config_options or []:
-            if isinstance(opt, dict) and opt.get("id") == "mode" \
+            if isinstance(opt, dict) and opt.get("id") == option_id \
                     and opt.get("type") == "select":
                 return opt
         return None
+
+    @staticmethod
+    def _mode_option(config_options: Any) -> Optional[Dict[str, Any]]:
+        return AcpSession._select_option(config_options, "mode")
 
     def configure_mode(self, session_id: str, policy_mode: str) -> Optional[str]:
         raw = str(policy_mode or "").strip().lower()
@@ -1100,6 +1422,38 @@ class AcpSession:
                 "set_config_option no confirmo el modo solicitado")
         option["currentValue"] = desired
         return desired
+
+    def configure_model(self, session_id: str,
+                        policy_model: str) -> Optional[str]:
+        """Fija el modelo de la sesion si la policy lo pide explicitamente.
+
+        Vacio = usar el default del CLI. Si la policy fija un modelo que la
+        sesion no anuncia, falla cerrado en vez de usar otro en silencio.
+        """
+        raw = str(policy_model or "").strip()
+        if not raw:
+            return None
+        info = self.session_info.get(str(session_id)) or {}
+        option = self._select_option(info.get("configOptions"), "model")
+        if option is None:
+            raise AcpError("la sesion no expone configOption 'model'")
+        values = [v.get("value") for v in option.get("options") or []
+                  if isinstance(v, dict)]
+        if raw not in values:
+            raise AcpError(f"modelo '{raw}' no anunciado por la sesion")
+        if str(option.get("currentValue") or "") == raw:
+            return raw
+        result = self.transport.request("session/set_config_option", {
+            "sessionId": session_id, "configId": "model",
+            "value": raw})
+        confirmed = self._select_option(
+            (result or {}).get("configOptions"), "model")
+        if confirmed is None \
+                or str(confirmed.get("currentValue") or "") != raw:
+            raise AcpError(
+                "set_config_option no confirmo el modelo solicitado")
+        option["currentValue"] = raw
+        return raw
 
     def prompt(self, session_id: str, text: str,
                idle_timeout: Optional[float] = None) -> Any:
@@ -1159,6 +1513,47 @@ def start_health_server(port: int, snapshot) -> Optional[Any]:
     return httpd
 
 
+class BridgeAlertSender:
+    """Aviso de escalado por WhatsApp + correo a traves del backend de Sofia.
+
+    El puente es stdlib-only y no importa `app.*`: manda un POST al endpoint
+    local `/api/bridge/escalation`, que reutiliza `whatsapp_service` y
+    `email_alert_service` (con sus cooldowns y su cola de reintentos).
+    """
+
+    def __init__(self, policy: Dict[str, Any], group: str,
+                 opener: Optional[Callable[..., Any]] = None,
+                 token_reader: Optional[Callable[[], str]] = None):
+        self.policy = policy
+        self.group = group
+        self.url = str(policy.get("alert_url") or ALERT_URL_DEFAULT)
+        self.token_file = str(
+            policy.get("alert_token_file") or ALERT_TOKEN_FILE_DEFAULT)
+        self._opener = opener or urllib.request.urlopen
+        self._token_reader = token_reader or self._read_token
+
+    def _read_token(self) -> str:
+        try:
+            return Path(self.token_file).read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def send(self, payload: Dict[str, Any]) -> bool:
+        token = self._token_reader()
+        if not token:
+            return False
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            self.url, data=body, method="POST",
+            headers={"Content-Type": "application/json",
+                     "X-Bridge-Token": token})
+        try:
+            with self._opener(req, timeout=ALERT_HTTP_TIMEOUT) as resp:
+                return 200 <= int(getattr(resp, "status", 0)) < 300
+        except Exception:
+            return False
+
+
 class Watcher:
     def __init__(self, policy, group, source, store,
                  spawn_worker=default_spawn_worker,
@@ -1166,7 +1561,8 @@ class Watcher:
                  now=time.time,
                  today=lambda: date.today().isoformat(),
                  devin_exists=None,
-                 log=None):
+                 log=None,
+                 alert_sender=None):
         if group not in policy["groups"]:
             raise BridgeError(f"grupo desconocido: {group}")
         self.policy = policy
@@ -1182,6 +1578,7 @@ class Watcher:
             exe = policy.get("devin_executable", "")
             devin_exists = lambda: bool(exe) and Path(exe).exists()
         self.devin_exists = devin_exists
+        self.alert_sender = alert_sender or BridgeAlertSender(policy, group)
         self._last_child = None
         self._last_poll_at: Optional[float] = None
 
@@ -1208,14 +1605,21 @@ class Watcher:
             "status": status,
             "worker_alive": worker_ok,
             "pending": len(state.get("pending") or []),
+            "muted": int(state.get("muted") or 0),
         }, (200 if ok else 503))
 
     def poll_once(self) -> Dict[str, Any]:
         decision: Dict[str, Any] = {"spawn_day": None, "queued": 0,
-                                    "deduped": 0, "has_more": False,
-                                    "early": None}
+                                    "deduped": 0, "dropped": 0, "evicted": 0,
+                                    "suppressed": 0, "muted": 0,
+                                    "has_more": False, "early": None}
+        escalation: Optional[Dict[str, Any]] = None
         with self.store.transaction() as state:
             self._account_locked(state)
+            # Silencios ya encolados (p. ej. al agregar la regla) no deben
+            # llegar al CLI aunque el watcher se haya reiniciado despues.
+            decision["muted"] += self._sweep_muted_locked(state)
+            escalation = self._maybe_escalate_locked(state)
             if state["source_reset"]:
                 decision["early"] = {"status": "source_reset", "queued": 0}
             elif not state["initialized"]:
@@ -1228,7 +1632,6 @@ class Watcher:
                 cursor = int(state["cursor"])
                 batch_limit = int(self.policy.get("batch_size", 50))
                 rows = self.source.fetch(cursor, batch_limit)
-                hit_pending_full = False
                 if not rows:
                     max_id = self.source.highwater()
                     if 0 < max_id < cursor:
@@ -1242,6 +1645,9 @@ class Watcher:
                 else:
                     day = self.today()
                     had_pending = bool(state["pending"])
+                    held_levels = digest_levels(self.policy)
+                    had_digest = any(
+                        e.get("level") in held_levels for e in state["pending"])
                     handled_last = cursor
                     inflight_ids = set(
                         (state.get("inflight") or {}).get("event_ids") or [])
@@ -1249,24 +1655,45 @@ class Watcher:
                         rid = int(row["occurrence_id"])
                         if route_event(self.policy, row) == self.group:
                             ev = event_from_row(row, day)
-                            duplicate = find_pending_duplicate(
+                            muted = mute_rule_for(self.policy, ev, day)
+                            queued_now = False
+                            duplicate = None if muted else find_pending_duplicate(
                                 state["pending"], ev, exclude_ids=inflight_ids)
-                            if duplicate is not None:
+                            if muted:
+                                state["muted"] = int(
+                                    state.get("muted") or 0) + 1
+                                decision["muted"] += 1
+                            elif duplicate is not None:
                                 duplicate["duplicates"] = int(
                                     duplicate.get("duplicates") or 0) + 1
                                 decision["deduped"] += 1
-                            elif len(state["pending"]) >= MAX_PENDING:
-                                state["status"] = "pending_full"
-                                state["status_at"] = self.now()
-                                state["last_error"] = \
-                                    "cola llena; cursor detenido"
-                                hit_pending_full = True
-                                break
+                            elif self._suppress_signature_locked(state, ev):
+                                decision["suppressed"] += 1
                             else:
-                                state["pending"].append(ev)
-                                decision["queued"] += 1
+                                outcome = admit_event(state, ev)
+                                if outcome == "dropped":
+                                    decision["dropped"] += 1
+                                else:
+                                    queued_now = True
+                                    decision["queued"] += 1
+                                    self._mark_digest_hold_locked(
+                                        state, ev, reset=not had_digest)
+                                if outcome == "evicted":
+                                    decision["evicted"] += 1
+                            if queued_now and ev["level"] in \
+                                    urgent_bypass_levels(self.policy):
+                                # Un CRITICAL nuevo no espera la ventana de digest.
+                                state["hold_until"] = 0.0
                         handled_last = rid
                     state["cursor"] = handled_last
+                    prune_signatures_locked(
+                        state, self.now(), repeat_suppress_seconds(self.policy))
+                    if len(state["pending"]) >= MAX_PENDING \
+                            and not state["uncertain"]:
+                        state["status"] = "pending_full"
+                        state["status_at"] = self.now()
+                        state["last_error"] = (
+                            "cola llena: se desaloja ruido, el cursor avanza")
                     if decision["queued"]:
                         state["paused"] = False
                         state["pause_cursor"] = 0
@@ -1279,13 +1706,17 @@ class Watcher:
                                 len(state["pending"]) < MAX_PENDING):
                             state["status"] = "ok"
                             state["last_error"] = None
-                    if (len(rows) >= batch_limit and not hit_pending_full
-                            and len(state["pending"]) < MAX_PENDING
+                    if (len(rows) >= batch_limit
+                            and len(state["pending"]) < MAX_PENDING_HARD
                             and not state["circuit_open"]):
                         decision["has_more"] = True
                 if decision["early"] is None:
-                    if (not hit_pending_full
-                            and state["status"] == "pending_full"
+                    if not any(e.get("level") in digest_levels(self.policy)
+                               for e in state["pending"]):
+                        # Un lote anterior pudo dejar la ventana armada sin
+                        # avisos de digest pendientes (p. ej. al migrar).
+                        state["warning_hold_until"] = 0.0
+                    if (state["status"] == "pending_full"
                             and len(state["pending"]) < MAX_PENDING
                             and not state["circuit_open"]):
                         state["status"] = (
@@ -1295,12 +1726,80 @@ class Watcher:
                             state["last_error"] = None
                     self._heal_stale_pause_locked(state)
                     decision["spawn_day"] = self._spawn_day_locked(state)
+        if escalation is not None:
+            if not self._send_escalation(escalation):
+                with self.store.transaction() as st:
+                    st["escalated_at"] = (
+                        self.now() - self._escalation_repeat() + 600.0)
         if decision["early"] is not None:
             return decision["early"]
         self._maybe_spawn(decision.get("spawn_day"))
         return {"status": "ok", "queued": decision["queued"],
                 "deduped": decision["deduped"],
+                "dropped": decision["dropped"],
+                "evicted": decision["evicted"],
+                "suppressed": decision["suppressed"],
+                "muted": decision["muted"],
                 "has_more": decision["has_more"]}
+
+    def _sweep_muted_locked(self, state) -> int:
+        """Quita de la cola los avisos que ahora caen en una regla de silencio.
+
+        No toca `inflight`: un lote ya enviado al CLI no se puede retirar.
+        """
+        pending = state.get("pending") or []
+        if not pending or not self.policy.get("_mute_rules"):
+            return 0
+        day = self.today()
+        keep = []
+        removed = 0
+        for ev in pending:
+            if mute_rule_for(self.policy, ev, day):
+                removed += 1
+            else:
+                keep.append(ev)
+        if not removed:
+            return 0
+        state["pending"] = keep
+        state["muted"] = int(state.get("muted") or 0) + removed
+        if not any(e.get("level") in digest_levels(self.policy)
+                   for e in keep):
+            state["warning_hold_until"] = 0.0
+        return removed
+
+    def _suppress_signature_locked(self, state, ev) -> bool:
+        """True si esta firma ya se envio hace poco y toca suprimirla.
+
+        Solo aplica a los niveles configurados (WARNING por defecto). Cada
+        `repeat_escalate_after` ocurrencias suprimidas se deja pasar una para
+        que una recidiva persistente no quede invisible.
+        """
+        window = repeat_suppress_seconds(self.policy, ev["level"])
+        if window <= 0 or ev["level"] not in repeat_suppress_levels(
+                self.policy):
+            return False
+        rec = (state.get("sig_sent") or {}).get(event_signature(ev))
+        if not rec:
+            return False
+        if self.now() - float(rec.get("last") or 0.0) >= window:
+            return False
+        rec["suppressed"] = int(rec.get("suppressed") or 0) + 1
+        escalate = repeat_escalate_after(self.policy)
+        if escalate > 0 and rec["suppressed"] >= escalate:
+            rec["suppressed"] = 0
+            return False
+        return True
+
+    def _mark_digest_hold_locked(self, state, ev, reset: bool = False) -> None:
+        """Arma la ventana de digest si el nivel se acumula para el lote."""
+        if ev["level"] not in digest_levels(self.policy):
+            return
+        window = digest_seconds(self.policy)
+        if window <= 0:
+            return
+        hold = float(state.get("warning_hold_until") or 0.0)
+        if reset or hold <= self.now():
+            state["warning_hold_until"] = self.now() + window
 
     def _hold_seconds(self) -> float:
         try:
@@ -1347,6 +1846,14 @@ class Watcher:
     def _spawn_day_locked(self, state) -> Optional[str]:
         if not state["pending"] or state["paused"] or state["circuit_open"]:
             return None
+        # Si solo hay avisos de digest esperando su ventana, no hace falta
+        # abrir el CLI todavia: el watcher lo abre cuando vence la ventana o
+        # cuando entra un CRITICAL.
+        held_levels = digest_levels(self.policy)
+        if float(state.get("warning_hold_until") or 0.0) > self.now() \
+                and all(e.get("level") in held_levels
+                        for e in state["pending"]):
+            return None
         days = [e["received_day"] for e in state["pending"]]
         return min(days) if days else None
 
@@ -1357,9 +1864,14 @@ class Watcher:
                 and not alive:
             state["inflight"]["uncertain"] = True
             state["uncertain"] = True
+            state["retry_attempts"] = int(state.get("retry_attempts") or 0) + 1
+            state["retry_after"] = self.now() + retry_interval_seconds(
+                self.policy)
             state["status"] = "uncertain"
             state["status_at"] = self.now()
-            state["last_error"] = "worker murio durante un turno; entrega incierta"
+            state["last_error"] = (
+                "worker murio durante un turno; entrega incierta; "
+                f"reintento automatico {state['retry_attempts']}")
         if state["worker_ready"] and not alive and state["last_spawn"]:
             state["worker_ready"] = False
             state["spawn_counted"] = True
@@ -1396,6 +1908,62 @@ class Watcher:
             state["status"] = "spawn_circuit_open"
             state["status_at"] = self.now()
             state["last_error"] = "demasiados fallos de consola; pausado"
+
+    def _escalate_after(self) -> int:
+        try:
+            return max(1, int(self.policy.get(
+                "escalate_after_attempts", ESCALATE_AFTER_ATTEMPTS)))
+        except (TypeError, ValueError):
+            return ESCALATE_AFTER_ATTEMPTS
+
+    def _escalation_repeat(self) -> float:
+        try:
+            minutes = float(self.policy.get(
+                "escalation_repeat_minutes", 360))
+        except (TypeError, ValueError):
+            minutes = 360.0
+        return max(60.0, minutes * 60.0)
+
+    def _maybe_escalate_locked(self, state) -> Optional[Dict[str, Any]]:
+        """Payload de escalado si el lote lleva demasiados reintentos fallidos."""
+        if not state.get("uncertain") or not state.get("inflight"):
+            return None
+        attempts = int(state.get("retry_attempts") or 0)
+        if attempts < self._escalate_after():
+            return None
+        now = self.now()
+        last = float(state.get("escalated_at") or 0.0)
+        if last and now - last < self._escalation_repeat():
+            return None
+        state["escalated_at"] = now
+        state["escalation_count"] = int(
+            state.get("escalation_count") or 0) + 1
+        return {
+            "group": self.group,
+            "status": state.get("status"),
+            "attempts": attempts,
+            "escalation": int(state["escalation_count"]),
+            "error": state.get("last_error"),
+            "pending": len(state.get("pending") or []),
+            "cursor": int(state.get("cursor") or 0),
+            "dropped": int(state.get("dropped") or 0),
+            "retry_interval_minutes": int(
+                retry_interval_seconds(self.policy) // 60),
+        }
+
+    def _send_escalation(self, payload: Dict[str, Any]) -> bool:
+        try:
+            ok = bool(self.alert_sender.send(payload))
+        except Exception:
+            ok = False
+        if ok:
+            self.log("escalado enviado por WhatsApp + correo "
+                     f"(intento {payload.get('attempts')}, "
+                     f"escalado {payload.get('escalation')})")
+        else:
+            self.log("escalado NO enviado (backend/token); se reintenta "
+                     f"en 10 min (intento {payload.get('attempts')})")
+        return ok
 
     def _maybe_spawn(self, day: Optional[str]) -> Optional[Any]:
         if day is None:
@@ -1470,7 +2038,8 @@ class Watcher:
 HELP_TEXT = (
     "Comandos: /salir cierra la consola, /estado muestra el estado, "
     "/detalle muestra el ultimo detalle tecnico registrado, "
-    "/reintentar reenvia el lote incierto (manual), /ayuda muestra esto. "
+    "/reintentar reenvia ahora el lote incierto (si no, se reintenta solo "
+    "cada 10 min), /ayuda muestra esto. "
     "Otro texto se envia como mensaje a Devin en esta misma sesion.")
 
 _DEVIN_LEVEL_TOKEN_RE = re.compile(
@@ -1537,6 +2106,7 @@ class ConsoleWorker:
         self._stall_retries = 0
         self._loading_session = False
         self._recycled_since_turn = False
+        self._rotation_disabled = False
 
     def _print(self, text: str = "") -> None:
         try:
@@ -1837,6 +2407,15 @@ class ConsoleWorker:
             e for e in state["pending"]
             if e["received_day"] == self.day
             and e["occurrence_id"] not in completed]
+        # Los niveles de digest se acumulan para un solo lote; CRITICAL sigue
+        # en tiempo real. Al vencer la ventana, el lote incluye todo.
+        if float(state.get("warning_hold_until") or 0.0) > self.now():
+            held = digest_levels(self.policy)
+            available = [e for e in available if e["level"] not in held]
+        # Lo urgente primero: un CRITICAL nuevo no espera detras del ruido
+        # acumulado (dentro de la misma prioridad se respeta el orden de llegada).
+        available.sort(
+            key=lambda e: (-_event_priority(e), e["occurrence_id"]))
         # Backlog grande: se manda completo (hasta MAX_PENDING) en un solo
         # mensaje resumido en vez de N lotes de batch_size.
         if self._digest_enabled() \
@@ -1907,10 +2486,17 @@ class ConsoleWorker:
         try:
             st = self.store.load()
             if st["uncertain"] or st["inflight"]:
-                self._print("Hay un turno anterior sin confirmación. Los "
-                            "avisos siguen guardados. No reenviaré nada "
-                            "automáticamente; usa /reintentar solo si deseas "
-                            "repetir ese lote.")
+                retry_at = float(st.get("retry_after") or 0.0)
+                attempts = int(st.get("retry_attempts") or 0)
+                if retry_at > self.now():
+                    falta = int((retry_at - self.now()) // 60) + 1
+                    self._print("Hay un turno anterior sin confirmación "
+                                f"(intento {attempts}). Los avisos siguen "
+                                f"guardados; reintento automático en ~{falta} "
+                                "min. /reintentar lo hace ahora mismo.")
+                else:
+                    self._print("Hay un turno anterior sin confirmación; "
+                                "reintento automático en curso.")
         except Exception:
             pass
         threading.Thread(target=self._queue_watch_loop, daemon=True).start()
@@ -1991,6 +2577,20 @@ class ConsoleWorker:
                 self._print("Modo de sesión: /bypass")
             else:
                 self._print(f"Modo de sesión: {effective}")
+        model = str(self.policy.get("model") or "").strip()
+        if model:
+            try:
+                effective_model = self._session.configure_model(
+                    self._session_id, model)
+            except Exception as exc:
+                self._print(f"ERROR: no se pudo fijar el modelo de la sesión: "
+                            f"{redact_text(exc)}")
+                self._mark_status("model_error", str(exc)[:300])
+                self._close_transport()
+                return False
+            if effective_model:
+                self._ui_event("model_configured", model=effective_model)
+                self._print(f"Modelo: {effective_model}")
         self._disconnect_notified = False
         return True
 
@@ -2106,10 +2706,13 @@ class ConsoleWorker:
             finally:
                 self._loading_session = False
             with self.store.transaction() as st:
-                st["sessions"][self.day] = {
-                    "session_id": new_sid,
-                    "initial_prompt_sent": bool(
-                        session.get("initial_prompt_sent"))}
+                renewed = dict(session)
+                renewed["session_id"] = new_sid
+                renewed["initial_prompt_sent"] = bool(
+                    session.get("initial_prompt_sent"))
+                renewed.setdefault("prompts_sent", 0)
+                renewed.setdefault("started_at", self.now())
+                st["sessions"][self.day] = renewed
             self._session_id = new_sid
             self._ui_event("session_ready", session_id=new_sid,
                            resumed=True)
@@ -2121,18 +2724,98 @@ class ConsoleWorker:
             raise BridgeError(f"no se pudo crear la sesion del dia: {exc}") from exc
         with self.store.transaction() as st:
             st["sessions"][self.day] = {
-                "session_id": sid, "initial_prompt_sent": False}
+                "session_id": sid, "initial_prompt_sent": False,
+                "prompts_sent": 0, "started_at": self.now()}
         self._session_id = sid
         self._ui_event("session_ready", session_id=sid, resumed=False)
         return sid
+
+    def _session_recycle_prompts(self) -> int:
+        try:
+            return max(0, int(self.policy.get(
+                "session_recycle_prompts", SESSION_RECYCLE_PROMPTS)))
+        except (TypeError, ValueError):
+            return SESSION_RECYCLE_PROMPTS
+
+    def _session_recycle_minutes(self) -> float:
+        return _policy_minutes(
+            self.policy, "session_recycle_minutes", SESSION_RECYCLE_MINUTES)
+
+    def _should_rotate_session(self) -> bool:
+        """True si la conversacion del dia ya acumulo demasiado contexto."""
+        if self._rotation_disabled:
+            return False
+        prompts_limit = self._session_recycle_prompts()
+        minutes = self._session_recycle_minutes()
+        if prompts_limit <= 0 and minutes <= 0:
+            return False
+        try:
+            sess = self.store.load()["sessions"].get(self.day) or {}
+        except Exception:
+            return False
+        if not sess.get("session_id"):
+            return False
+        if prompts_limit > 0 and int(
+                sess.get("prompts_sent") or 0) >= prompts_limit:
+            return True
+        started = float(sess.get("started_at") or 0.0)
+        return bool(minutes > 0 and started
+                    and self.now() - started >= minutes * 60.0)
+
+    def _rotate_session(self) -> bool:
+        """Abre una sesion nueva del dia para resetear el contexto acumulado.
+
+        El proximo lote se manda con el prompt inicial (instrucciones), asi el
+        agente no arrastra cientos de miles de tokens de historial.
+        """
+        if self._session is None:
+            return False
+        try:
+            sid = self._session.new_session(self.group_cfg["cwd"])
+        except Exception as exc:
+            self._mark_status("session_rotate_error",
+                              f"session/new fallo: {exc}")
+            self._print(f"\n*** No se pudo renovar la sesión: "
+                        f"{redact_text(exc)[:200]} ***")
+            return False
+        try:
+            effective = self._session.configure_mode(
+                sid, str(self.policy.get("permission_mode") or ""))
+        except Exception as exc:
+            self._mark_status("permission_mode_error", str(exc)[:300])
+            self._print(f"\n*** La sesión nueva no confirmó el modo: "
+                        f"{redact_text(exc)[:200]} ***")
+            return False
+        model = str(self.policy.get("model") or "").strip()
+        if model:
+            try:
+                self._session.configure_model(sid, model)
+            except Exception as exc:
+                self._mark_status("model_error", str(exc)[:300])
+                self._print(f"\n*** La sesión nueva no confirmó el modelo: "
+                            f"{redact_text(exc)[:200]} ***")
+                return False
+        with self.store.transaction() as st:
+            st["sessions"][self.day] = {
+                "session_id": sid, "initial_prompt_sent": False,
+                "prompts_sent": 0, "started_at": self.now()}
+        self._session_id = sid
+        if effective:
+            self._effective_mode = effective
+        self._ui_event("session_rotated", session_id=sid)
+        self._print("\nRenuevo la conversación del día para no arrastrar todo "
+                    "el historial (contexto alto). La sesión nueva recibe las "
+                    "instrucciones y el próximo lote.")
+        return True
 
     def _send_batch(self, events: List[Dict[str, Any]],
                     use_initial: bool) -> bool:
         if not events:
             return True
         event_ids = [e["occurrence_id"] for e in events]
-        digest = self._digest_enabled() \
-            and len(events) > self._digest_threshold()
+        digest = (self._digest_enabled()
+                  and len(events) > self._digest_threshold()) \
+            or (digest_force(self.policy) and len(events) > 1)
         body = render_digest(events, self.day, self._digest_max_chars()) \
             if digest else render_report(events, self.day)
         if use_initial:
@@ -2204,6 +2887,7 @@ class ConsoleWorker:
             self._inflight_incomplete(stop_reason)
             return False
         self._stall_retries = 0
+        now = self.now()
         with self.store.transaction() as state:
             completed = set(state["completed"])
             completed.update(event_ids)
@@ -2213,12 +2897,39 @@ class ConsoleWorker:
                 if e["occurrence_id"] not in completed]
             state["inflight"] = None
             state["uncertain"] = False
+            self._clear_retry_locked(state)
+            sess = state["sessions"].setdefault(self.day, {})
             if use_initial:
-                sess = state["sessions"].setdefault(self.day, {})
                 sess["initial_prompt_sent"] = True
                 sess["session_id"] = self._session_id
+                sess["started_at"] = now
+                sess["prompts_sent"] = 1
+            else:
+                sess["session_id"] = self._session_id
+                sess.setdefault("started_at", now)
+                sess["prompts_sent"] = int(sess.get("prompts_sent") or 0) + 1
+            for e in events:
+                sig = event_signature(e)
+                rec = state["sig_sent"].setdefault(
+                    sig, {"last": 0.0, "suppressed": 0, "count": 0})
+                rec["last"] = now
+                rec["count"] = int(rec.get("count") or 0) + 1
+                rec["suppressed"] = 0
+            prune_signatures_locked(
+                state, now, repeat_suppress_seconds(self.policy))
+            held = digest_levels(self.policy)
+            window = digest_seconds(self.policy)
+            old_hold = float(state.get("warning_hold_until") or 0.0)
+            if window > 0 and any(e["level"] in held
+                                  for e in state["pending"]):
+                # Lo que llego mientras se enviaba espera la proxima ventana,
+                # pero un envio CRITICAL no debe extender una ventana activa.
+                if old_hold <= now:
+                    state["warning_hold_until"] = now + window
+            else:
+                state["warning_hold_until"] = 0.0
             state["status"] = "ok"
-            state["status_at"] = self.now()
+            state["status_at"] = now
             state["last_error"] = None
         self._ui_event("prompt_completed", event_ids=list(event_ids),
                        stop_reason="end_turn", digest=digest)
@@ -2229,16 +2940,19 @@ class ConsoleWorker:
         detail = redact_text(exc)[:200]
         with self.store.transaction() as state:
             if state["inflight"] and state["inflight"].get("prompt_sent"):
+                attempts = self._schedule_retry_locked(state)
                 state["uncertain"] = True
                 state["inflight"]["uncertain"] = True
                 state["status"] = "uncertain"
                 state["status_at"] = self.now()
                 state["last_error"] = (
-                    f"entrega incierta ({detail}); /reintentar manual"
-                    if detail else "entrega incierta; /reintentar manual")
+                    f"entrega incierta ({detail}); reintento automatico "
+                    f"{attempts} en {int(self._retry_interval() // 60)} min"
+                    if detail else "entrega incierta; reintento automatico")
                 self._print(f"\n*** Entrega incierta ({detail}): el agente no "
-                            "confirmo el turno. NO se reenvia automaticamente. "
-                            "Usa /reintentar. ***")
+                            "confirmo el turno. Reintento automatico #"
+                            f"{attempts} en "
+                            f"{int(self._retry_interval() // 60)} min. ***")
             else:
                 state["inflight"] = None
                 state["status"] = "send_error"
@@ -2252,12 +2966,29 @@ class ConsoleWorker:
             if state["inflight"]:
                 state["inflight"]["uncertain"] = True
                 state["inflight"]["stop_reason"] = stop_reason
+            attempts = self._schedule_retry_locked(state)
             state["uncertain"] = True
             state["status"] = f"turn_incomplete:{stop_reason or 'sin_resultado'}"
             state["status_at"] = self.now()
-            state["last_error"] = "turno sin end_turn; reportes retenidos"
+            state["last_error"] = (
+                f"turno sin end_turn; reintento automatico {attempts}")
         self._print(f"\n*** Turno incompleto (stopReason={stop_reason}). "
-                    f"Reportes retenidos; usa /reintentar o revisa Devin. ***")
+                    f"Reportes retenidos; reintento automatico #{attempts} en "
+                    f"{int(self._retry_interval() // 60)} min. ***")
+
+    def _retry_interval(self) -> float:
+        return retry_interval_seconds(self.policy)
+
+    def _schedule_retry_locked(self, state) -> int:
+        state["retry_attempts"] = int(state.get("retry_attempts") or 0) + 1
+        state["retry_after"] = self.now() + self._retry_interval()
+        return int(state["retry_attempts"])
+
+    def _clear_retry_locked(self, state) -> None:
+        state["retry_attempts"] = 0
+        state["retry_after"] = 0.0
+        state["escalated_at"] = 0.0
+        state["escalation_count"] = 0
 
     def _stdin_dispatch_loop(self) -> None:
         while True:
@@ -2442,10 +3173,47 @@ class ConsoleWorker:
                 return
         events = [e for e in state["pending"]
                   if e["occurrence_id"] in set(inflight.get("event_ids", []))]
+        if not events:
+            self._print("El lote incierto ya no esta en la cola (lo desalojo "
+                        "el ruido); se libera y sigo con los avisos nuevos.")
+            self._ui_event("retry_events_missing",
+                           event_ids=list(inflight.get("event_ids") or []))
         with self.store.transaction() as st:
             st["inflight"] = None
             st["uncertain"] = False
+            self._clear_retry_locked(st)
         self._send_batch(events, use_initial=bool(inflight.get("use_initial")))
+
+    def _maybe_auto_retry(self) -> bool:
+        """Reintenta el lote incierto cuando vence `retry_after` (10 min).
+
+        Devuelve True si disparo un reintento. La entrega sigue siendo
+        incierta: se reconecta con `session/load` de la misma sesion para no
+        perder el contexto antes de reenviar el mismo lote.
+        """
+        try:
+            state = self.store.load()
+        except Exception:
+            return False
+        inflight = state.get("inflight")
+        if not state.get("uncertain") or not inflight:
+            return False
+        if self.now() < float(state.get("retry_after") or 0.0):
+            return False
+        if self._transport is None or self._transport.closed:
+            self._print("\nReconectando con Devin (misma sesion guardada) "
+                        "para el reintento automatico...")
+            if not self._connect():
+                self._print("No se pudo reconectar; se reintenta en el "
+                            "proximo ciclo.")
+                return False
+        attempt = int(state.get("retry_attempts") or 0)
+        self._print(f"\n*** Reintento automatico #{attempt} del lote incierto "
+                    f"({len(inflight.get('event_ids') or [])} aviso(s)). ***")
+        self._ui_event("auto_retry", attempt=attempt,
+                       event_ids=list(inflight.get("event_ids") or []))
+        self._retry_inflight()
+        return True
 
     def _has_day_work(self) -> bool:
         try:
@@ -2546,8 +3314,28 @@ class ConsoleWorker:
                     self._drain_backlog()
                     if self._stop.is_set():
                         break
+                    if self._maybe_auto_retry():
+                        last_activity = time.time()
+                        continue
                     events = self._take_pending_events()
                     if events:
+                        need_rotate = self._should_rotate_session()
+                        if not need_rotate and not self._rotation_disabled \
+                                and digest_fresh_session(self.policy) \
+                                and any(e["level"] in digest_levels(self.policy)
+                                        for e in events):
+                            try:
+                                sess = self.store.load()["sessions"].get(
+                                    self.day, {})
+                            except Exception:
+                                sess = {}
+                            need_rotate = bool(
+                                sess.get("initial_prompt_sent"))
+                        if need_rotate and not self._rotate_session():
+                            # No bloquear el lote ni crear sesiones en bucle:
+                            # se sigue con la sesion actual y no se reintenta
+                            # la rotacion hasta el proximo worker.
+                            self._rotation_disabled = True
                         try:
                             sess = self.store.load()["sessions"].get(
                                 self.day, {})

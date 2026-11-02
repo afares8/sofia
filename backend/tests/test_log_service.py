@@ -61,6 +61,38 @@ def test_continuation_lines_are_not_own_errors():
     assert log_service._classify_level("ERROR: real failure") == "ERROR"
 
 
+def test_python_warning_source_echo_is_not_an_event(tmp_path, clean_log_state):
+    # openpyxl emite un UserWarning y la linea siguiente, indentada, es el eco
+    # del codigo ("warn(msg)"). Sofia la guardaba como WARNING con mensaje
+    # "(msg)" (issue 141630, 2026-11-01).
+    log = tmp_path / "app.log"
+    log.write_text(
+        "C:\\venv\\Lib\\site-packages\\openpyxl\\worksheet\\_reader.py:329: "
+        "UserWarning: Data Validation extension is not supported and will be removed\n"
+        "  warn(msg)\n"
+        "  warnings.warn(message, stacklevel=1)\n"
+        "2026-11-01 17:00:00,941 - app.x - WARNING - real warning\n",
+        encoding="utf-8",
+    )
+
+    events = asyncio.run(
+        log_service.tail_log("mayor", "Mayor", str(log), tail_lines=50)
+    )
+
+    assert [e.message for e in events] == ["real warning"]
+    assert log_service._file_positions[str(log)] == log.stat().st_size
+
+
+def test_indented_line_with_full_log_format_is_still_classified():
+    assert log_service._classify_level("warn(msg)", indented=True) is None
+    assert log_service._classify_level(
+        "warnings.warn(message, stacklevel=1)", indented=True) is None
+    assert log_service._classify_level(
+        "2026-11-01 17:00:00,941 - app.x - WARNING - real warning",
+        indented=True,
+    ) == "WARNING"
+
+
 def test_ansi_colored_level_is_stripped_and_classified(tmp_path, clean_log_state):
     # WPPConnect escribe \x1b[31merror\x1b[39m: <ts> <msg>; sin strip no se clasifica
     # (el \b de _LEVEL_RE no matchea "merror").
@@ -76,12 +108,18 @@ def test_ansi_colored_level_is_stripped_and_classified(tmp_path, clean_log_state
 
 
 @pytest.fixture
-def clean_log_state(monkeypatch):
+def clean_log_state(monkeypatch, tmp_path):
     monkeypatch.setattr(log_service, "_file_positions", {})
     monkeypatch.setattr(log_service, "_file_identities", {})
     monkeypatch.setattr(log_service, "_path_locks", {})
     monkeypatch.setattr(log_service, "_resolve_errors", {})
     monkeypatch.setattr(log_service, "_overlong_pending", set())
+    monkeypatch.setattr(
+        log_service, "_CURSOR_STATE_PATH", tmp_path / "log_cursors.json"
+    )
+    monkeypatch.setattr(log_service, "_cursor_state_loaded", True)
+    monkeypatch.setattr(log_service, "_cursor_last_persist", 0.0)
+    monkeypatch.setattr(log_service, "_cursor_persisted", {})
     monkeypatch.setattr(
         log_service, "_monitor_status", {"last_poll": None, "sources": {}}
     )
@@ -588,6 +626,62 @@ def test_startup_skip_advances_cursor_past_partial_line(
         f.write(b"ERROR: next\n")
     second = asyncio.run(log_service.tail_log("s", "S", str(p)))
     assert [e.message for e in second] == ["next"]
+
+
+def test_persisted_cursor_avoids_reingest_after_restart(tmp_path, clean_log_state):
+    # Issue 140208 (2026-10-31): cada reinicio del backend releia el startup
+    # tail de 8 KB y volvia a ingerir la misma linea ERROR de WPPConnect.
+    p = tmp_path / "wpp.out.log"
+    p.write_text(
+        "error: 2026-10-31T15:21:46.299Z Runtime.callFunctionOn timed out\n",
+        encoding="utf-8",
+    )
+    first = asyncio.run(log_service.tail_log("wppconnect", "WppConnect", str(p)))
+    assert len(first) == 1
+    assert log_service._CURSOR_STATE_PATH.is_file()
+
+    # Simular reinicio: se pierde el estado en memoria.
+    log_service._file_positions.clear()
+    log_service._file_identities.clear()
+    log_service._cursor_state_loaded = False
+    log_service._cursor_persisted = {}
+
+    second = asyncio.run(log_service.tail_log("wppconnect", "WppConnect", str(p)))
+    assert second == []
+
+
+def test_persisted_cursor_discarded_when_file_identity_changes(tmp_path, clean_log_state):
+    p = tmp_path / "a.log"
+    p.write_text("ERROR: old failure\n", encoding="utf-8")
+    assert len(asyncio.run(log_service.tail_log("s", "S", str(p)))) == 1
+
+    replacement = tmp_path / "b.log"
+    replacement.write_text("ERROR: new failure\n", encoding="utf-8")
+    os.replace(replacement, p)
+
+    log_service._file_positions.clear()
+    log_service._file_identities.clear()
+    log_service._cursor_state_loaded = False
+    log_service._cursor_persisted = {}
+
+    events = asyncio.run(log_service.tail_log("s", "S", str(p)))
+    assert [e.message for e in events] == ["new failure"]
+
+
+def test_persisted_cursor_resets_when_file_shrinks(tmp_path, clean_log_state):
+    p = tmp_path / "a.log"
+    p.write_text("ERROR: before truncate\n" + "z" * 100, encoding="utf-8")
+    assert len(asyncio.run(log_service.tail_log("s", "S", str(p), tail_lines=50))) == 1
+
+    p.write_text("ERROR: after truncate\n", encoding="utf-8")
+
+    log_service._file_positions.clear()
+    log_service._file_identities.clear()
+    log_service._cursor_state_loaded = False
+    log_service._cursor_persisted = {}
+
+    events = asyncio.run(log_service.tail_log("s", "S", str(p)))
+    assert [e.message for e in events] == ["after truncate"]
 
 
 @pytest.mark.parametrize("n", [0, -1])

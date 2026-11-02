@@ -76,6 +76,10 @@ Conservar mensaje completo redactado y timestamp de origen en detail (limite 120
 - Leccion de proceso: `pythonw.exe`/`python.exe` del venv arranca un hijo redirector en `Python311` real (padre->hijo PID); ese hijo NO es una instancia duplicada del puente ni de tareas. Verificar parent/child antes de reportar watchers duplicados.
 - Pruebas: `backend/.venv/Scripts/python.exe -m pytest tests/test_sofia_devin_bridge.py -q` desde `backend` (agente ACP falso por pipes, DB/state temporales, subprocess reales para mutex/estado, sin red ni modelo). Evidencia en `backend/data/devin-desktop/evidence/` (gitignored). Handshake `initialize` verificado en vivo (Devin 3000.11.3, `loadSession=true`, `authMethods=[devin-browser]`, `devin auth status`=autenticado); durante las pruebas no se envio session/new ni prompts reales. Activacion posterior: ambas tareas quedaron Running y avisos naturales abrieron una sesion real por grupo; esto no acredita que el analisis termine ni autoriza reinicios adicionales.
 - Consola minimizada (2026-10-18, pedido del dueno): `default_spawn_worker` pasa `STARTUPINFO` con `STARTF_USESHOWWINDOW` + `SW_SHOWMINNOACTIVE`; la consola del worker arranca minimizada en la barra de tareas y se restaura para interactuar. Verificado en vivo: con el flag el spawn usa conhost clasico (no Windows Terminal) y la ventana queda minimizada; sin el flag abria visible (WT). Aplica a workers nuevos: watchers reiniciados 2026-10-18 23:34:34 (Stop/Start) con el codigo nuevo; los workers abiertos siguen con el codigo previo. Test: `test_default_spawn_worker_starts_minimized_console`.
+- Silencios temporales (2026-11-01): `policy.json:mute_rules` acepta `{id, service_id?, pattern (regex case-insensitive), levels?, issue_ids?, expires_at (YYYY-MM-DD)?, note?}`. El watcher descarta los avisos que coinciden antes de encolarlos y tambien barre los que ya estaban en `pending`; NO toca `inflight` ni borra occurrences de `sofia.db`. Se cuenta en `state.muted` y en `/health` (`muted`). `levels` por defecto es `WARNING/ERROR`. Un regex/fecha invalida falla cerrado en `load_policy`. Regla activa: `mayor-banistmo-file-reception-sandbox` (hasta 2026-11-15; el sandbox del banco sigue roto y no hay fix local). Tests: `test_mute_rule_*`.
+- CRITICAL repetidos (2026-11-01): la policy puede incluir `CRITICAL` en `repeat_suppress_levels` con una ventana corta (`repeat_suppress_minutes_by_level: {"CRITICAL": 10}`). El primer CRITICAL de una firma sale igual (sigue en `urgent_bypass_levels`); los identicos dentro de 10 min se cuentan como `suppressed`. Esto evita que una rafaga de la guardia de memoria (varios `Sesion Devin cerrada por presion de memoria (PID #)` en el mismo minuto) abra un turno por cada PID. `sig_sent` se actualiza al enviar el prompt, no al encolar. Test: `test_repeated_critical_signature_suppressed_with_short_window`.
+- Guardia de memoria (2026-11-01 23:23): parche aplicado con elevacion (backup `C:/ProgramData/ServerSofia/Watch-DevinMemory.ps1.bak-20261101-232348`). Ahora agrupa **un solo CRITICAL por rafaga** (`Sesiones Devin cerradas por presion de memoria (N)`) y aplica `-CriticalRepeatMinutes` (default 60) con `last_critical_at` en el state; el detalle por PID sigue en el log local. Verificado con `-DryRun` forzando umbrales: 4 candidatos -> 1 aviso agregado. La regla de 10 min del puente queda como segunda barrera. Revisar con que `-MinVictimMB` se invoca (el log mostraba cierres de 45-302 MB pese al default 512).
+- Filtro operativo (2026-11-01, pedido del dueno): `digest_minutes=360` (cada 6 h) y `repeat_suppress_minutes=360` para WARNING. `mute_rules` silencia familias operativas: `inventory.low_stock`, `sales.payment.verify.amount_unverifiable`, `QUOTA_PLAN_UNDEFINED`/`fiscal.quota.check_failed`, warnings de `purchase_invoices`, `jobs.depreciation_failed`, `Slow request` de `tec` y el fallback de URLs DIAPI de `packing`. NO se silencian ERROR/CRITICAL ni bugs reales (`ReferenceError`, `ErrorBoundary`, `TypeError` de modulo dinamico, fallos de red). Banistmo ademas tiene un `log_ignore_patterns` preciso para las dos causas del sandbox; un Banistmo con otra causa sigue entrando. El fixture de tests aisla `digest_minutes=60` y `mute_rules=[]` para no depender de la policy de produccion.
 
 
 ## Vision como servicio monitoreado (2026-10-16)
@@ -385,7 +389,9 @@ Familias que se repiten y son esperadas o artefactos de parsing, no fallos de la
   SAP DI (8001) aun no responde mientras PackingBackend inicia (es hijo suyo); el codigo cae a la URL
   configurada y se recupera en ~1 min. Verificado 2026-10-16 tras un reinicio: `/Health/Index` ->
   `connected:true`, `connectionAge 0.7 min`. Transitorio y esperado en cada reinicio (esperar 30-60s
-  antes de tratarlo como caida).
+  antes de tratarlo como caida). Re-verificado 2026-11-01: PackingBackend arranco 23:59:42 local
+  (el aviso se ingirio a las 00:00:15) y a las 02:07 el middleware 8001 daba `connected:true`,
+  `connectionAge 126 min`.
 - **Packing `packing_service` backfill / entrega parcial (issues 77520-77531/77541-77550 "No matching
   SAP line found for X in order Y (bulto N)"; 32195 "Order has incomplete quantities - proceeding with
   partial delivery" + continuaciones "   - Product ...")**: la reconciliacion de cantidades detecta
@@ -571,10 +577,17 @@ el detached-frame comun. Reiniciar WPPConnect NO borra el pairing (pero es mas p
 La linea de log `error: ... Runtime.callFunctionOn timed out ... ProtocolError` (issue 77881) es la
 MISMA firma de ese frame colgado; el monitor pasivo la ingesta como issue ERROR, y puede llegar
 tarde (la linea ingerida era de ~6 h antes, cuando WPPConnect ya estaba UP). No es un error nuevo:
-si el probe `wppconnect` esta UP (200) al momento, es historico. ADEMAS: las mismas lineas del
-2026-10-16T19:32:37Z se reingirieron varias veces (issues 77959/77961 re-creados con nuevas
-occurrences 78050/78051, 78166/78167) -> el CURSOR del log de WPPConnect no avanza / relee tramos;
-revisar el cursor de `WPPConnect.out.log` (identidad de archivo / from_now).
+si el probe `wppconnect` esta UP (200) al momento, es historico.
+
+**Cursor de logs persistido (2026-11-01, verificado):** las reingestiones repetidas (issues
+77959/77961 y de nuevo 140208: la misma linea del 2026-10-31T15:21:46Z genero 7 occurrences,
+una por cada reinicio de SofiaBackend ese dia) no eran un cursor que "no avanza": el cursor vivia
+solo en memoria y cada arranque hacia el startup tail de 8 KB (`_STARTUP_TAIL_BYTES`), que volvia
+a leer la misma linea. Ahora `log_service` persiste `{dev, ino, pos}` por archivo en
+`backend/data/log_cursors.json` (override `SOFIA_LOG_CURSOR_PATH`), lo restaura una vez por
+proceso y lo guarda atomico una vez por ciclo de `log_poll_loop`. Si falta el archivo, cambia la
+identidad (reemplazo) o el archivo encogio, se conserva el startup tail anterior. Verificado en
+vivo: reinicio de SofiaBackend 2026-11-01 01:02 local sin nueva occurrence de 140208; 514 tests OK.
 
 ### Episodio 2026-10-19 03:00-03:04 local (recuperado con close+start; verificado)
 - Watchdog del wrapper: `Chromium unresponsive (1/3)` 03:01:06 -> `recovered` 03:02:07
@@ -714,6 +727,7 @@ Contexto: el dueno pidio "arreglar de raiz las dos salvedades [de la auditoria],
 - Fix (`droplet_docker_service.py`): `LOG_TAIL_CAP = 50000` (`docker logs --since X --tail 50000 ...`; la consulta baja a ~3 s) + `_fetch_container_logs()` aisla fallas por contenedor (queda en `log_failures` de `/api/health/sofia`; una fuente lenta ya no tumba el poll completo).
 - Verificado en vivo tras reiniciar SofiaBackend: primer poll OK y segundo poll estable (`consecutive_failures: 0`, `log_failures: {}`), sin nuevas ocurrencias `droplet-ssh`.
 - Pendiente del dueno (NO autorizado aun): rotacion de logs docker en el droplet (`daemon.json` log-opts max-size/max-file; requiere recrear contenedores) y/o truncar el json-log de 2.2 GB. El droplet ademas mostro OOM reales esa noche (postgres/redis/systemd oom-killer 19:35-19:47 y 01:03 UTC) - presion de memoria a vigilar.
+- RECURRENCIA 2026-10-26 11:42Z (issue 18450): un poll fallo con `last_error=""` (timeout de los 90 s del fetch completo) mientras el droplet estaba en load 13-17 con 4 CPUs y dos backends arriba (`tec-backend-next` iniciado 11:38:27Z y `tec-backend-1` reiniciado 11:44:07Z, deploy en curso; 8 workers python a ~77% CPU). El poll siguiente (11:44:54) volvio a OK (`consecutive_failures:0`, `log_failures:{}`). En la misma ventana el scheduler de Mayor (`app.elenatec.com` = el droplet) registro un read timeout y se recupero al minuto siguiente. Es transitorio del droplet bajo carga, no del monitor: no requiere cambio de codigo.
 
 ### 2. Errores WinError 5 del watcher al reemplazar state.json
 - Evidencia: 5 lineas en `local/watcher.log` (mtime <=07:58 local) y 4 en `elenatec/watcher.log` (<=02:08); los state.json se escribian normal; la suite de tests usa dirs temporales (no toca el state real). Holder no identificado (locks transitorios; candidatos: AV/filtros). OJO: `occurrences.timestamp` de eventos pasivos = hora de INGESTA (los 9 eventos se ingirieron recien al activar el monitoreo, no a la hora del error original).
@@ -847,6 +861,156 @@ un reinicio).
 - Guardia de host: tarea SYSTEM `ServerSofia-DevinMemoryGuard` cada 5 min (`C:\ProgramData\ServerSofia\Watch-DevinMemory.ps1`, log `Logs\DevinMemoryGuard-YYYY-MM-DD.log`). Aviso a Sofia (`service_id=devin-memory-guard`) si el commit libre < 8192 MB; con < 4096 MB cierra las sesiones `devin.exe` mas antiguas (>= 120 min) hasta recuperar 8192 MB. Las 4 sesiones Devin del 19-oct (~34 GB de commit) causaron el agotamiento que tumbo Vision y SofiaBackend el 20-oct.
 - Tests: `test_health_snapshot_paused_is_503`, `test_pause_self_heals_when_report_arrived_after_pause`, `test_pause_stays_without_report_after_pause`, `test_process_commit_bytes_current_process`, `test_worker_recycles_agent_over_commit_limit`, `test_worker_keeps_agent_under_commit_limit` (108 passed).
 
+### Guardia de memoria: throttle del aviso (2026-10-27)
+
+- El WARNING a Sofia se emite como maximo una vez por hora (`-WarnRepeatMinutes`, default 60)
+  mientras el commit libre siga bajo el umbral; cada tick de 5 min sigue quedando en el log local.
+  Estado en `C:\ProgramData\ServerSofia\Logs\DevinMemoryGuard.state.json` (`warned`, `last_warn_at`).
+  Al volver por encima de 8192 MB se registra `commit recuperado ... aviso previo cerrado` y el estado
+  se reinicia. La via CRITICAL (<4096 MB) no cambia: cierra y notifica igual.
+- Motivo verificado: sin throttle cada tick creaba una occurrence nueva del issue 87390 (35 en el dia
+  UTC 2026-10-27 = ventana local 19:00-24:00 del 26-oct) y el puente abria un turno de Devin cada 5 min
+  justo cuando el host estaba bajo de memoria (ui-events local: prompts 04:36-05:01Z con 1 evento cada
+  uno, todos del memory guard).
+- El `message` que muestra un reporte de Sofia para ese issue es el de la PRIMERA occurrence
+  (`Commit del host bajo: 3091 MB libres`, 20-oct); el valor vigente va en `detail`.
+- Causa de la presion: sesiones interactivas `devin.exe` dejadas abiertas (arboles
+  PowerShell -> `devin.exe` -> `devin.exe acp`, ~9.5 GB cada una) mas WindowsTerminal creciendo
+  ~450 MB/5 min. La guardia las cierra a <4096 MB: 2026-10-27 00:20:43 cerro PID 12096 (9710 MB) y el
+  commit libre paso de 3556 a 13235 MB. Los workers del puente no son esas sesiones (su arbol cuelga
+  del `python.exe worker` y se reciclan por `agent_commit_limit_mb`).
+- Respaldo del script previo: `C:\ProgramData\ServerSofia\Watch-DevinMemory.ps1.bak-20261027`.
+  Prueba aislada con `-LogDir` temporal, `-WarnFreeMB` artificial y `-SofiaUrl` inalcanzable
+  (aviso, throttle, recuperacion y `-DryRun` sin estado).
+- Windows Terminal puede ser el mayor consumidor del host y la guardia NO lo toca (por diseno: sus
+  pestanas son sesiones interactivas del dueno). Verificado 2026-10-27: `WindowsTerminal#7760` paso
+  de 7.3 GB (00:00) a 15.3 GB (01:35) creciendo +92 MB/min con ~0.8 s de CPU/min, mientras sus
+  OpenConsole seguian en 2 MB. Al cerrar la guardia la sesion ACP `devin#28460` (01:35:43) el
+  crecimiento **se detuvo en seco** (15 306 MB planos durante 90 s, commit libre 13.7 GB): el
+  consumo de WT esta ligado a la salida de consola de esas sesiones, no solo a un leak del binario
+  (hay issues conocidos: microsoft/terminal #16983 hardware rendering, #14588, #19710).
+  Matar la sesion detiene la hemorragia pero NO devuelve los GB ya acumulados en el scrollback:
+  eso solo lo libera cerrar la pestana/terminal (accion del dueno). Mitigacion conocida:
+  `"useSoftwareRendering": true` en `settings.json` (aplica al reiniciar WT).
+
+### Guardia de memoria: aviso transitorio 2026-10-31 (recuperado solo)
+
+- 04:25:42 local: WARNING con commit libre 7977 MB (umbral 8192). A las 04:30:42 bajo a 7686 MB y
+  el segundo aviso a Sofia se omitio por throttle (60 min); a las 04:35:42 el commit libre volvio a
+  10327 MB y el log registro `commit recuperado por encima del umbral; aviso previo cerrado`.
+  Nunca se acerco al umbral CRITICAL (4096 MB), asi que la guardia no cerro ninguna sesion.
+- Fuentes medidas en el pico (`Win32_Process` + `PrivateMemorySize64`): 3 sesiones ACP de larga vida
+  `devin.exe acp` (PID 40660, 12.9 GB; PID 28732, 10.9 GB; PID 2032, 5.6 GB) y `WindowsTerminal`
+  PID 22400 (desde 10-27 22:07, 4.7 GB); total `devin` 20 procesos / 33.3 GB.
+- El texto del reporte (`Commit del host bajo: 3091 MB libres`) sigue siendo el de la primera
+  occurrence del 20-oct; el valor vigente esta en `detail` (ver arriba). No requiere accion.
+
+### Guardia de memoria: cierre CRITICAL 2026-10-31 06:50 (recuperacion automatica)
+
+- La guardia cerro **PID 40660** (edad 1801 min, commit 13410 MB) a las 06:50:42 local cuando el
+  commit libre llego a **3719 MB** (< 4096 CRITICAL). Log: `cerrado PID 40660 ... : ok` y
+  `commit libre tras la guardia: 17137 MB`. Estado posterior: commit libre 17.1-17.9 GB, 19 procesos
+  `devin`, sin servicios caidos (Mayor/Packing/Sofia/Vision/WPPConnect y ambos DIAPI en 200).
+- **El PID del `message` del reporte no es el de hoy**: `Sesion Devin cerrada ... (PID 45628)` es la
+  primera occurrence del issue 87391 (2026-10-20 13:00:47, mismo patron que el issue 87390); el PID
+  y las cifras vigentes estan en `detail`.
+- La sesion cerrada era una **sesion interactiva** (`devin.exe acp` sin `--permission-mode`, arbol
+  `devin.exe` -> `devin.exe acp`), abierta el 10-30 00:49. **No era el canal de auto-fix**: los ACP
+  del puente llevan `--permission-mode dangerous acp` y se reciclan cada ~1 h por
+  `agent_commit_limit_mb` (historial local: PIDs 36176 01:14, 29964 01:37, 29132 09:20, 21916 10:25,
+  12368 11:50). El `session_ready resumed=true` de 11:50:52Z es ese reciclaje normal al inicio del
+  turno, no una recuperacion por el cierre.
+- Puente sano tras el cierre: `local` status ok / 0 uncertain / worker vivo (cursor 140017) y
+  `elenatec` status ok / 0 pendientes; el turno de elenatec de 06:50-06:53 termino en `end_turn`.
+- Presion restante medida: sesiones interactivas PID 28732 (11.4 GB) y PID 2032 (6.1 GB) +
+  `WindowsTerminal` PID 22400 (4.7 GB). Mientras sigan abiertas el commit libre volvera a bajar y la
+  guardia cerrara otra sesion < 4096 MB; liberar esos GB requiere cerrar la pestana/terminal
+  (accion del dueno). No se cerro nada a mano.
+
+### Guardia de memoria: avisos transitorios 2026-11-01
+
+- Dos occurrences del issue 87390 (141378, 141393): 09:25:42 local con commit libre 8036 MB y
+  10:20:42 con 7597 MB; el segundo aviso a Sofia se emitio porque el estado se habia reiniciado al
+  recuperarse el commit, y el tick de 10:25:42 (7160 MB) quedo omitido por throttle.
+- A las 09:45:42 el commit libre volvio a 10281 MB sin que la guardia cerrara nada (devin siguio
+  con 14 procesos). Nunca se alcanzo el umbral CRITICAL (4096 MB).
+- Fuentes medidas (`Win32_Process` + `PrivateMemorySize64`): `WindowsTerminal` PID 22400 (desde
+  10-27 22:07) **19.6 GB plano**; dos sesiones **interactivas** `devin.exe acp` PID 32200
+  (10-31 16:45, 6.6 GB) y PID 17692 (10-31 17:48, 6.3 GB) creciendo ~25-30 MB/5 min, ambas colgando
+  de `powershell.exe` de la pestana de WT 22400 (no son workers del puente).
+- Workers del puente con `--permission-mode dangerous acp` sanos y bajo `agent_commit_limit_mb`:
+  PID 30288 (06:31, 2971 MB) y PID 13540 (09:42, 2584 MB). Los `devin.exe` del perfil
+  `systemprofile` son cascarones ociosos de ~50 MB.
+- `useSoftwareRendering` no esta definido en `LocalState\settings.json` de Windows Terminal
+  (ultima escritura 2026-08-26); la mitigacion documentada sigue sin aplicar. Los 19.6 GB de WT solo
+  se liberan cerrando pestanas (accion del dueno); a <4096 MB la guardia cerrara las dos sesiones
+  interactivas por edad/tamano, como esta disenado.
+
+### Guardia de memoria: cierre CRITICAL 2026-11-01 13:55 (recuperacion automatica)
+
+- 13:55:42 local: commit libre **3649 MB** (<4096 CRITICAL). La guardia cerro **PID 32200**
+  (edad 1271 min, 7854 MB) y el commit libre paso a **11488 MB**; el tick de 14:00:42 registro
+  `commit recuperado ... (10655 MB)` y reinicio el estado (`warned=false`). Occurrence 141509.
+- El PID cerrado era la **sesion interactiva** abierta el 10-31 16:45 (la `devin#32200` de la
+  seccion anterior), no un worker del puente: los ACP con `--permission-mode dangerous acp`
+  (PID 10132 local 13:11, PID 18648 elenatec 13:55) siguieron vivos y ambos grupos quedaron
+  `status ok` / `worker_alive true`. Ningun servicio NSSM se cayo.
+- Presion restante (medida 14:00 local): `WindowsTerminal` PID 22400 **21.8 GB** (no se toca por
+  diseno) y la otra sesion interactiva `devin#17692` (10-31 17:48, 7.6 GB, +25-30 MB/5 min). Con
+  eso el commit libre volvera a bajar y habra otro cierre <4096; liberar esos GB exige cerrar la
+  pestana/terminal del dueno.
+- El PID del `message` del reporte (`PID 45628`) sigue siendo el de la primera occurrence del
+  issue 87391 (2026-10-20); el PID y las cifras vigentes van en `detail`.
+- Riesgo observado (NO aplicado, a decidir): `Watch-DevinMemory.ps1` elige victimas entre todo
+  `devin.exe` con edad >= `MinAgeMinutes` ordenado por tamano, sin excluir los workers del puente.
+  Si un worker supera 120 min y el commit libre cae <4096, podria cerrarse a mitad de turno
+  (`prompt_sent` => `uncertain`, requiere `/reintentar`). Hasta hoy todos los cierres cayeron en
+  sesiones interactivas o cascarones `systemprofile`. Blindaje posible: excluir por
+  `CommandLine -match '--permission-mode'` y dejar ese cierre solo como ultimo recurso.
+
+### Guardia de memoria: caida reanudada tras el cierre de 13:55 (2026-11-01)
+
+- Despues del cierre de PID 32200 el commit libre subio a 11488 MB (13:55) y volvio a bajar:
+  9762 (14:05), 8895 (14:10), 8026 (14:15, occurrence 141519), 7129 (14:20), 10199 (14:25,
+  recuperado -> estado reiniciado), 9439 (14:30), 8716 (14:35), 7888 (14:40, occurrence 141528),
+  7094 (14:45), 6263 (14:50), 5151 (14:55) y 4480 MB medido a las 14:57.
+- Consumidor dominante: `WindowsTerminal` PID 22400, 23.2 GB (14:15) -> 25.5 GB (14:40) ->
+  27.1 GB (14:55) -> 27.6 GB (15:00), ~+300-500 MB/5 min; no se toca por diseno. La sesion
+  interactiva `devin#17692` (10-31 17:48) seguia en ~8.0 GB y era la mayor elegible.
+- 15:00:42: commit libre 3814 MB (<4096) -> la guardia cerro PID 17692 (edad 1272 min, 8029 MB)
+  y el commit libre paso a 11828 MB (occurrence 141550; el `message` del issue 87391 sigue
+  mostrando `PID 45628` y el PID real va en `context`). Los workers del puente (PID 15036 local
+  2023 MB, PID 18648 elenatec 1373 MB) siguieron vivos y ambos grupos quedaron `status ok`.
+- Ambos WARNING se emitieron con el throttle de 60 min; el texto del reporte
+  (`Commit del host bajo: 3091 MB libres`) sigue siendo el de la primera occurrence del issue
+  87390. Sin accion local: liberar los GB de WT exige cerrar la pestana (dueno).
+
+### Guardia de memoria: sobre-cierre de cascarones y fix de seleccion de victimas (2026-11-01)
+
+- 15:14:39 local: un build **Android release de VisionMobile** (`vision/mobile/build_android.ps1`
+  -> `gradlew.bat assembleRelease`) arranco desde una pestana interactiva de WindowsTerminal;
+  el daemon Gradle (java 2698 MB) + Kotlin/aapt2/ninja/clang sumaron ~4.3 GB de commit y a las
+  15:16:40 el commit libre cayo de 10792 a **3316 MB** en 6 min.
+- La guardia cerro PID 25148 (1990 MB) y siguio con **9 `devin.exe` mas de 45-302 MB**
+  (occurrences 141556-141565; 2 cerraban en `fallo`). El commit subio a 8467 MB y a las 15:20:42
+  el build solto memoria (13045 MB, devin 4 procesos). `WindowsTerminal` PID 22400 se mantuvo en
+  27.8 GB: el pico lo causo el build, no el terminal.
+- **Defecto real:** cerrar cascarones de 45-302 MB no puede recuperar 8192 MB y destruye sesiones
+  interactivas del dueno. FIX en `C:\ProgramData\ServerSofia\Watch-DevinMemory.ps1`
+  (backup `.bak-20261101`): nuevo `-MinVictimMB` (default 512) que excluye victimas que no aportan
+  commit; los workers del puente ACP (`CommandLine -match '--permission-mode'`) pasan a ser
+  **ultimo recurso** (antes podian ser la primera victima por tamano); el log y el `detail` marcan
+  `[worker del puente]`; si solo quedan sesiones por debajo del umbral se registra
+  `commit critico y solo hay sesiones Devin por debajo de 512 MB (...) ; no se cierran` y no se
+  mata nada.
+- Verificado: parse OK; `-DryRun -LogDir <temp>` con `-WarnFreeMB/-CriticalFreeMB 999999` lista
+  victimas sin matar y sin escribir estado; `-MinVictimMB` alto -> mensaje de "no se cierran";
+  `-MinAgeMinutes 0` -> los dos workers del puente salen como `[worker del puente]` en ultimo
+  lugar; corrida real de la tarea 15:25:42 con los defaults -> INFO normal. ACL intacta
+  (SYSTEM/Administradores FullControl).
+- Sigue pendiente (dueno): los 27.8 GB de `WindowsTerminal` PID 22400 y `useSoftwareRendering`.
+  El build de VisionMobile es trabajo interactivo de otra sesion; no se toco.
+
 ## Puente Sofia-Devin: digest de cola, cierre por inactividad y auto-recuperacion (2026-10-20)
 
 - Cola grande en UN mensaje: con mas de `backlog_digest_threshold` (policy, default 50) avisos
@@ -963,6 +1127,41 @@ pidio no tener scripts automaticos); el watchdog es la unica recuperacion automa
   Secuencia real 00:46:56: ch6 main rechazado mientras ch4 tenia el slot -> `stream started`
   de ch6 al reintentar. No es un fallo; no tocar el presupuesto sin decision del dueno.
 
+### Vision: `stream start failed ... code=310070` de Tocumen (device 79) es red, no codigo (2026-10-26)
+
+- `VmsSofia.Api.DeviceService[0] stream start failed device=79 channel=N streamType=0/1
+  code=310070` (issues 115027-115036) llega en rafaga: device 79 = **Tocumen**
+  (hikpartner/hybrid, serial FQ8324693). Al abrir una vista de 9 camaras del sitio remoto algunos
+  canales fallan el primer intento ("The device is off-line, or connection timeout caused by
+  network" / "No error") y el reintento arranca (`stream started device=79 channel=1..8`). El
+  device sigue `online=True` con sus 33 camaras online y el log solo tenia 34 fallos (devices 79
+  y 83): no es ruido cronico ni un fallo del vms-api.
+- En la misma ventana el visor afectado deja `POST /mtx/cam_1701_low/whep -> 502 in 50 s`
+  (timeout del proxy porque el canal no publico media). cam_1701 acumula solo 2 502 historicos y
+  se recupera al reintentar. Los `slow request ... register-stream -> 200 in 4-6 s` del mismo
+  minuto son el logger de diseno (>1.5 s) por la latencia del sitio remoto.
+- Patron de un `_low` en frio durante una vista concurrente (2026-10-26 00:30-00:32, canales
+  9/10/11/12 de Tocumen): primero `POST /mtx/cam_<id>_low/whep -> 502 in 50 s` (el proxy agota su
+  timeout esperando media) y al reintentar `-> 400 in 12-21 s` (MediaMTX no tiene stream). `_low`
+  es un transcode `runOnDemand` desde `_sub` (verificado en `/v3/config/paths/get`); al verificar,
+  el `_sub` de 1670/1671/1672 no estaba publicando y el de 1701 si. `register-stream` respondio
+  200 (4.9 s) y no se registro `stream_events`, asi que no hubo error del backend; el visor
+  reintenta y el resto de la misma vista cargo con 201. En todo el log esos 4 caminos solo tienen
+  estos 502/400.
+- Ojo al leer el mensaje del issue: 79109 muestra `cameras/1450 ... 25813 ms` porque el
+  fingerprint conserva el texto de la PRIMERA ocurrencia (2026-10-17); el detail de la ocurrencia
+  actual es `cameras/1669 ... 5319 ms`.
+- Rafaga de ~16 `slow request POST /mtx/cam_<id>_low/whep -> 201` en <15 s = una cuadricula de 16
+  celdas abriendose, no un incidente: el cliente Web limita a 8 las negociaciones WHEP y los
+  `register-stream` simultaneos (auditoria `AUDITORIA_OPTIMIZACION_VISION_2026-10-23.md`) y el
+  resto espera 1.5-4 s; todas terminan 201. Verificado 2026-10-26 00:26:42-00:26:54 (16 camaras
+  distintas, cliente publico 181.178.73.209, sin repeticion en la hora siguiente).
+- Cada camara/canal cae en un issue distinto porque `_fingerprint` normaliza solo numeros de 4+
+  digitos: `cam_1356`, `device=79` y `channel=7` no matchean `\b\d{4,}\b` (el `_` es caracter de
+  palabra y 79/7 tienen <4 digitos). Es fragmentacion esperada del monitor, no 16 fallos.
+
+
+
 
 
 
@@ -1074,3 +1273,216 @@ ser atomica con el release). No se toco codigo ni datos.
 
 
 
+
+## Puente Sofia-Devin: cola con prioridad, reintento y escalado (2026-10-24)
+
+Incidente que lo motivo: el 2026-10-23 11:02 el ACP devolvio `-32011 weekly usage
+quota exhausted`. El puente marco `uncertain` y, por diseno, no reenviaba nunca
+solo; la cola local crecio hasta `MAX_PENDING=500` y el cursor quedo congelado en
+111157. El 2026-10-24 09:46 Sofia SI detecto y alerto la caida de Packing
+(`Packing no responde (DOWN)`, occurrence 111579, CRITICAL), pero ese aviso quedo
+422 IDs por delante del cursor: el CLI nunca lo recibio.
+
+Cambios verificados (tests en `tests/test_sofia_devin_bridge.py` y
+`tests/test_bridge_escalation.py`, 133 casos):
+
+- **La cola llena ya no congela el cursor.** `admit_event()` decide por nivel:
+  CRITICAL/ERROR siempre entran (hasta `MAX_PENDING_HARD=2000`); el WARNING se
+  descarta o desaloja al WARNING mas antiguo (`state.dropped`). El cursor avanza
+  siempre, asi un critico de hoy no queda detras del ruido de ayer.
+- **Despacho por prioridad.** `_take_pending_events()` ordena CRITICAL > ERROR >
+  WARNING y dentro de cada nivel respeta el orden de llegada.
+- **Reintento automatico cada 10 min** (`policy.retry_interval_minutes`). Un
+  lote incierto ya no espera a `/reintentar`: el worker reconecta con
+  `session/load` de la misma sesion y reenvia el lote. Estado:
+  `retry_attempts`, `retry_after`.
+- **Escalado a WhatsApp + correo** cuando el error persiste
+  (`policy.escalate_after_attempts=3`, o sea ~30 min). El watcher hace POST a
+  `http://127.0.0.1:5180/api/bridge/escalation` con el token de
+  `C:/ProgramData/ServerSofia/bridge-alert.token` (ACL: SYSTEM lectura, admins
+  total, ahmed lectura). Sin token el endpoint falla cerrado (503). Repeticion
+  minima: `policy.escalation_repeat_minutes=360`; si el envio falla se reintenta
+  en 10 min. El endpoint reutiliza `whatsapp_service.send_alert` y
+  `email_alert_service.send_fallback_email`.
+- **WhatsApp con el canal global apagado.** `alerts.whatsapp_enabled` sigue en
+  false (se apago el 18-oct por ruido). `alerts.bridge_escalation_whatsapp=true`
+  habilita WhatsApp SOLO para el escalado del puente (`_whatsapp_cfg()` copia la
+  config sin mutarla). OJO: al 2026-10-24 la sesion de WPPConnect esta
+  `Disconnected` y pide QR; hasta reemparejar, el escalado solo entrega correo.
+- **Despliegue**: el puente corre por las tareas `Sofia-Devin-AppsPC` y
+  `Sofia-Devin-ElenaTec` (SYSTEM). Reinicio con
+  `C:\ProgramData\ServerSofia\restart_bridge_tasks.ps1` (UAC): detiene tareas,
+  mata procesos `sofia_devin_bridge` y las vuelve a arrancar. El backend necesita
+  reinicio para cargar `app/routers/bridge.py`.
+- **Verificacion**: `Get-Content backend/data/devin-desktop/<grupo>/state.json`
+  (cursor, dropped, retry_attempts, escalated_at) y
+  `backend/data/devin-desktop/<grupo>/ui-events.jsonl`
+  (`auto_retry`, `retry_events_missing`, `prompt_completed`). Health:
+  `http://127.0.0.1:5185/health` (local) y `:5186` (elenatec).
+
+### Estado de RAM fisica 2026-10-27 09:36 (host degradado)
+
+- `ullAvailPhys` **499 MB**, carga **97 %**; `WindowsTerminal#7760` WS **8 979 MB**, 12 `devin.exe`
+  WS 2 589 MB, commit libre 8 193 MB. Con ese nivel, Windows ya recorta working sets por su cuenta:
+  recortar a mano no devuelve GB.
+- Consecuencias medidas en esa ventana: 4 endpoints de ficha de producto en Mayor a **31,4-31,9 s**,
+  `export-pdf` 33,2 s, timeouts de Mayor a Packing `/wms/infrastructure/warehouses` (10 s x2),
+  Vision rechazando HD por su piso de 1536 MB. SAP respondia 1-13 ms (descartado).
+- La guardia no actua (mide commit, 8 GB libres). La unica recuperacion real es que el dueno cierre
+  o reinicie Windows Terminal (~9 GB residentes).
+
+## Corte de red transitorio 2026-10-27 10:54-11:06 (verificado)
+
+- Sintomas simultaneos: CRITICAL de `Ingest E2E (elenatec)`, `Ngrok Tunnel (E2E publico)`,
+  `SofiaTunnel (SSH a droplet)`, `Sofia-Devin local` y `Sofia-Devin ElenaTec`; `droplet docker poll
+  failed: timed out`; Vision `hikpartner` sin contacto con `apiius.hik-partner.com`; `Elenatec
+  scheduler` WinError 10060; WPPConnect `Runtime.callFunctionOn` timeouts + ReadTimeout 60 s.
+- Recuperado solo: ping 8.8.8.8 OK, DNS resuelve, `elenatec.com` 200, URL publica ngrok 200,
+  `/api/health/tunnel` 200, 5185 y 5186 -> 200. No hizo falta reiniciar nada.
+- Puente ElenaTec: quedo `status=uncertain` (ACP -32010) y su health devolvio 503 (por diseno);
+  el reintento automatico del worker (10 min) reconecto con `session/load` y volvio a `ok`.
+- WPPConnect: el watchdog hizo auto-recovery (close+start) a las 11:02:43 local; el log muestra
+  `isLogged` + `Started Session: default` **sin QR** -> pairing preservado.
+- En la misma ventana el host estaba al 98 % de RAM (scoreboard 24 s, imagenes 9,4 s,
+  `send-file-base64` 80 s): red + paginacion se sumaron.
+
+## Incidentes de impresion de Mayor (2026-10-30)
+
+- Mayor escribe lineas `ERROR ... [printnode] ABIERTO|SIGUE|AUTOCURACION ...` a stderr
+  (`C:/Users/ahmed/apps/service-logs/MayorBackend.err.log`), que Sofia ya monitorea como
+  servicio `mayor`. No hace falta configurar nada: se vuelven occurrences y el puente
+  Sofia-Devin las envia al grupo local.
+- Cada linea trae bodega, impresora, estado PrintNode, alerta fisica (SNMP), tamano de la
+  cola del spooler y el comando de triage. Skill:
+  `C:/Users/ahmed/apps/mayor/.devin/skills/printnode-triage/SKILL.md`.
+- Triaje: `cd C:/Users/ahmed/apps/mayor/backend && .venv/Scripts/python.exe scripts/printnode_triage.py --warehouse <N>`
+  (`--cycle` re-prueba, `--fix` autocuracion segura, `--purge --yes` destructivo).
+- El monitor de Mayor ya aplica `restart_spooler` con cooldown cuando la impresora responde
+  en red pero Windows la marca offline. Si el incidente sigue abierto despues de `--fix`,
+  es fisico (papel/atasco) o de red: no reintentar en bucle.
+
+## Optimizacion de consumo del puente Sofia-Devin (2026-10-30)
+
+- El puente suprime WARNING/ERROR repetidos por firma estable (servicio + nivel +
+  mensaje normalizado). `repeat_suppress_minutes` es 240 min para WARNING y 60 min
+  para ERROR (`repeat_suppress_minutes_by_level`). Cada `repeat_escalate_after` (12)
+  ocurrencias suprimidas deja pasar una recidiva para que una tormenta persistente no
+  quede invisible. CRITICAL no se suprime (`repeat_suppress_levels`).
+- Modo horario: `digest_levels` = WARNING+ERROR, `digest_minutes` = 60. Todos los
+  avisos de la hora se mandan en UN solo prompt (`digest_force`); `digest_fresh_session`
+  abre `session/new` + prompt inicial para ese lote, de modo que cada hora arranca de
+  cero. Un CRITICAL rompe la ventana y sale de inmediato (`urgent_bypass_levels`). Si
+  solo hay WARNING/ERROR esperando, el watcher no abre el CLI hasta que vence la hora.
+- La conversacion tambien se renueva por `session_recycle_prompts` (80 lotes) o
+  `session_recycle_minutes` (240 min), como red de seguridad para lotes CRITICAL.
+- `stall_seconds` subio a 1800 (30 min) porque los reintentos por stall consumian ~27%
+  de los tokens del 30-oct; `stall_seconds` es worker-side y aplica al proximo worker.
+- Estado nuevo: `sig_sent` (firmas ya enviadas, acotado a 2000) y
+  `warning_hold_until`; ambos son opcionales y los `state.json` viejos cargan con
+  defaults.
+- Pruebas: `backend/.venv/Scripts/python.exe -m pytest tests/test_sofia_devin_bridge.py -q`
+  (144 passed) y `tests/test_bridge_escalation.py` (5 passed).
+- Modelo del CLI: `deepseek-v4-1-flash-1017-high` (DeepSeek V4.1 Flash High), definido
+  en `C:/Users/ahmed/AppData/Roaming/devin/config.json`. `policy.json -> model` queda
+  vacio por defecto (respeta el default); si se fija un valor que la sesion no anuncia,
+  el worker falla cerrado con `model_error`.
+
+## Monitor Docker del droplet: deadline duro y `docker logs` colgado (2026-10-30)
+
+Incidente: `droplet docker poll failed:` (issue `Droplet SSH`, WARNING) con mensaje vacio desde
+2026-10-30 06:04 local, escalando hasta `Poll failed (14x)`. Causa: `_ssh_exec` usaba
+`client.exec_command(...)` + `stdout.read()`; el timeout de paramiko solo acota cada `recv`, asi
+que un `docker logs --tail 50000 --timestamps tec-db-1` que gotea datos nunca vencia: el hilo
+quedaba colgado con la sesion SSH abierta y `asyncio.wait_for` no puede cancelar un
+`to_thread`. Cada poll vencido dejaba un `docker logs` vivo en el droplet: se acumularon **170**
+procesos, dockerd subio a **350 % de CPU**, `docker ps -a` paso de 0.1 s a **36 s** (retro
+alimentacion: el poll se volvia a vencer) y la carga del droplet llego a 6. El mensaje salia
+vacio porque `str(TimeoutError)` es `''`.
+
+Fix aplicado (mismo archivo, `backend/app/services/droplet_docker_service.py`):
+- `_ssh_exec` abre el canal, lee con polling (`recv_ready`/`recv_stderr_ready`) contra un deadline
+  propio y **cierra el canal al vencer** (el comando remoto muere por EOF/SIGPIPE). Levanta
+  `TimeoutError` con el comando en el mensaje.
+- `docker logs` remoto va con prefijo `timeout -k 5 30s` (`CONTAINER_LOG_TIMEOUT_S`) ademas del
+  deadline del canal.
+- `_fetch_all` reparte un presupuesto global (`FETCH_TIMEOUT_S - 5`) entre comandos; `_fetch_all_guarded`
+  marca `_fetch_busy` y `_collect_once` levanta `FetchBusy` si el fetch anterior sigue vivo (el loop
+  omite el ciclo sin registrar issue: no se apilan sesiones SSH ni lectores de logs).
+- El mensaje del issue y `last_error` incluyen el tipo de excepcion (`TimeoutError: ...`), antes
+  quedaba `poll failed: ` sin diagnostico.
+
+Diagnostico en el droplet (read-only): `pgrep -fc "docker logs --sinc[e]"` (debe ser 0 fuera de un
+poll), `time docker ps -a --format '{{.Names}}'` (~0.1 s), `top -bn1 | grep dockerd` (~0 %). Un
+`docker logs <contenedor>` que responde 200 con 0 bytes y no termina es deadlock del daemon para
+ese contenedor, no del monitor: se verifico en la API (`curl --unix-socket /var/run/docker.sock
+"http://localhost/containers/tec-db-1/logs?tail=1"`). Se limpia matando los lectores filtrados
+(`pkill -f "docker logs --sinc[e]"`); si vuelve, la salida es reiniciar ese contenedor (downtime
+de produccion, requiere decision del dueno) o el daemon (no hay `live-restore` en este droplet).
+El json-log del contenedor se puede leer directo (mismo dato, solo lectura) para confirmar que el
+archivo esta sano.
+
+Verificado 2026-10-30 tras reiniciar `SofiaBackend` (con `SofiaFrontend` detenido/restaurado por la
+dependencia): polls cada ~2 min sin `Poll failed`, `consecutive_failures=0`, `log_failures` vacio
+(tec-db-1 vuelve a entregar logs), 0 procesos `docker logs` filtrados, dockerd 0 % y carga 0.7.
+
+## Monitor Docker: `docker logs --tail` colgado en dockerd 29.5.3 (2026-11-01, corregido)
+
+- Sintoma (2026-11-01 10:49 UTC): `/api/health/sofia` ->
+  `docker_monitor.log_failures.tec-db-1: TimeoutError: comando remoto excedio 30s: docker logs
+  --since 240s --tail 50000 --timestamps tec-db-1 ...`. El resto del poll iba OK
+  (`consecutive_failures=0`), asi que lo unico perdido era la cobertura de Postgres (ERROR/FATAL/
+  PANIC). `data/droplet_state.json` seguia con `last_ts["tec-db-1"]` del 30-oct, pero eso solo
+  significa "ningun error ingerido desde entonces" (`_last_ts` es el watermark de dedup, no el
+  cursor del poll); la prueba de la ceguera es `log_failures`, no ese campo.
+- Medido en el droplet (read-only): json-log de `tec-db-1` 82 MB / 207 749 lineas; `tail -c` 3 ms;
+  `docker logs --since 2h --timestamps tec-db-1` **2,2 s**; `docker logs --tail 10 tec-db-1` **sin
+  respuesta ni en 180 s**, tambien por la API (`curl --unix-socket /var/run/docker.sock
+  "http://localhost/containers/tec-db-1/logs?tail=10"`); el resto de contenedores 0,04-0,7 s
+  (`--tail` y `--since`), `docker ps`/`inspect` 0,03-0,2 s, 0 procesos `docker logs` huerfanos,
+  dockerd 7 % de CPU, load 1,2.
+- Conclusion: no es deadlock del contenedor (como se concluyo el 2026-10-30) sino de la **ruta
+  `--tail` de dockerd 29.5.3** para ese contenedor; `--since` solo sigue sano. La nota del
+  2026-10-17 (`--since` 60-150 s / `--tail` ~3 s) era el estado inverso con un json-log de 2,2 GB:
+  cual de las dos formas es rapida cambia con el tamano del archivo Y con la version del daemon.
+- Fix (`backend/app/services/droplet_docker_service.py`): `_log_command(container, since, mode)`
+  arma las dos formas (`since` = solo `--since`; `tail` = `--since ... --tail LOG_TAIL_CAP`) y
+  `_fetch_container_logs()` prueba la preferida (`since`) y cae a la otra ante cualquier excepcion,
+  memorizando en `_log_mode[container]` la que respondio (asi el timeout no se paga en cada poll).
+  Tests: `tests/test_droplet_docker.py::test_fetch_container_logs_prefers_since_without_tail`,
+  `..._falls_back_to_tail_and_remembers`, `..._isolates_slow_container`.
+- Verificado 2026-11-01 05:57 local: `Restart-Service SofiaBackend -Force` (reinicia tambien
+  SofiaFrontend por dependencia SCM); poll 1 (10:58:04Z) y poll 2 (11:00:14Z) con
+  `log_failures: {}`, `consecutive_failures: 0`, `last_ingest_count` 1 y 0; sin issues
+  `droplet-ssh`; el unico evento nuevo fue el `nssm 1026` benigno del propio reinicio.
+- Si reaparece `log_failures` en un contenedor, comparar antes de tocar nada
+  `time docker logs --since 2h <c>` vs `time docker logs --tail 10 <c>`; el fix alterna solo, asi
+  que una falla persistente implica que fallan las dos formas (droplet caido o dockerd saturado).
+
+## Parser de logs: ecos de `warnings.warn` (2026-11-01)
+
+- Python imprime los warnings en dos lineas: `<archivo>:<linea>: UserWarning: <texto>` y la
+  siguiente, **indentada**, con el eco de codigo (`  warn(msg)`). `tail_log` hacia `strip()` antes
+  de clasificar, asi que la indentacion se perdia y `_HEAD_RE` leia `warn(msg)` como nivel WARN +
+  mensaje `(msg)`: issue 141630 con dos occurrences "(msg)" el 2026-11-01 (openpyxl al leer la
+  plantilla del Informe 43 de Mayor). La primera linea del warning no se ingeria (no tiene nivel
+  reconocible), asi que el resultado era un issue inutil y agrupado por fingerprint de "(msg)".
+- Fix: `_classify_level(line, indented=...)` recibe la indentacion del **raw** y descarta las
+  lineas indentadas salvo que traigan formato de log completo (`_PY_LOGGING_RE`/`_TS_LEVEL_RE`).
+  Restaura la regla de continuacion que ya existia en `_CONTINUATION_RE` (el `strip()` la anulaba)
+  y tambien cubre `warnings.warn(message, stacklevel=1)` de Vision.
+- Verificado antes de aplicarlo sobre las fuentes monitoreadas: las unicas lineas indentadas que se
+  clasificaban eran ecos de codigo (`warn(msg)`, `warnings.warn(...)`); en vms-api, tras
+  `_merge_dotnet_continuations`, 0 eventos reales se pierden (827 antes y despues). Tests:
+  `test_python_warning_source_echo_is_not_an_event`,
+  `test_indented_line_with_full_log_format_is_still_classified`.
+
+### Guardia de memoria: aviso transitorio 2026-11-01 20:10 (recuperado solo)
+
+- 20:10:42 local: WARNING con commit libre 7803 MB (occurrence 141744, issue 87390); el tick de
+  20:15:42 (7397 MB) quedo omitido por el throttle de 60 min y a las 20:20:42 el commit volvio a
+  10892 MB (`commit recuperado ... aviso previo cerrado`). Nunca se acerco al umbral CRITICAL
+  (4096 MB) y la guardia no cerro ninguna sesion.
+- Consumidor dominante: `WindowsTerminal` PID 22400 **30.1 GB** (no se toca por diseno); `devin`
+  6 procesos / 7648 MB en el pico. El `message` del reporte (`Commit del host bajo: 3091 MB
+  libres`) sigue siendo el de la primera occurrence del 20-oct; el valor vigente va en `detail`.
+- Sin accion: liberar los GB de WT exige cerrar la pestana/terminal (accion del dueno).

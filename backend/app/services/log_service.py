@@ -3,9 +3,11 @@ Passive log monitoring - tail log files and detect ERROR/WARNING lines.
 Fires alerts and stores events in DB when errors are found.
 """
 import asyncio
+import json
 import logging
 import os
 import re
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +29,21 @@ _overlong_pending: set = set()
 
 _MAX_LINE_BYTES = 65536
 _STARTUP_TAIL_BYTES = 8192
+
+# El cursor vive en memoria, pero se persiste para que un reinicio de Sofia no
+# vuelva a leer el tramo final del log (el startup tail de 8 KB reingeria la
+# misma linea ERROR en cada arranque: 2026-10-31 issue 140208 genero 7
+# occurrences identicas, una por reinicio del backend).
+_CURSOR_STATE_PATH = Path(
+    os.getenv(
+        "SOFIA_LOG_CURSOR_PATH",
+        str(Path(__file__).resolve().parents[2] / "data" / "log_cursors.json"),
+    )
+)
+_CURSOR_PERSIST_INTERVAL_S = 5.0
+_cursor_state_loaded = False
+_cursor_last_persist = 0.0
+_cursor_persisted: Dict[str, tuple] = {}
 
 _monitor_status: Dict = {"last_poll": None, "sources": {}}
 
@@ -163,7 +180,17 @@ def _split_line(line: str):
     return None, line
 
 
-def _classify_level(line: str) -> Optional[str]:
+def _classify_level(line: str, indented: Optional[bool] = None) -> Optional[str]:
+    if indented is None:
+        indented = bool(line[:1].isspace())
+    if indented and not (_PY_LOGGING_RE.match(line) or _TS_LEVEL_RE.match(line)):
+        # Continuacion de un mensaje ya reportado (payload .NET ya unido, cola
+        # de excepcion o eco de codigo de warnings.warn). No es un evento
+        # propio: caso real 2026-11-01, openpyxl imprime
+        # "  warn(msg)" bajo su UserWarning y Sofia lo guardaba como WARNING
+        # con mensaje "(msg)". Una linea indentada con formato de log completo
+        # (timestamp + nivel) si se clasifica.
+        return None
     reported, message = _split_line(line)
     if reported is not None:
         if reported not in ("ERROR", "CRITICAL", "WARNING", "WARN"):
@@ -218,6 +245,65 @@ def _merge_dotnet_continuations(lines):
     return merged
 
 
+def _load_cursor_state() -> None:
+    """Restaura cursores persistidos (una sola vez por proceso)."""
+    global _cursor_state_loaded
+    if _cursor_state_loaded:
+        return
+    _cursor_state_loaded = True
+    try:
+        raw = json.loads(_CURSOR_STATE_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        logger.warning(f"[LOGS] cursor state unreadable: {exc}")
+        return
+    sources = raw.get("sources") if isinstance(raw, dict) else None
+    if not isinstance(sources, dict):
+        return
+    for key, entry in sources.items():
+        try:
+            pos = int(entry["pos"])
+            ident = (int(entry["dev"]), int(entry["ino"]))
+        except Exception:
+            continue
+        if pos < 0:
+            continue
+        _file_positions[key] = pos
+        _file_identities[key] = ident
+
+
+def _persist_cursor_state(force: bool = False) -> None:
+    """Guarda cursores de forma atomica y con throttle (el loop puede dormir 0s)."""
+    global _cursor_last_persist, _cursor_persisted
+    snapshot = {
+        key: (tuple(ident), _file_positions[key])
+        for key, ident in _file_identities.items()
+        if key in _file_positions
+    }
+    if snapshot == _cursor_persisted:
+        return
+    now = time.monotonic()
+    if not force and now - _cursor_last_persist < _CURSOR_PERSIST_INTERVAL_S:
+        return
+    payload = {
+        "version": 1,
+        "sources": {
+            key: {"dev": ident[0], "ino": ident[1], "pos": pos}
+            for key, (ident, pos) in snapshot.items()
+        },
+    }
+    try:
+        _CURSOR_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CURSOR_STATE_PATH.with_name(_CURSOR_STATE_PATH.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, _CURSOR_STATE_PATH)
+        _cursor_persisted = snapshot
+        _cursor_last_persist = now
+    except Exception as exc:
+        logger.warning(f"[LOGS] cursor state persist failed: {exc}")
+
+
 def get_monitor_status() -> dict:
     """Return a copy of the log monitor status for health reporting."""
     return {
@@ -239,6 +325,7 @@ def _transition(src: dict, state: str, error: Optional[str] = None) -> None:
 
 async def tail_log(service_id: str, service_name: str, log_path: str, tail_lines: int = 200):
     """Read new lines from log file since last check. Returns new error lines found."""
+    _load_cursor_state()
     sources = _monitor_status["sources"]
     src = sources.setdefault(service_id, {"service_id": service_id})
     src["configured_path"] = log_path
@@ -294,6 +381,7 @@ async def tail_log(service_id: str, service_name: str, log_path: str, tail_lines
             _transition(src, "ready", None)
             src["pending_bytes"] = 0
             src["drain_backlog"] = False
+            _persist_cursor_state()
             return []
 
         lines = []
@@ -357,7 +445,7 @@ async def tail_log(service_id: str, service_name: str, log_path: str, tail_lines
             if not text:
                 _file_positions[key] = pos_after
                 continue
-            level = _classify_level(text)
+            level = _classify_level(text, indented=raw[:1].isspace())
             if not level:
                 _file_positions[key] = pos_after
                 continue
@@ -378,6 +466,7 @@ async def tail_log(service_id: str, service_name: str, log_path: str, tail_lines
             except Exception as exc:
                 _transition(src, "error", f"db persist failed: {exc}"[:300])
                 src["drain_backlog"] = False
+                _persist_cursor_state()
                 return events
             _file_positions[key] = pos_after
             if issue_id == 0:
@@ -409,6 +498,7 @@ async def tail_log(service_id: str, service_name: str, log_path: str, tail_lines
             _transition(src, "error", "oversized line truncated")
         else:
             _transition(src, "ready", None)
+        _persist_cursor_state()
 
     return events
 
@@ -444,6 +534,9 @@ async def log_poll_loop():
         for sid in list(_monitor_status["sources"]):
             if sid not in active:
                 del _monitor_status["sources"][sid]
+        # Un solo snapshot por ciclo: el throttle interno de tail_log podria
+        # dejar sin persistir el cursor de las ultimas fuentes del ciclo.
+        _persist_cursor_state(force=True)
         _monitor_status["last_poll"] = datetime.utcnow().isoformat()
         backlog = any(
             s.get("state") == "ready" and s.get("drain_backlog")

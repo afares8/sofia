@@ -226,11 +226,11 @@ def test_remote_grep_superset_for_known_containers():
 
 # ── fetch de logs por contenedor (cap de lineas + aislamiento) ───────────────
 
-def test_fetch_container_logs_caps_emission_with_tail():
-    """`docker logs` debe ir acotado con --tail: sin el cap, un json-log de
-    varios GB (tec-db-1 ~2.2 GB) supera el timeout del canal SSH y tumba el
-    poll completo."""
+def test_fetch_container_logs_prefers_since_without_tail():
+    """El primer intento se acota solo con `--since` (dockerd 29.5.3: `--tail`
+    sobre el json-log de tec-db-1 no responde ni con --tail 10 en >180 s)."""
     cmds = []
+    svc._log_mode.clear()
 
     def fake_exec(client, cmd, timeout=40):
         cmds.append(cmd)
@@ -239,14 +239,42 @@ def test_fetch_container_logs_caps_emission_with_tail():
     logs, failures = svc._fetch_container_logs(
         None, ["tec-db-1"], "240s", exec_fn=fake_exec)
     assert failures == [] and logs["tec-db-1"] == "salida"
-    assert f"--tail {svc.LOG_TAIL_CAP}" in cmds[0]
+    assert "--tail" not in cmds[0]
     assert "--since 240s" in cmds[0]
     assert f"tail -{svc.GREP_TAIL_CAP}" in cmds[0]
+    assert cmds[0].startswith(f"timeout -k 5 {svc.CONTAINER_LOG_TIMEOUT_S}s ")
+    assert svc._log_mode["tec-db-1"] == "since"
+
+
+def test_fetch_container_logs_falls_back_to_tail_and_remembers():
+    """Si `--since` solo no responde (json-log gigante), se reintenta con
+    `--tail` y esa forma queda memorizada para los polls siguientes."""
+    cmds = []
+    svc._log_mode.clear()
+
+    def fake_exec(client, cmd, timeout=40):
+        cmds.append(cmd)
+        if "--tail" not in cmd:
+            raise TimeoutError("sin tail")
+        return "salida"
+
+    logs, failures = svc._fetch_container_logs(
+        None, ["tec-db-1"], "240s", exec_fn=fake_exec)
+    assert failures == [] and logs["tec-db-1"] == "salida"
+    assert len(cmds) == 2 and "--tail" in cmds[1]
+    assert svc._log_mode["tec-db-1"] == "tail"
+
+    cmds.clear()
+    svc._fetch_container_logs(None, ["tec-db-1"], "240s", exec_fn=fake_exec)
+    assert len(cmds) == 1 and "--tail" in cmds[0]
+    svc._log_mode.clear()
 
 
 def test_fetch_container_logs_isolates_slow_container():
     """Un contenedor que revienta (timeout) no debe tumbar el fetch: el resto
     se devuelve igual y la falla queda listada para diagnostico."""
+    svc._log_mode.clear()
+
     def fake_exec(client, cmd, timeout=40):
         if "tec-db-1" in cmd:
             raise TimeoutError()
@@ -259,3 +287,81 @@ def test_fetch_container_logs_isolates_slow_container():
     assert len(failures) == 1
     assert failures[0][0] == "tec-db-1"
     assert "TimeoutError" in failures[0][1]
+    svc._log_mode.clear()
+
+
+# ── _ssh_exec: deadline duro + cierre del canal remoto ──────────────────────
+
+class _FakeChan:
+    def __init__(self, chunks=None, exit_ready=True):
+        self.chunks = list(chunks or [])
+        self.exit_ready = exit_ready
+        self.is_closed = False
+        self.cmd = None
+
+    def settimeout(self, _):
+        pass
+
+    def exec_command(self, cmd):
+        self.cmd = cmd
+
+    def recv_ready(self):
+        return bool(self.chunks)
+
+    def recv(self, _):
+        return self.chunks.pop(0)
+
+    def recv_stderr_ready(self):
+        return False
+
+    def exit_status_ready(self):
+        return self.exit_ready
+
+    @property
+    def closed(self):
+        return self.is_closed
+
+    def close(self):
+        self.is_closed = True
+
+
+class _FakeClient:
+    def __init__(self, chan):
+        self._chan = chan
+
+    def get_transport(self):
+        return SimpleNamespace(open_session=lambda: self._chan)
+
+
+def test_ssh_exec_returns_stdout():
+    chan = _FakeChan([b"hola ", b"mundo"])
+    assert svc._ssh_exec(_FakeClient(chan), "echo hola") == "hola mundo"
+    assert chan.is_closed
+
+
+def test_ssh_exec_times_out_and_closes_remote_command():
+    """Un comando que gotea datos no puede colgar el hilo: al vencer el
+    deadline se cierra el canal (el `docker logs` remoto muere) y se levanta
+    TimeoutError con mensaje no vacio."""
+    chan = _FakeChan([], exit_ready=False)
+    try:
+        svc._ssh_exec(_FakeClient(chan), "docker logs --tail 50000 tec-db-1",
+                      timeout=0.2)
+    except TimeoutError as exc:
+        assert "0.2s" in str(exc)
+    else:
+        raise AssertionError("se esperaba TimeoutError")
+    assert chan.is_closed
+
+
+def test_collect_once_skips_when_previous_fetch_still_running(monkeypatch):
+    """Un fetch abandonado no debe apilar otra sesion SSH."""
+    monkeypatch.setattr(svc, "_fetch_busy", True)
+    try:
+        asyncio.run(svc._collect_once("240s"))
+    except svc.FetchBusy:
+        pass
+    else:
+        raise AssertionError("se esperaba FetchBusy")
+    finally:
+        monkeypatch.setattr(svc, "_fetch_busy", False)

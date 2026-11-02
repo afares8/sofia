@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
-from app.routers import health, events, ingest, logs, config, webhook, restore, nightly, autonomy, incident_team
+from app.routers import health, events, ingest, logs, config, webhook, restore, nightly, autonomy, incident_team, bridge
 from app.services.alert_queue import alert_queue_loop
 from app.services.analytics_service import spike_detection_loop
 from app.services.config_service import load_config
@@ -163,6 +163,7 @@ app.include_router(restore.router, prefix="/api")
 app.include_router(nightly.router, prefix="/api")
 app.include_router(autonomy.router, prefix="/api")
 app.include_router(incident_team.router, prefix="/api")
+app.include_router(bridge.router, prefix="/api")
 
 
 @app.get("/api/ping")

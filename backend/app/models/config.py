@@ -32,6 +32,9 @@ class AlertConfig(BaseModel):
     wppconnect_session: str = "default"
     cooldown_minutes: int = 10           # don't spam same alert twice
     max_messages_per_hour: int = 8
+    # El puente Sofia-Devin puede usar WhatsApp para escalar aunque el canal
+    # global este apagado (evita reactivar todo el ruido de alertas).
+    bridge_escalation_whatsapp: bool = False
 
     # Multi-channel escalation: if a pending restore expires with no response,
     # forward the alert to additional numbers in order.

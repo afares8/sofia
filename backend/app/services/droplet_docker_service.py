@@ -34,7 +34,9 @@ import json
 import logging
 import os
 import re
+import socket
 import tempfile
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -56,11 +58,11 @@ DISK_WARN_PCT = int(os.getenv("SOFIA_DROPLET_DISK_WARN_PCT", "85"))
 MEM_WARN_PCT = int(os.getenv("SOFIA_DROPLET_MEM_WARN_PCT", "10"))
 
 FETCH_TIMEOUT_S = 90          # hard cap for a whole SSH fetch round
+CONTAINER_LOG_TIMEOUT_S = 30  # per-container `docker logs` cap (remoto + canal)
 GREP_TAIL_CAP = 1000          # safety bound AFTER remote grep (error lines only)
 LOG_TAIL_CAP = 50000          # lineas maximas que docker emite por contenedor:
-# `docker logs --since` sobre un json-log de varios GB (tec-db-1 ~2.2 GB)
-# escanea el archivo hacia atras y supera cualquier timeout de canal; con
-# --tail la emision queda acotada y la consulta baja de ~60-150 s a ~3 s.
+# se usa solo en el modo "tail" (ver `_log_command`), que es el que acota la
+# emision cuando `docker logs --since` se vuelve lento sobre un json-log grande.
 SEEN_CAP = 3000               # persisted dedup ring size
 STATE_PATH = Path(__file__).resolve().parents[2] / "data" / "droplet_state.json"
 
@@ -180,6 +182,8 @@ _seen_set: Set[str] = set()
 _oom_seen: Deque[str] = deque(maxlen=500)
 _oom_seen_set: Set[str] = set()
 _host_flags: Dict[str, bool] = {}
+# container -> "since" | "tail": forma de `docker logs` que respondio en el droplet.
+_log_mode: Dict[str, str] = {}
 _status: Dict = {
     "enabled": ENABLED,
     "last_poll": None,
@@ -264,12 +268,54 @@ def _is_dup(container: str, ts: str, line: str) -> bool:
 
 # ── SSH fetch (sync — runs in a thread via asyncio.to_thread) ────────────────
 def _ssh_exec(client, cmd: str, timeout: int = 40) -> str:
-    _, stdout, _ = client.exec_command(cmd, timeout=timeout)
-    return stdout.read().decode("utf-8", errors="replace")
+    """Ejecuta un comando remoto con deadline duro y cierra el canal al vencer.
+
+    `stdout.read()` con timeout de paramiko solo acota cada recv: un comando que
+    gotea datos (p. ej. `docker logs --tail 50000` sobre un json-log grande)
+    nunca vence y deja el hilo colgado con la sesion SSH abierta. Cada poll
+    vencido dejaba entonces un `docker logs` vivo en el droplet que mantenia al
+    dockerd ocupado (visto 2026-10-30: 170 procesos filtrados, dockerd al 350%
+    de CPU y `docker ps` tardando 36 s). Al cerrar el canal el comando remoto
+    recibe EOF/SIGPIPE y muere.
+    """
+    chan = client.get_transport().open_session()
+    chan.settimeout(min(timeout, 5))
+    chan.exec_command(cmd)
+    deadline = time.monotonic() + timeout
+    chunks: List[bytes] = []
+    try:
+        while True:
+            try:
+                if chan.recv_ready():
+                    chunks.append(chan.recv(65536))
+                    continue
+                if chan.recv_stderr_ready():
+                    chan.recv_stderr(65536)
+                    continue
+            except socket.timeout:
+                pass
+            if chan.exit_status_ready() or chan.closed:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"comando remoto excedio {timeout}s: {cmd[:80]}")
+            time.sleep(0.05)
+    finally:
+        chan.close()
+    return b"".join(chunks).decode("utf-8", errors="replace")
 
 
 def _remote_grep_pattern(container: str) -> str:
     return _REMOTE_GREP.get(container, _REMOTE_GREP_DEFAULT)
+
+
+def _log_command(container: str, since: str, mode: str) -> str:
+    tail = f"--tail {LOG_TAIL_CAP} " if mode == "tail" else ""
+    return (
+        f"timeout -k 5 {CONTAINER_LOG_TIMEOUT_S}s "
+        f"docker logs --since {since} {tail}--timestamps {container} 2>&1 "
+        f"| grep -aE '{_remote_grep_pattern(container)}' | tail -{GREP_TAIL_CAP}"
+    )
 
 
 def _fetch_container_logs(client, names: List[str], since: str,
@@ -279,21 +325,31 @@ def _fetch_container_logs(client, names: List[str], since: str,
     Un contenedor lento (json-log de varios GB) o caido no debe tumbar el
     poll completo: se omite esa fuente en esta pasada, el resto se ingesta
     igual y la falla queda en (failures) para diagnostico.
+
+    El acotado por `--tail` y el acotado solo por `--since` se alternan: cual de
+    los dos es rapido depende del tamano del json-log Y de la version de dockerd
+    (2026-10-17: `--since` 60-150 s, `--tail` ~3 s; 2026-11-01 con dockerd
+    29.5.3: `--since` 2 s, `--tail 10` colgado >180 s en tec-db-1). La forma que
+    respondio se recuerda por contenedor para no pagar el timeout en cada poll.
     """
     exec_fn = exec_fn or _ssh_exec
     logs: Dict[str, str] = {}
     failures: List[Tuple[str, str]] = []
     for name in names:
-        pattern = _remote_grep_pattern(name)
-        try:
-            logs[name] = exec_fn(
-                client,
-                f"docker logs --since {since} --tail {LOG_TAIL_CAP} "
-                f"--timestamps {name} 2>&1 "
-                f"| grep -aE '{pattern}' | tail -{GREP_TAIL_CAP}",
-            )
-        except Exception as exc:
-            failures.append((name, f"{type(exc).__name__}: {exc}"))
+        preferred = _log_mode.get(name, "since")
+        last: Optional[Exception] = None
+        for mode in (preferred, "tail" if preferred == "since" else "since"):
+            try:
+                logs[name] = exec_fn(
+                    client, _log_command(name, since, mode),
+                    timeout=CONTAINER_LOG_TIMEOUT_S,
+                )
+                _log_mode[name] = mode
+                break
+            except Exception as exc:
+                last = exc
+        else:
+            failures.append((name, f"{type(last).__name__}: {last}"))
     return logs, failures
 
 
@@ -307,6 +363,16 @@ def _fetch_all(host: str, user: str, key_path: str, since: str) -> Dict:
     """
     import paramiko
     import time as _time
+
+    # Presupuesto total del round: cada comando se recorta a lo que quede para
+    # que el hilo termine antes del wait_for y no queden sesiones colgadas.
+    deadline = _time.monotonic() + FETCH_TIMEOUT_S - 5
+
+    def _exec(client_arg, cmd: str, timeout: int = 40) -> str:
+        remaining = int(deadline - _time.monotonic())
+        if remaining <= 1:
+            raise TimeoutError("presupuesto del poll agotado")
+        return _ssh_exec(client_arg, cmd, timeout=min(timeout, remaining))
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -330,16 +396,17 @@ def _fetch_all(host: str, user: str, key_path: str, since: str) -> Dict:
     if last_exc:
         raise last_exc
     try:
-        ps = _ssh_exec(
+        ps = _exec(
             client, "docker ps -a --format '{{.Names}}|{{.Status}}'")
         names = [
             ln.split("|", 1)[0].strip()
             for ln in ps.splitlines() if ln.strip()
         ]
 
-        logs, log_failures = _fetch_container_logs(client, names, since)
+        logs, log_failures = _fetch_container_logs(
+            client, names, since, exec_fn=_exec)
 
-        events = _ssh_exec(
+        events = _exec(
             client,
             "docker events --since " + since + " --until 0s "
             "--filter type=container "
@@ -349,12 +416,12 @@ def _fetch_all(host: str, user: str, key_path: str, since: str) -> Dict:
             "|{{.Actor.Attributes.exitCode}}'",
         )
 
-        oom = _ssh_exec(
+        oom = _exec(
             client,
             "dmesg -T 2>/dev/null | grep -iE 'Out of memory: Killed process"
             "|invoked oom-killer' | tail -50",
         )
-        usage = _ssh_exec(
+        usage = _exec(
             client,
             "df -P / | awk 'NR==2{gsub(/%/,\"\",$5); print \"disk=\"$5}'; "
             "free -m | awk '/^Mem:/{print \"mem=\"int($7*100/$2)}'",
@@ -369,7 +436,7 @@ def _fetch_all(host: str, user: str, key_path: str, since: str) -> Dict:
         # ── per-service health checks (all read-only) ───────────────────
         # Covers: pg availability/locks/connections, redis ping, backup
         # staleness (file mtime), certbot renewal failures, nginx 5xx burst.
-        checks_raw = _ssh_exec(
+        checks_raw = _exec(
             client,
             "echo pg_ready=$(docker exec tec-db-1 pg_isready -U magnate "
             "2>/dev/null || echo DOWN); "
@@ -681,9 +748,27 @@ async def _process_checks(checks: Dict) -> int:
 
 
 # ── poll cycle ───────────────────────────────────────────────────────────────
+class FetchBusy(RuntimeError):
+    """El fetch anterior sigue vivo: no se apilan sesiones SSH ni `docker logs`."""
+
+
+_fetch_busy = False
+
+
+def _fetch_all_guarded(since: str) -> Dict:
+    global _fetch_busy
+    _fetch_busy = True
+    try:
+        return _fetch_all(SSH_HOST, SSH_USER, SSH_KEY, since)
+    finally:
+        _fetch_busy = False
+
+
 async def _collect_once(since: str) -> int:
+    if _fetch_busy:
+        raise FetchBusy("fetch anterior aun en curso")
     data = await asyncio.wait_for(
-        asyncio.to_thread(_fetch_all, SSH_HOST, SSH_USER, SSH_KEY, since),
+        asyncio.to_thread(_fetch_all_guarded, since),
         timeout=FETCH_TIMEOUT_S,
     )
 
@@ -793,11 +878,19 @@ async def droplet_docker_loop() -> None:
                 logger.info(f"[DOCKER] Ingested {n} docker event(s).")
             _save_state()
             await asyncio.sleep(POLL_SECONDS)
+        except FetchBusy as exc:
+            # Un fetch abandonado sigue vivo: se omite el ciclo sin registrar
+            # issue (no es una falla nueva del droplet ni del SSH).
+            logger.warning(f"[DOCKER] Ciclo omitido: {exc}")
+            await asyncio.sleep(POLL_SECONDS)
         except Exception as exc:
             fails = int(_status.get("consecutive_failures") or 0) + 1
             _status["consecutive_failures"] = fails
-            _status["last_error"] = str(exc)[:300]
-            logger.warning(f"[DOCKER] Poll failed ({fails}x): {exc}")
+            # str() de TimeoutError/asyncio.TimeoutError es vacio: sin el tipo,
+            # el issue quedaba como "poll failed: " y sin diagnostico.
+            err = f"{type(exc).__name__}: {exc}".strip().rstrip(": ")
+            _status["last_error"] = err[:300]
+            logger.warning(f"[DOCKER] Poll failed ({fails}x): {err}")
             # Record an unreachable-droplet issue (deduped by fingerprint) but
             # do NOT alert — tec/sofiatunnel_e2e health checks already cover
             # a real outage with CRITICAL alerts.
@@ -806,7 +899,7 @@ async def droplet_docker_loop() -> None:
                     service_id="droplet-ssh",
                     service_name="Droplet SSH",
                     level="WARNING",
-                    message=f"droplet docker poll failed: {str(exc)[:200]}",
+                    message=f"droplet docker poll failed: {err[:200]}",
                     source="docker",
                     timestamp=datetime.utcnow(),
                 ))
