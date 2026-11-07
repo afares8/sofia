@@ -1486,3 +1486,104 @@ dependencia): polls cada ~2 min sin `Poll failed`, `consecutive_failures=0`, `lo
   6 procesos / 7648 MB en el pico. El `message` del reporte (`Commit del host bajo: 3091 MB
   libres`) sigue siendo el de la primera occurrence del 20-oct; el valor vigente va en `detail`.
 - Sin accion: liberar los GB de WT exige cerrar la pestana/terminal (accion del dueno).
+
+### Guardia de memoria: agotamiento de commit 2026-11-07 (causa externa: tormenta ffmpeg de Packing)
+
+- El commit libre cayo cinco veces: 3188 MB (09:26, cerro `devin#40716` 14.7 GB), 1264 MB
+  (09:35, cerro `#28984` y `#21476`), **212 MB (10:30)**, 4016 MB (11:28) y 599 MB (12:09,
+  cerro `#28348` 2.9 GB); a las 12:20 volvio a 48454 MB.
+- En 10:30 y 11:28 la guardia **no pudo cerrar nada**: `commit critico y solo hay sesiones
+  Devin por debajo de 512 MB (7 con edad suficiente); no se cierran`. La sesion grande
+  (`devin#28348`, 1.3-3.0 GB) aun no tenia `MinAgeMinutes` (120). Es el comportamiento
+  disenado, no un fallo del script: cuando el consumidor no son sesiones Devin, la guardia
+  no puede recuperar el commit.
+- Atribucion: el `top: 3` del log no muestra `ffmpeg` (10:30: `devin#28348` 1299 MB,
+  `WindowsTerminal` 1270 MB, `python#3472` 1262 MB), asi que la guardia no identifica al
+  consumidor. El `WinError 1455` de esa misma ventana si esta atribuido en
+  `Packing/AGENTS.md` a la tormenta de `ffmpeg.exe` de grabacion (~630 MB c/u) lanzada por
+  `POST /api/wms/cameras/batch/*` desde lotes grandes de bultos; el fix (lock por camara,
+  coalescing y auto-stop) se desplego el 2026-11-07 12:31-12:33 local y no hubo mas 1455.
+- Con commit agotado aparecieron `cv2.error: bad allocation`, `MemoryError` en Mayor
+  (`transfers/status-bar`, `products/image`), en Vision (`ai model integrity check`) y
+  `psycopg2 DatabaseError`; todos se recuperaron solos al liberarse el commit.
+- El script ya ordena victimas con las sesiones del puente al final (`IsBridge` por
+  `CommandLine -match '--permission-mode'`), asi que el riesgo documentado el 2026-11-01
+  quedo cubierto.
+- Triaje: los ERROR de esa ventana (Mayor `MemoryError`, Vision `zone sync failed`,
+  Packing `Error authenticating with mayor`) son sintomas del mismo agotamiento, no fallos
+  independientes. No reiniciar servicios por ellos si el commit libre ya esta sano.
+
+## Puente ElenaTec en modo remoto (2026-11-05)
+
+El grupo `elenatec` del puente ya no trabaja en el clon local divergente
+(`C:/Users/ahmed/apps/tec-review`): su `policy.json` declara un bloque `remote`
+(`host: magnate`, `cwd: /root/tec`, `devin_executable: /root/.local/bin/devin`,
+`require_root: true`) y el worker lanza `ssh magnate /root/.local/bin/devin
+--permission-mode <modo> acp` hablando ACP por stdio. El agente edita el
+checkout real de produccion y sus commits quedan en `main` de `/root/tec`, que
+es el propio `origin`; no hace falta push y sigue prohibido desplegar/reiniciar.
+
+- Verificado en vivo: `initialize` -> protocolVersion 1, `session/new` con cwd
+  `/root/tec` -> sessionId, `session/configure_mode` -> `bypass`.
+- El worker valida por SSH `id -u == 0` y `devin auth status` remoto antes de
+  abrir ACP; si falla, queda `elevation_mismatch`/`auth_required` y backoff.
+- Las sesiones guardadas llevan `remote: true|false`; al cambiar de base el
+  puente NO reanuda una sesion creada en la otra (crea una nueva del dia).
+- El prompt `elenatec-initial.txt` obliga a commitear, respetar
+  `.git/devin-file-locks`, no tocar archivos ya modificados por otra sesion,
+  no usar `git add -A`/`reset`/`stash`/`clean` y serializar el commit con
+  `.git/devin-git-operation.lock`.
+- Tests: `backend/.venv/Scripts/python.exe -m pytest tests/test_sofia_devin_bridge.py -q`
+  (154 passed). El smoke del worker remoto sin reportes sale con rc=0.
+
+## Puente: diagnostico de fallos de spawn y latch del circuit breaker (2026-11-06)
+
+Incidente: `sofia-devin-elenatec` (5186) respondio 503 con
+`status=auth_required` / `last_error="devin auth status remoto fallo"` desde
+~04:17 local; 5 fallos de spawn seguidos dejaron el estado en
+`spawn_circuit_open` y el canal no volvio a intentarlo.
+
+- **`spawn_circuit_open` es un latch, no un backoff**: `_register_failure_locked`
+  pone `circuit_open=True` al llegar a `MAX_SPAWN_FAILURES` (5) y NADA lo vuelve
+  a `False` (ni eventos nuevos ni reiniciar la tarea: el flag vive en
+  `state.json`). Mientras este activo, `/health` devuelve 503 y el watcher no
+  abre consola. Los tests existentes exigen que siga abierto 10.000 s despues,
+  asi que se recupera a mano, no solo:
+  1. `Stop-ScheduledTask -TaskName 'Sofia-Devin-<grupo>'` y matar los
+     `pythonw/python` con `--group <grupo>` en la linea de comandos.
+  2. Copia `state.json` a `state.json.bak-<fecha>-circuit` y, con el watcher
+     parado, poner `circuit_open=false`, `spawn_failures=0`,
+     `next_retry_after=0`, `last_spawn=0`, `spawn_counted=false`,
+     `worker_ready=false`, `status="ok"`, `last_error=null` (guardar con
+     `json.dump(..., ensure_ascii=False, indent=1)`, igual que `StateStore._save`).
+  3. `Start-ScheduledTask`. Verificado 2026-11-06 04:34 local: 5186 -> 200
+     `status=ok`, `worker_ready=true`, el worker retomo los 23 pendientes del
+     dia 2026-11-05 (`inflight.prompt_sent=true`).
+- **El fallo de auth ya no es mudo**: `devin_authenticated_remote_detail()`
+  devuelve `(ok, detalle)` y el worker lo escribe en `state.last_error`, asi que
+  se distingue `ssh sin respuesta en 40 s` de `rc=<n>: <stderr>`. El
+  `devin_authenticated_remote()` historico sigue devolviendo bool.
+- **stderr del worker a archivo**: `default_spawn_worker` redirige el stderr del
+  hijo a `<state_root>/<grupo>/worker.err.log` (rotacion a `.1` sobre 1 MiB).
+  Antes un worker que moria antes de marcar estado no dejaba rastro (la consola
+  se cierra y el watcher solo contaba el fallo con `SPAWN_GRACE_SECONDS=15`).
+- **Leccion de triaje**: `status_at < last_spawn` en `state.json` significa que
+  el ultimo worker murio SIN marcar estado; si `status_at >= last_spawn` y el
+  delta ronda 40 s, el que fallo fue el timeout del `ssh ... devin auth status`.
+  En este incidente `ssh -o BatchMode=yes ... magnate '/root/.local/bin/devin
+  auth status'` respondia `rc=0` en ~2 s desde la consola, la sesion de admin y
+  una tarea programada con el mismo principal; `devin auth status` remoto decia
+  `Logged in` y el droplet estaba sano (load 0.6, uid 0). Reiniciar el proceso
+  watcher basto para que la comprobacion pasara; la causa exacta del timeout en
+  la instancia anterior quedo sin demostrar y ahora la registra `last_error`.
+- **Causa raiz del timeout de 40 s en `devin auth status remoto` demostrada y corregida (2026-11-07)**:
+  `ConsoleWorker._run_inner` arrancaba `self._start_dispatchers()` (cuyo hilo `_stdin_loop`
+  ejecuta `for line in sys.stdin:` y bloquea en `ReadFile` sobre el `STD_INPUT_HANDLE` de
+  `conhost.exe`) **antes** de invocar `devin_authenticated_remote_detail`. Al ejecutar
+  `subprocess.run(_ssh_base(host) + [executable, "auth", "status"], capture_output=True, timeout=40)`
+  sin `stdin=subprocess.DEVNULL`, `ssh.exe` heredaba el `STD_INPUT_HANDLE` de la consola y
+  quedaba bloqueado 40 s esperando el lock del handle de entrada de consola retenido por
+  `_stdin_loop` (`verify_elevation` no fallaba porque corria antes de `_start_dispatchers`).
+  **Fix**: pasar `stdin=subprocess.DEVNULL` en `verify_elevation`, `devin_authenticated` y
+  `devin_authenticated_remote_detail`. Verificado en vivo: el worker `elenatec` autentico en ~2 s,
+  abrio sesion ACP (`glaze-muscle`), marco `worker_ready=true` y `5186/health` quedo en 200 OK.
