@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from app.models.event import ErrorEvent
 from app.services import db_service, whatsapp_service, sourcemap_service
 from app.services.config_service import load_config
-from app.services.event_classification import normalize_reported_level
+from app.services.event_classification import normalize_reported_level, useful_message
 from app.services.ingest_identity import verified_operator_identity
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
@@ -62,11 +62,15 @@ async def ingest_event(payload: IngestPayload, authorization: str = Header(defau
         except Exception:
             pass
 
+    # Un Error serializado por el SDK como "{}" dejaba el aviso sin texto:
+    # se usa la primera linea util de detail/traceback (ver useful_message).
+    message = useful_message(payload.message, payload.detail or "", traceback_str or "")
+
     event = ErrorEvent(
         service_id=payload.service_id,
         service_name=payload.service_name,
-        level=normalize_reported_level(payload.level, payload.message),
-        message=payload.message,
+        level=normalize_reported_level(payload.level, message),
+        message=message,
         detail=payload.detail,
         traceback=traceback_str,
         url=payload.url,

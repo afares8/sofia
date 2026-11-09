@@ -1712,3 +1712,20 @@ Hallazgos y cambios aplicados:
 - Tras cerrar el proceso, el checkpoint truncó el WAL: `sessions.db` 8,29 GB y
   WAL 0,00 GB (antes 10,43 + 8,35). `PRAGMA quick_check` = ok, 303.661 nodos,
   270 sesiones. Disco C: de 75 GB a 82 GB libres.
+
+### Mensajes "{}" del SDK y mute de Slow fetch (2026-11-09)
+
+- El frontend de Mayor reporta errores como `message="{}"` (Error serializado);
+  el texto real (`TypeError: Failed to fetch dynamically imported module: ...`)
+  quedaba solo en `detail`. Issue 82613 acumulo 9 ocurrencias asi.
+- Fix: `useful_message()` en `app/services/event_classification.py` (usado por
+  `routers/ingest.py`). Si el mensaje es vacio o un placeholder (`{}`, `[]`,
+  `null`, `undefined`), toma la primera linea util de `detail`/`traceback`
+  quitando los marcadores `[detail]`, `[traceback]`, `console.error`, etc.
+  Si no hay nada, deja `(sin mensaje)`. Tests en `tests/test_ingest.py`.
+- Mute rules nuevas: `mayor-slow-request` cubre `Slow request` y `Slow fetch`
+  (fetch del frontend con 2xx); `mayor-sap-middleware-orphans` cubre
+  "Port 9000 is held by system process PID 4" y "Killing orphaned process
+  PID ... on port 9000" (comportamiento documentado del manager).
+- Verificado: al recargar policy en caliente, la cola local paso de 5 a 2
+  avisos; quedan `C: drive at 85.5%` y el `{}` (reales, sin silenciar).

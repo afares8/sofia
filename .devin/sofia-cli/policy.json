@@ -97,9 +97,9 @@
     {
       "id": "mayor-slow-request",
       "service_id": "mayor",
-      "pattern": "^Slow request",
+      "pattern": "^(Slow request|Slow fetch)",
       "levels": ["WARNING"],
-      "note": "Latencia de endpoints de Mayor con respuesta 2xx: telemetria de rendimiento, no bug."
+      "note": "Latencia de endpoints/fetch de Mayor con respuesta 2xx: telemetria de rendimiento, no bug."
     },
     {
       "id": "vision-slow-request",
@@ -142,6 +142,13 @@
       "pattern": "SAP DI API Middleware did not stop gracefully",
       "levels": ["WARNING"],
       "note": "El backend mata el middleware .NET al reiniciar cuando no cierra solo: comportamiento esperado del manager."
+    },
+    {
+      "id": "mayor-sap-middleware-orphans",
+      "service_id": "mayor",
+      "pattern": "Port 9000 is held by system process PID 4|Killing orphaned process PID \\d+ on port 9000",
+      "levels": ["WARNING"],
+      "note": "El manager SAP detecta el listener http.sys (PID 4) y limpia huerfanos al arrancar: comportamiento esperado y documentado, no bug. Si el middleware no queda arriba, sale como ERROR/health."
     },
     {
       "id": "windows-nssm-process-handle",
