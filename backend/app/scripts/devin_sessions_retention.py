@@ -116,6 +116,10 @@ def main() -> int:
                     help="borra de verdad con `devin rm` (default: dry-run)")
     ap.add_argument("--vacuum", action="store_true",
                     help="VACUUM despues de borrar (requiere que no haya sesiones activas)")
+    ap.add_argument("--vacuum-only", action="store_true",
+                    help="solo VACUUM (no borra sesiones); aborta si hay devin activo")
+    ap.add_argument("--maintenance", action="store_true",
+                    help="checkpoint + VACUUM solo si la DB esta libre; pensado para una tarea horaria")
     args = ap.parse_args()
 
     db = Path(args.db)
@@ -127,6 +131,11 @@ def main() -> int:
     wal_size = wal.stat().st_size if wal.exists() else 0
     print(f"DB: {db}  ({size / 1e9:.2f} GB, WAL {wal_size / 1e9:.2f} GB)")
     print(f"Corte: actividad anterior a {args.days} dias")
+
+    if args.vacuum_only:
+        return run_vacuum(db)
+    if args.maintenance:
+        return run_maintenance(db)
 
     candidates = fetch_candidates(db, args.days)
     if not candidates:
@@ -172,17 +181,62 @@ def main() -> int:
     print(f"Borradas: {ok}  Fallidas: {failed}")
 
     if args.vacuum:
-        if active_session_ids():
-            print("VACUUM omitido: hay procesos devin activos.")
-        else:
-            print("Ejecutando VACUUM (puede tardar varios minutos)...")
-            con = sqlite3.connect(str(db))
-            try:
-                con.execute("PRAGMA busy_timeout=60000")
-                con.execute("VACUUM")
-            finally:
-                con.close()
-            print(f"VACUUM listo. DB ahora {db.stat().st_size / 1e9:.2f} GB")
+        run_vacuum(db)
+    return 0
+
+
+def run_maintenance(db: Path) -> int:
+    """Checkpoint + VACUUM solo si la DB no esta en uso.
+
+    Leccion 2026-11-09: un VACUUM con lectores abiertos en modo WAL escribe
+    todas las paginas al WAL (8,3 GB) y no encoge el archivo principal. El
+    orden correcto es checkpoint(TRUNCATE) y, solo si no quedo busy, VACUUM.
+    Pensado para una tarea horaria: si esta ocupada, no hace nada y reintenta.
+    """
+    before_db = db.stat().st_size / 1e9
+    wal = db.with_name(db.name + "-wal")
+    before_wal = wal.stat().st_size / 1e9 if wal.exists() else 0.0
+    print(f"Antes: DB {before_db:.2f} GB, WAL {before_wal:.2f} GB")
+
+    con = sqlite3.connect(str(db), timeout=10)
+    try:
+        con.execute("PRAGMA busy_timeout=10000")
+        busy, log_frames, ckpt_frames = con.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    except sqlite3.Error as exc:
+        print(f"checkpoint fallo: {exc}")
+        return 0
+    finally:
+        con.close()
+    if busy:
+        print("DB en uso (checkpoint busy); no se compacta ahora. Reintento luego.")
+        return 0
+    print(f"checkpoint ok (frames={log_frames}/{ckpt_frames}); VACUUM...")
+    rc = run_vacuum(db)
+    wal = db.with_name(db.name + "-wal")
+    after_wal = wal.stat().st_size / 1e9 if wal.exists() else 0.0
+    print(f"Despues: DB {db.stat().st_size / 1e9:.2f} GB, WAL {after_wal:.2f} GB")
+    return rc
+
+
+def run_vacuum(db: Path) -> int:
+    """VACUUM con red de seguridad: no corre si hay procesos devin activos."""
+    if active_session_ids():
+        print("VACUUM omitido: hay procesos devin activos. Cierra las sesiones "
+              "y vuelve a ejecutar con --vacuum-only.")
+        return 0
+    before = db.stat().st_size / 1e9
+    print(f"Ejecutando VACUUM sobre {before:.2f} GB (puede tardar varios minutos)...")
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute("PRAGMA busy_timeout=60000")
+        con.execute("VACUUM")
+    except sqlite3.Error as exc:
+        print(f"VACUUM fallo: {exc}")
+        return 1
+    finally:
+        con.close()
+    print(f"VACUUM listo. DB ahora {db.stat().st_size / 1e9:.2f} GB")
     return 0
 
 

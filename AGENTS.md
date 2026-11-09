@@ -1680,3 +1680,18 @@ Hallazgos y cambios aplicados:
   escribieron `policy.json recargado en caliente` en `watcher.log`.
 - **Ruido**: 0 lineas de `skills discovery` en `devin-diagnostics.log` de local
   y elenatec desde el reinicio de los watchers (antes ~2.800/dia).
+
+### Retencion aplicada (2026-11-09) y leccion del WAL
+
+- Retencion local a **45 dias** aplicada con `devin_sessions_retention.py --apply`:
+  80 sesiones borradas (83.647 nodos), 0 fallos. La DB paso de 384.235 a 302.991
+  nodos (346 -> 270 sesiones); tamano logico 10,43 -> 8,21 GB.
+- **Leccion**: VACUUM en modo WAL **con lectores abiertos** escribe todas las
+  paginas al WAL (quedo en 8,26 GB) y no encoge el archivo principal. El orden
+  correcto es `PRAGMA wal_checkpoint(TRUNCATE)` y solo si no devuelve busy,
+  VACUUM. Con sesiones Devin abiertas el checkpoint devuelve `(1,-1,-1)`.
+- Por eso se registran dos tareas: `Sofia-Devin-DBRetention` (diaria 04:30,
+  dry-run 45 dias) y `Sofia-Devin-DBMaintenance` (cada hora, `--maintenance`:
+  checkpoint + VACUUM solo si la DB esta libre; si esta ocupada no hace nada).
+  La compactacion fisica ocurrira en la primera ventana sin sesiones abiertas.
+- `magnate` NO se toco (17,9 GB, 307 sesiones >30 dias): pendiente de decision.
