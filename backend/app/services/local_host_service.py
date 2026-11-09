@@ -44,6 +44,10 @@ logger = logging.getLogger("sofia.localhost")
 
 ENABLED = os.getenv("SOFIA_LOCAL_MONITOR", "true").lower() in ("1", "true", "yes")
 POLL_SECONDS = int(os.getenv("SOFIA_LOCAL_POLL_S", "120"))
+# A service must stay down for this many consecutive polls before alerting.
+# SofiaBackend restarts as part of the coordinated restarts, and its first poll
+# runs while the frontends are still starting; a single sample is not evidence.
+SVC_CONFIRM_POLLS = max(1, int(os.getenv("SOFIA_LOCAL_SVC_CONFIRM_POLLS", "2")))
 DISK_WARN = int(os.getenv("SOFIA_LOCAL_DISK_WARN", "85"))
 DISK_CRIT = int(os.getenv("SOFIA_LOCAL_DISK_CRIT", "93"))
 MEM_WARN = int(os.getenv("SOFIA_LOCAL_MEM_WARN", "10"))
@@ -92,6 +96,8 @@ def _sha(text: str) -> str:
 # ── persisted state ──────────────────────────────────────────────────────────
 _last_record_id: Dict[str, int] = {}          # log name -> max RecordId seen
 _svc_state: Dict[str, str] = {}               # service -> last known status
+_svc_down_polls: Dict[str, int] = {}          # service -> consecutive down polls
+_svc_alerted: Set[str] = set()                # services with an open down alert
 _flags: Dict[str, bool] = {}
 _seen_ids: Set[str] = set()
 _cpu_high_polls = 0
@@ -337,17 +343,25 @@ async def _process_services(states: Dict[str, str]) -> int:
     for name, state in states.items():
         prev = _svc_state.get(name)
         _svc_state[name] = state
-        if state == prev or prev is None:
+        if state in ("RUNNING", "START_PENDING"):
+            _svc_down_polls.pop(name, None)
+            if name in _svc_alerted:
+                _svc_alerted.discard(name)
+                count += await _host_event(
+                    "INFO", f"svc_{name}",
+                    f"Windows service {name} recovered: {prev} -> {state}")
             continue
-        if state not in ("RUNNING", "START_PENDING"):
-            transitional = state == "PAUSED" or state.endswith("_PENDING")
-            count += await _host_event(
-                "WARNING" if transitional else "ERROR", f"svc_{name}",
-                f"Windows service {name} is {state}")
-        elif prev not in ("RUNNING", "START_PENDING"):
-            count += await _host_event(
-                "INFO", f"svc_{name}",
-                f"Windows service {name} recovered: {prev} -> {state}")
+        polls = _svc_down_polls.get(name, 0) + 1
+        _svc_down_polls[name] = polls
+        if polls < SVC_CONFIRM_POLLS:
+            continue
+        if polls > SVC_CONFIRM_POLLS and prev == state:
+            continue
+        _svc_alerted.add(name)
+        transitional = state == "PAUSED" or state.endswith("_PENDING")
+        count += await _host_event(
+            "WARNING" if transitional else "ERROR", f"svc_{name}",
+            f"Windows service {name} is {state}")
     return count
 
 

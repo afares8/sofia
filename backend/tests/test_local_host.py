@@ -105,25 +105,62 @@ def test_collect_service_states_queries_new_names(monkeypatch):
         assert states[name] == "RUNNING"
 
 
-def test_stopped_watched_service_triggers_error(monkeypatch):
-    monkeypatch.setitem(svc._svc_state, "vms-api", "RUNNING")
+def _reset_svc_state(monkeypatch):
+    monkeypatch.setattr(svc, "_svc_state", {})
+    monkeypatch.setattr(svc, "_svc_down_polls", {})
+    monkeypatch.setattr(svc, "_svc_alerted", set())
+
+
+def _poll(state, service="vms-api", times=1):
+    count = 0
+    for _ in range(times):
+        count += asyncio.run(svc._process_services({service: state}))
+    return count
+
+
+def test_stopped_watched_service_triggers_error_after_confirmation(monkeypatch):
+    _reset_svc_state(monkeypatch)
     host_event = AsyncMock(return_value=True)
     monkeypatch.setattr(svc, "_host_event", host_event)
+    monkeypatch.setitem(svc._svc_state, "vms-api", "RUNNING")
 
-    count = asyncio.run(svc._process_services({"vms-api": "STOPPED"}))
+    assert _poll("STOPPED") == 0
+    assert _poll("STOPPED") == 1
 
-    assert count == 1
     host_event.assert_awaited_once_with(
         "ERROR", "svc_vms-api", "Windows service vms-api is STOPPED"
     )
 
 
-def test_transitional_pending_state_is_warning_not_error(monkeypatch):
-    monkeypatch.setitem(svc._svc_state, "VisionBackend", "RUNNING")
+def test_stopped_service_alerts_once_while_still_down(monkeypatch):
+    _reset_svc_state(monkeypatch)
     host_event = AsyncMock(return_value=True)
     monkeypatch.setattr(svc, "_host_event", host_event)
+    monkeypatch.setitem(svc._svc_state, "vms-api", "RUNNING")
 
-    asyncio.run(svc._process_services({"VisionBackend": "STOP_PENDING"}))
+    assert _poll("STOPPED", times=4) == 1
+    assert host_event.await_count == 1
+
+
+def test_planned_restart_within_one_poll_is_silent(monkeypatch):
+    """SofiaBackend restarts with the frontends; its first poll must not alert."""
+    _reset_svc_state(monkeypatch)
+    host_event = AsyncMock(return_value=True)
+    monkeypatch.setattr(svc, "_host_event", host_event)
+    monkeypatch.setitem(svc._svc_state, "PackingFrontend", "RUNNING")
+
+    assert _poll("STOPPED", service="PackingFrontend") == 0
+    assert _poll("RUNNING", service="PackingFrontend") == 0
+    host_event.assert_not_awaited()
+
+
+def test_transitional_pending_state_is_warning_not_error(monkeypatch):
+    _reset_svc_state(monkeypatch)
+    host_event = AsyncMock(return_value=True)
+    monkeypatch.setattr(svc, "_host_event", host_event)
+    monkeypatch.setitem(svc._svc_state, "VisionBackend", "RUNNING")
+
+    assert _poll("STOP_PENDING", service="VisionBackend", times=2) == 1
 
     host_event.assert_awaited_once_with(
         "WARNING", "svc_VisionBackend",
@@ -131,24 +168,27 @@ def test_transitional_pending_state_is_warning_not_error(monkeypatch):
 
 
 def test_service_recovery_is_info(monkeypatch):
-    monkeypatch.setitem(svc._svc_state, "VisionBackend", "STOP_PENDING")
+    _reset_svc_state(monkeypatch)
     host_event = AsyncMock(return_value=True)
     monkeypatch.setattr(svc, "_host_event", host_event)
+    monkeypatch.setitem(svc._svc_state, "VisionBackend", "RUNNING")
 
-    asyncio.run(svc._process_services({"VisionBackend": "RUNNING"}))
+    assert _poll("STOPPED", service="VisionBackend", times=2) == 1
+    assert _poll("RUNNING", service="VisionBackend") == 1
 
-    host_event.assert_awaited_once_with(
+    assert host_event.await_args_list[-1].args == (
         "INFO", "svc_VisionBackend",
-        "Windows service VisionBackend recovered: STOP_PENDING -> RUNNING")
+        "Windows service VisionBackend recovered: STOPPED -> RUNNING")
 
 
 def test_paused_service_transition_is_warning(monkeypatch):
     service_name = "test-paused-service"
-    monkeypatch.setitem(svc._svc_state, service_name, "RUNNING")
+    _reset_svc_state(monkeypatch)
     host_event = AsyncMock(return_value=True)
     monkeypatch.setattr(svc, "_host_event", host_event)
+    monkeypatch.setitem(svc._svc_state, service_name, "RUNNING")
 
-    count = asyncio.run(svc._process_services({service_name: "PAUSED"}))
+    count = _poll("PAUSED", service=service_name, times=2)
 
     assert count == 1
     host_event.assert_awaited_once_with(
