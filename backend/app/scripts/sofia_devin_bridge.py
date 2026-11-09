@@ -1772,17 +1772,24 @@ class Watcher:
         stale = age is None or age > HEALTH_STALE_SECONDS
         status = state.get("status")
         worker_ok = bool(self.is_worker_alive(self.group))
-        blocked = bool(state.get("paused") or state.get("uncertain")
-                       or state.get("circuit_open")
+        # `uncertain` es transitorio: murio un worker con un turno enviado y el
+        # puente lo reintenta solo (10 min). NO es DOWN; si se reporta 503 el
+        # monitor (con auto_restore) reinicia el puente encima del reintento y
+        # alarga el problema. `paused`, `circuit_open` y `source_reset` si
+        # requieren mirada humana.
+        blocked = bool(state.get("paused") or state.get("circuit_open")
                        or state.get("source_reset"))
         ok = not stale and not blocked and (
-            status == "ok" or (status == "pending_full" and worker_ok))
+            status in ("ok", "uncertain")
+            or (status == "pending_full" and worker_ok))
         return ({
             "ok": ok,
             "group": self.group,
             "last_poll_age_seconds": None if age is None else round(age, 1),
             "status": status,
             "worker_alive": worker_ok,
+            "uncertain": bool(state.get("uncertain")),
+            "paused": bool(state.get("paused")),
             "pending": len(state.get("pending") or []),
             "muted": int(state.get("muted") or 0),
         }, (200 if ok else 503))
@@ -3757,5 +3764,31 @@ def main(argv: Optional[List[str]] = None) -> int:
                 pass
 
 
+def _exit_log(message: str) -> None:
+    """Deja rastro de una salida anomala aunque el proceso corra con pythonw.
+
+    pythonw no tiene stdout/stderr: un `return 4` (mutex ocupado), un fallo de
+    policy o un traceback se perdian sin dejar evidencia. Se escribe en
+    %TEMP%\\sofia_devin_bridge-exit.log (siempre escribible para el usuario).
+    """
+    text = (f"{time.strftime('%Y-%m-%dT%H:%M:%S')} pid={os.getpid()} "
+            f"argv={' '.join(sys.argv[1:])} {message}\n")
+    try:
+        path = Path(tempfile.gettempdir()) / "sofia_devin_bridge-exit.log"
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError:
+        pass
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        _rc = main()
+    except SystemExit:
+        raise
+    except BaseException:
+        _exit_log("CRASH\n" + tb_mod.format_exc()[-4000:])
+        raise
+    if _rc:
+        _exit_log(f"exit rc={_rc}")
+    sys.exit(_rc)

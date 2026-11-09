@@ -2619,6 +2619,18 @@ def test_health_snapshot_ok_and_stale(env):
     assert w.health_snapshot()[1] == 503
 
 
+def test_health_snapshot_uncertain_is_not_down(env):
+    """`uncertain` es transitorio: el puente reintenta solo y no es DOWN."""
+    w, store, spawns = make_watcher(env)
+    w._last_poll_at = w.now()
+    with store.transaction() as st:
+        st["uncertain"] = True
+        st["status"] = "uncertain"
+    payload, status = w.health_snapshot()
+    assert status == 200 and payload["ok"] is True
+    assert payload["uncertain"] is True
+
+
 def test_health_snapshot_paused_is_503(env):
     w, store, spawns = make_watcher(env)
     w._last_poll_at = w.now()
