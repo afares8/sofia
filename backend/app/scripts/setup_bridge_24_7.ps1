@@ -82,6 +82,9 @@ foreach ($t in $Tasks) {
 
 $startup = New-ScheduledTaskTrigger -AtStartup
 $logon = New-ScheduledTaskTrigger -AtLogOn -User $User
+# OJO: -AllowHardTerminate NO existe en New-ScheduledTaskSettingsSet (es una
+# propiedad del objeto Settings, no un switch). El valor por defecto ya es
+# True, que es lo que necesitamos para que /End pueda terminar el proceso.
 $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
@@ -89,21 +92,38 @@ $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -RestartCount 3 `
-    -RestartInterval (New-TimeSpan -Minutes 1) `
-    -AllowHardTerminate
+    -RestartInterval (New-TimeSpan -Minutes 1)
 
-foreach ($t in $Tasks) {
-    $action = New-ScheduledTaskAction -Execute $Python `
-        -Argument ('"{0}" watch --group {1} --policy-dir "{2}"' -f $Script, $t.Group, $PolicyDir) `
-        -WorkingDirectory $WorkDir
-    $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType S4U -RunLevel $t.RunLevel
+function Restore-OriginalTasks([string[]]$Names) {
+    foreach ($name in $Names) {
+        $xmlPath = Join-Path $BackupDir ("{0}.xml" -f $name)
+        if (-not (Test-Path $xmlPath)) { continue }
+        schtasks /End /TN $name 2>$null | Out-Null
+        schtasks /Create /TN $name /XML $xmlPath /F | Out-Null
+        schtasks /Run /TN $name 2>$null | Out-Null
+        Write-Host "[$(Get-Date)] Restaurada $name desde $xmlPath"
+    }
+}
 
-    Write-Host "[$(Get-Date)] Re-registrando $($t.Name) (S4U, $($t.RunLevel))..."
-    schtasks /End /TN $t.Name 2>$null | Out-Null
-    Start-Sleep -Seconds 2
-    Register-ScheduledTask -TaskName $t.Name -Action $action -Trigger @($startup, $logon) `
-        -Principal $principal -Settings $settings -Force | Out-Null
-    Start-ScheduledTask -TaskName $t.Name
+try {
+    foreach ($t in $Tasks) {
+        $action = New-ScheduledTaskAction -Execute $Python `
+            -Argument ('"{0}" watch --group {1} --policy-dir "{2}"' -f $Script, $t.Group, $PolicyDir) `
+            -WorkingDirectory $WorkDir
+        $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType S4U -RunLevel $t.RunLevel
+
+        Write-Host "[$(Get-Date)] Re-registrando $($t.Name) (S4U, $($t.RunLevel))..."
+        schtasks /End /TN $t.Name 2>$null | Out-Null
+        Start-Sleep -Seconds 2
+        Register-ScheduledTask -TaskName $t.Name -Action $action -Trigger @($startup, $logon) `
+            -Principal $principal -Settings $settings -Force | Out-Null
+        Start-ScheduledTask -TaskName $t.Name
+    }
+} catch {
+    Write-Host ("[$(Get-Date)] ERROR al re-registrar: " + $_.Exception.Message) -ForegroundColor Red
+    Restore-OriginalTasks ($Tasks | ForEach-Object { $_.Name })
+    Write-Host "Rollback aplicado. XML original en $BackupDir"
+    exit 1
 }
 
 $failed = @()
@@ -118,12 +138,7 @@ foreach ($t in $Tasks) {
 
 if ($failed.Count -gt 0) {
     Write-Host "[$(Get-Date)] FALLO: $($failed.Name -join ', ') no respondio. Restaurando XML original..." -ForegroundColor Red
-    foreach ($t in $failed) {
-        $xmlPath = Join-Path $BackupDir ("{0}.xml" -f $t.Name)
-        schtasks /End /TN $t.Name 2>$null | Out-Null
-        schtasks /Create /TN $t.Name /XML $xmlPath /F | Out-Null
-        schtasks /Run /TN $t.Name 2>$null | Out-Null
-    }
+    Restore-OriginalTasks ($failed | ForEach-Object { $_.Name })
     Write-Host "Rollback aplicado. XML original en $BackupDir"
     exit 1
 }
