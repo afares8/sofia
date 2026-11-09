@@ -120,7 +120,21 @@ def main() -> int:
                     help="solo VACUUM (no borra sesiones); aborta si hay devin activo")
     ap.add_argument("--maintenance", action="store_true",
                     help="checkpoint + VACUUM solo si la DB esta libre; pensado para una tarea horaria")
+    ap.add_argument("--log-file", default="",
+                    help="redirige stdout/stderr a este archivo (para correr con pythonw sin consola)")
     args = ap.parse_args()
+
+    if args.log_file:
+        # Con pythonw.exe no hay stdout/stderr: la tarea programada abria una
+        # ventana cmd.exe visible y ademas perdia la salida. Escribimos el log
+        # desde el propio proceso.
+        try:
+            log = open(args.log_file, "a", encoding="utf-8", buffering=1)
+            sys.stdout = log
+            sys.stderr = log
+            print(f"\n=== {dt.datetime.now():%Y-%m-%d %H:%M:%S} {' '.join(sys.argv[1:])} ===")
+        except OSError:
+            pass
 
     db = Path(args.db)
     if not db.exists():
@@ -211,7 +225,23 @@ def run_maintenance(db: Path) -> int:
     if busy:
         print("DB en uso (checkpoint busy); no se compacta ahora. Reintento luego.")
         return 0
-    print(f"checkpoint ok (frames={log_frames}/{ckpt_frames}); VACUUM...")
+    print(f"checkpoint ok (frames={log_frames}/{ckpt_frames})")
+    # VACUUM solo si hay paginas libres que valga la pena recuperar: repetirlo
+    # cada hora sin ganancia bloquea la DB durante minutos.
+    try:
+        con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+        con.execute("PRAGMA query_only=ON")
+        page_count = con.execute("PRAGMA page_count").fetchone()[0]
+        freelist = con.execute("PRAGMA freelist_count").fetchone()[0]
+        con.close()
+    except sqlite3.Error:
+        page_count = freelist = 0
+    threshold = max(2000, page_count // 100)  # ~1% de la DB o 2000 paginas
+    if freelist < threshold:
+        print(f"nada que compactar (freelist={freelist} < {threshold}); "
+              "se omite VACUUM.")
+        return 0
+    print(f"paginas libres: {freelist} (umbral {threshold})")
     rc = run_vacuum(db)
     wal = db.with_name(db.name + "-wal")
     after_wal = wal.stat().st_size / 1e9 if wal.exists() else 0.0

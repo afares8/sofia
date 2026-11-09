@@ -1695,3 +1695,20 @@ Hallazgos y cambios aplicados:
   checkpoint + VACUUM solo si la DB esta libre; si esta ocupada no hace nada).
   La compactacion fisica ocurrira en la primera ventana sin sesiones abiertas.
 - `magnate` NO se toco (17,9 GB, 307 sesiones >30 dias): pendiente de decision.
+
+### Ventana negra cmd.exe de las tareas de retencion (2026-11-09)
+
+- Causa: `Sofia-Devin-DBMaintenance` y `Sofia-Devin-DBRetention` se registraron
+  con accion `cmd.exe /c "... python ... >> log"`. Con `LogonType Interactive`
+  eso abre una consola visible en la sesion del usuario; ademas el `cmd` quedo
+  huerfano cuando el hijo python termino (PID sin hijo, CPU ~0).
+- Fix: ambas tareas usan `pythonw.exe` (sin consola) y el script escribe su
+  propio log con `--log-file <retention.log>`; se agrego `-MultipleInstances
+  IgnoreNew`. Verificado: 0 procesos `cmd.exe` al ejecutar la tarea y log con
+  marca de tiempo por corrida.
+- Extra: el `VACUUM` horario se omitia mal (se repetia sin ganancia y bloqueaba
+  la DB). Ahora `--maintenance` consulta `freelist_count` y solo compacta si
+  supera `max(2000, page_count/100)`; si no, solo hace checkpoint.
+- Tras cerrar el proceso, el checkpoint truncó el WAL: `sessions.db` 8,29 GB y
+  WAL 0,00 GB (antes 10,43 + 8,35). `PRAGMA quick_check` = ok, 303.661 nodos,
+  270 sesiones. Disco C: de 75 GB a 82 GB libres.
