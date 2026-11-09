@@ -1661,3 +1661,22 @@ Hallazgos y cambios aplicados:
   deja `uncertain` (503 transitorio, se reintenta solo). El setup ahora espera
   inactividad (`-WaitIdleMinutes`, default 5) y `health_snapshot` reporta 200
   para `uncertain`; `paused`/`circuit_open`/`source_reset` siguen 503.
+
+### Verificacion en vivo del 2026-11-09 (auto-recuperacion y auto-restore)
+
+- **`manual_gap` se cura solo**: se forzo `status=manual_gap`, `paused=true`,
+  `status_at` 20 min atras en `local/state.json`; en el siguiente ciclo (25 s)
+  volvio a `status=ok`, `paused=false`, `last_error=null`, `pause_cursor=0`.
+- **Auto-restore real**: `POST /api/restore/trigger/sofia-devin-local` con el
+  puente **abajo** devolvio `status=success`, `restore_method=start_command`,
+  `result_message="Servicio restaurado."` y `/health` volvio a 200 en ~17 s
+  (el backend corre como LocalSystem y ejecuta `schtasks /End` + `/Run`).
+- **OJO con la config persistida**: `backend/data/config.json` (creado 2026-11-01)
+  fija `restore_enabled/auto_restore` por servicio y **tiene prioridad** sobre
+  `DEFAULT_SERVICES` de `app/models/config.py`: `load_config()` solo usa el
+  default cuando la clave falta en el JSON. Cambiar solo `config.py` no surte
+  efecto. Se actualizo `data/config.json` (backup `config.json.bak-<ts>`).
+- **Hot-reload de policy verificado**: `touch policy.json` y ambos watchers
+  escribieron `policy.json recargado en caliente` en `watcher.log`.
+- **Ruido**: 0 lineas de `skills discovery` en `devin-diagnostics.log` de local
+  y elenatec desde el reinicio de los watchers (antes ~2.800/dia).
