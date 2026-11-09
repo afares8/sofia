@@ -14,7 +14,7 @@
   "repeat_suppress_levels": ["WARNING", "ERROR", "CRITICAL"],
   "repeat_suppress_minutes_by_level": {"ERROR": 60, "CRITICAL": 10},
   "repeat_escalate_after": 12,
-  "digest_levels": ["WARNING", "ERROR"],
+  "digest_levels": ["WARNING"],
   "digest_minutes": 360,
   "digest_fresh_session": true,
   "digest_force": true,
@@ -72,10 +72,95 @@
       "pattern": "jobs\\.depreciation_failed|No se encontr. la cuenta de depreciaci.n acumulada",
       "levels": ["WARNING"],
       "note": "Falta accum_dep_account_id / catalogo de cuentas del cliente: configuracion operativa, no bug de codigo."
+    },
+    {
+      "id": "windows-ipf-esif-apploader",
+      "service_id": "server-sofia",
+      "pattern": "Windows Application event 17 \\[IPF(SVCHOST|UMDF)\\]",
+      "levels": ["WARNING"],
+      "note": "Driver host de Intel IPF/ESIF (audio/sensor) reintenta cada hora contra pipe://ipfsrv.dptf y falla con ESIF_E_NOT_INITIALIZED: ruido de driver de Windows, ningun servicio de esta PC depende de el. Las occurrences siguen en sofia.db."
+    },
+    {
+      "id": "packing-ai-tracking-external",
+      "service_id": "packing",
+      "pattern": "\\[AI_TRACKING\\].*(Web fallback failed|BL fallback also returned no results|Multi-carrier search exhausted|Could not find tracking input)",
+      "levels": ["WARNING"],
+      "note": "Scraping de tracking en webs de navieras (Maersk/MSC/CMA CGM/Hapag) bloqueado o sin datos: fallo externo esperado, no bug de codigo. Los ERROR/CRITICAL de AI_TRACKING siguen saliendo."
+    },
+    {
+      "id": "packing-slow-request",
+      "service_id": "packing",
+      "pattern": "^Slow request",
+      "levels": ["WARNING"],
+      "note": "Latencia de endpoints de Packing con respuesta 2xx (incluye alta en SAP y guardado en share): telemetria de rendimiento, no bug."
+    },
+    {
+      "id": "mayor-slow-request",
+      "service_id": "mayor",
+      "pattern": "^Slow request",
+      "levels": ["WARNING"],
+      "note": "Latencia de endpoints de Mayor con respuesta 2xx: telemetria de rendimiento, no bug."
+    },
+    {
+      "id": "vision-slow-request",
+      "service_id": "vision",
+      "pattern": "^Slow request",
+      "levels": ["WARNING"],
+      "note": "Latencia de endpoints de Vision (WHEP/snapshot/register-stream): telemetria de rendimiento, no bug. Los ERROR de Vision siguen saliendo."
+    },
+    {
+      "id": "vision-stream-capacity",
+      "service_id": "vision",
+      "pattern": "device_credentials_missing|capacity_reject",
+      "levels": ["WARNING"],
+      "note": "Rechazo de stream por capacidad del media server o credenciales del dispositivo: operacion del cliente, no bug de codigo."
+    },
+    {
+      "id": "wppconnect-webhook-backend-restart",
+      "service_id": "wppconnect",
+      "pattern": "Error calling Webhook.*ECONNREFUSED 127\\.0\\.0\\.1:(8075|8100|5180)",
+      "levels": ["WARNING"],
+      "note": "WPPConnect reintenta el webhook mientras el backend esta reiniciando: se recupera solo, no requiere accion."
+    },
+    {
+      "id": "mayor-abuseipdb-key-missing",
+      "service_id": "mayor",
+      "pattern": "AbuseIPDB API key no configurada",
+      "levels": ["WARNING"],
+      "note": "Integracion opcional sin configurar; el modulo de seguridad funciona sin ella."
+    },
+    {
+      "id": "mayor-apscheduler-missed-job",
+      "service_id": "mayor",
+      "pattern": "Run time of job .* was missed",
+      "levels": ["WARNING"],
+      "note": "APScheduler avisa de un job que se solapo con el reinicio del backend; el siguiente ciclo lo ejecuta."
+    },
+    {
+      "id": "mayor-sap-middleware-kill",
+      "service_id": "mayor",
+      "pattern": "SAP DI API Middleware did not stop gracefully",
+      "levels": ["WARNING"],
+      "note": "El backend mata el middleware .NET al reiniciar cuando no cierra solo: comportamiento esperado del manager."
+    },
+    {
+      "id": "windows-nssm-process-handle",
+      "service_id": "server-sofia",
+      "pattern": "Windows Application event 1026 \\[nssm\\]",
+      "levels": ["WARNING"],
+      "note": "NSSM no pudo abrir el handle de un proceso ya terminado durante un reinicio: ruido del wrapper, no del servicio."
+    },
+    {
+      "id": "windows-dcom-bitlocker-noise",
+      "service_id": "server-sofia",
+      "pattern": "Windows System event (10001 \\[Microsoft-Windows-DistributedCOM\\]|24641 \\[Microsoft-Windows-BitLocker-Driver\\])",
+      "levels": ["WARNING"],
+      "note": "Eventos de DCOM (paquete de la tienda) y BitLocker del SO: no afectan a ningun servicio monitoreado."
     }
   ],
   "session_recycle_prompts": 80,
   "session_recycle_minutes": 240,
+  "auto_resume_minutes": 15,
   "retry_interval_minutes": 10,
   "escalate_after_attempts": 3,
   "escalation_repeat_minutes": 360,
@@ -105,7 +190,13 @@
       "cwd": "C:/Users/ahmed/apps/tec-review",
       "elevated": false,
       "initial_prompt": "elenatec-initial.txt",
-      "task_name": "Sofia-Devin-ElenaTec"
+      "task_name": "Sofia-Devin-ElenaTec",
+      "remote": {
+        "host": "magnate",
+        "cwd": "/root/tec",
+        "devin_executable": "/root/.local/bin/devin",
+        "require_root": true
+      }
     }
   },
   "elenatec_route": {

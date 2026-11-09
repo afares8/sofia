@@ -15,6 +15,7 @@ WhatsApp alert as long as the service is back within:
 import asyncio
 import httpx
 import logging
+import time
 from datetime import datetime
 from typing import Dict
 from app.models.config import ServiceConfig
@@ -31,6 +32,13 @@ _status_cache: Dict[str, ServiceStatus] = {}
 # mandar el correo de respaldo se espera este tiempo; si el servicio ya
 # respondio, el correo no se envia (solo era un reinicio).
 WPPCONNECT_EMAIL_DEFER_SECONDS = 180  # 3 minutos
+
+# Un servicio que sigue DOWN no puede avisar una sola vez: el 2026-11-08 los
+# dos puentes Sofia-Devin estuvieron caidos 15 h y solo hubo un aviso. Cada
+# DOWN_REMINDER_SECONDS se reenvía el aviso mientras siga caído.
+DOWN_REMINDER_SECONDS = 3600
+_down_alert_at: Dict[str, float] = {}
+_down_alert_count: Dict[str, int] = {}
 
 
 def get_all_statuses() -> Dict[str, ServiceStatus]:
@@ -153,9 +161,43 @@ async def check_service(svc: ServiceConfig) -> ServiceStatus:
         # Trigger restore prompt for restoreable services
         from app.services import restore_service
         await restore_service.notify_down_with_restore_prompt(svc.id, svc.name)
+        _down_alert_at[svc.id] = time.monotonic()
+        _down_alert_count[svc.id] = 1
         logger.warning(
             f"[HEALTH] {svc.name} DOWN after {new_failures} consecutive failures — alert sent"
         )
+    elif new_status == "down" and svc.enabled:
+        last = _down_alert_at.get(svc.id)
+        if last is None:
+            _down_alert_at[svc.id] = time.monotonic()
+        elif time.monotonic() - last >= DOWN_REMINDER_SECONDS:
+            cfg = load_config()
+            count = _down_alert_count.get(svc.id, 1) + 1
+            sent = await whatsapp_service.send_alert(
+                cfg.alerts, svc.name, svc.id, "CRITICAL",
+                f"{svc.name} sigue caído (recordatorio {count - 1})",
+                f"URL: {svc.url} — {new_failures} chequeos fallidos consecutivos. "
+                f"Sigue DOWN desde hace ~{int((time.monotonic() - last) / 60)} min.",
+                defer_email_seconds=0,
+            )
+            _down_alert_at[svc.id] = time.monotonic()
+            _down_alert_count[svc.id] = count
+            logger.warning(
+                f"[HEALTH] {svc.name} still DOWN — reminder #{count - 1} sent"
+            )
+            event = ErrorEvent(
+                service_id=svc.id,
+                service_name=svc.name,
+                level="CRITICAL",
+                message=f"{svc.name} sigue caído (recordatorio {count - 1})",
+                detail=(f"URL: {svc.url} — {new_failures} chequeos fallidos "
+                        f"consecutivos"),
+                source="passive",
+                timestamp=datetime.utcnow(),
+            )
+            event_id = await db_service.insert_event(event)
+            if sent:
+                await db_service.mark_notified(event_id)
     elif new_status == "restarting" and prev_status == "up":
         logger.info(
             f"[HEALTH] {svc.name} failed check {new_failures}/{threshold} — "
@@ -163,6 +205,8 @@ async def check_service(svc: ServiceConfig) -> ServiceStatus:
         )
     elif new_status == "up" and prev_status in ("restarting", "down"):
         logger.info(f"[HEALTH] {svc.name} recovered after {prev_failures} failure(s)")
+        _down_alert_at.pop(svc.id, None)
+        _down_alert_count.pop(svc.id, None)
         if prev_status == "down" and svc.enabled:
             cfg = load_config()
             await whatsapp_service.send_alert(

@@ -12,6 +12,8 @@ from app.services import health_service
 @pytest.fixture(autouse=True)
 def isolated_health(monkeypatch):
     monkeypatch.setattr(health_service, "_status_cache", {})
+    monkeypatch.setattr(health_service, "_down_alert_at", {})
+    monkeypatch.setattr(health_service, "_down_alert_count", {})
     monkeypatch.setattr(health_service.db_service, "record_metric", AsyncMock())
     monkeypatch.setattr(health_service.db_service, "insert_event", AsyncMock(return_value=1))
     monkeypatch.setattr(health_service.db_service, "mark_notified", AsyncMock())
@@ -135,6 +137,45 @@ def test_other_service_down_does_not_defer_email(monkeypatch):
     assert health_service.whatsapp_service.send_alert.await_count == 1
     kwargs = health_service.whatsapp_service.send_alert.await_args.kwargs
     assert kwargs["defer_email_seconds"] == 0
+
+
+def test_down_sends_reminder_after_window(monkeypatch):
+    """Un servicio que sigue DOWN reenvía el aviso tras la ventana."""
+    mock_http(monkeypatch, [httpx.Response(503)] * 4)
+    service = ServiceConfig(id="sofia-devin-local", name="Puente Sofia-Devin",
+                            url="http://localhost/ping")
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(health_service.time, "monotonic", lambda: clock["t"])
+
+    async def run():
+        for _ in range(3):
+            await health_service.check_service(service)
+        clock["t"] += health_service.DOWN_REMINDER_SECONDS + 1
+        await health_service.check_service(service)
+
+    asyncio.run(run())
+    assert health_service.whatsapp_service.send_alert.await_count == 2
+    reminder = health_service.whatsapp_service.send_alert.await_args_list[1]
+    assert "sigue caído" in reminder.args[4]
+    assert health_service.db_service.insert_event.await_count == 2
+
+
+def test_down_reminder_resets_on_recovery(monkeypatch):
+    codes = [503, 503, 503, 200, 503, 503, 503]
+    mock_http(monkeypatch, [httpx.Response(code) for code in codes])
+    service = ServiceConfig(id="mayor", name="Mayor", url="http://localhost/ping")
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(health_service.time, "monotonic", lambda: clock["t"])
+
+    async def run():
+        for _ in range(7):
+            await health_service.check_service(service)
+            clock["t"] += health_service.DOWN_REMINDER_SECONDS + 1
+
+    asyncio.run(run())
+    # 1a caida (alerta) + recuperacion + 2a caida (alerta) = 3; sin recordatorio
+    # extra porque el contador se reinicia al recuperar.
+    assert health_service.whatsapp_service.send_alert.await_count == 3
 
 
 def test_services_are_polled_concurrently(monkeypatch):

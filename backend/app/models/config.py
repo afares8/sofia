@@ -331,8 +331,8 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         url="http://127.0.0.1:5185/health",
         log_path="C:/Users/ahmed/apps/sofia/backend/data/devin-desktop/local/watcher.log",
         enabled=True,
-        restore_enabled=False,
-        auto_restore=False,
+        restore_enabled=True,
+        auto_restore=True,
     ),
     ServiceConfig(
         id="sofia-devin-elenatec",
@@ -340,8 +340,8 @@ DEFAULT_SERVICES: List[ServiceConfig] = [
         url="http://127.0.0.1:5186/health",
         log_path="C:/Users/ahmed/apps/sofia/backend/data/devin-desktop/elenatec/watcher.log",
         enabled=True,
-        restore_enabled=False,
-        auto_restore=False,
+        restore_enabled=True,
+        auto_restore=True,
     ),
 ]
 

@@ -1587,3 +1587,59 @@ Incidente: `sofia-devin-elenatec` (5186) respondio 503 con
   **Fix**: pasar `stdin=subprocess.DEVNULL` en `verify_elevation`, `devin_authenticated` y
   `devin_authenticated_remote_detail`. Verificado en vivo: el worker `elenatec` autentico en ~2 s,
   abrio sesion ACP (`glaze-muscle`), marco `worker_ready=true` y `5186/health` quedo en 200 OK.
+
+## Auditoria de tokens y disponibilidad del puente (2026-11-08)
+
+Revision de los logs del puente de los dias 2026-11-07 y 2026-11-08 (5 sesiones,
+246 peticiones, 23,0 M tokens de contexto, ~0,50 USD con deepseek-v4-1-flash-high).
+Hallazgos y cambios aplicados:
+
+- **Cobertura**: ambas tareas son `LogonTrigger` + `LogonType Interactive`. Tras el
+  reinicio programado del 2026-11-08 estuvieron caidas 00:03-15:08 (15 h) y los
+  CRITICAL "puente DOWN" se entregaron 16 h tarde porque los entrega el propio
+  puente. Se agrega `backend/app/scripts/setup_bridge_24_7.ps1` (ejecutar como
+  Administrador) que re-registra con `LogonType S4U`, triggers `AtStartup` +
+  `AtLogOn`, `RestartCount 3` y rollback automatico desde el XML original.
+  `RunLevel Highest` solo para el grupo local; ElenaTec sigue `Limited` porque su
+  worker verifica NO elevacion.
+- **`manual_gap` ya no es permanente**: si `session/load` falla (o el agente no
+  soporta `loadSession`), `_ensure_session` abre una sesion nueva del dia, reenvia
+  el prompt inicial y guarda `recovered_from`; ademas `_heal_manual_gap_locked`
+  levanta la pausa tras `policy.auto_resume_minutes` (15 min) si hay pendientes.
+  Esto reemplaza la invariante anterior "session/load fallido => manual_gap, sin
+  sesion de reemplazo" (caso 2026-11-07: 12 h sin triaje y 500 pendientes).
+- **ERROR en tiempo real**: `policy.digest_levels` pasa a `["WARNING"]`. Antes
+  incluia ERROR con ventana de 360 min y los 7 ERROR de ElenaTec del 2026-11-08
+  quedaron retenidos hasta las 03:10. CRITICAL ya salia por `urgent_bypass_levels`.
+- **Backlog de dias anteriores**: `_spawn_day_locked` reagrupa los avisos de dias
+  viejos en el dia actual en vez de abrir la consola del dia anterior (el
+  2026-11-08 se abrio la sesion del 7-nov a las 21:08 y murio a los 2 minutos al
+  reiniciar el watcher desde dentro de si misma).
+- **`policy.json` se recarga en caliente** (`Watcher._reload_policy_if_changed`,
+  por mtime). Ya no hace falta reiniciar el watcher para aplicar mute rules; los
+  prompts iniciales prohiben reiniciar las tareas `Sofia-Devin-*` desde dentro de
+  una sesion (el watcher es el padre y mata al agente a mitad de turno).
+- **Mute rules nuevas** (51 de 66 pendientes eran ruido conocido): `AI_TRACKING`
+  de Packing, `Slow request` de Packing/Mayor/Vision, rechazos de stream de
+  Vision, webhook de WPPConnect durante reinicio, AbuseIPDB sin key, jobs
+  saltados de APScheduler, kill del middleware SAP, evento 1026 de NSSM y
+  eventos DCOM/BitLocker. Los ERROR/CRITICAL no se silencian.
+- **Alertas DOWN con recordatorio**: `health_service.DOWN_REMINDER_SECONDS`
+  (3600 s) reenvia el aviso mientras el servicio siga caido y registra el evento;
+  antes habia un unico aviso por caida. `sofia-devin-local` y
+  `sofia-devin-elenatec` pasan a `restore_enabled/auto_restore = True` con
+  `SERVICE_CONTEXT` (`schtasks /End` + `/Run`) y scripts
+  `restore_sofia-devin-{local,elenatec}.ps1` como fallback.
+- **Ruido de logs**: `_devin_log` descarta `skills discovery`,
+  `remote config revalidation failed` y `Waiting for stop token`; el spawn del
+  agente fija `RUST_LOG=info,chisel_agent::skills_loading=warn,windsurf_api_client::remote_config=error`.
+  Eran ~2.800 lineas/dia que rotaban 1 MiB cada pocas horas.
+- **Retencion de `sessions.db`**: `backend/app/scripts/devin_sessions_retention.py`
+  (dry-run por defecto; `--apply` borra con `devin rm --force`; `--vacuum`
+  opcional). Estado al 2026-11-08: local 10,3 GB + 1,4 GB WAL; magnate 17,9 GB +
+  0,6 GB WAL. No se borro nada automaticamente.
+- **Indice de contexto**: `C:/Users/ahmed/AGENTS-INDEX.md` mapea las secciones de
+  `C:/Users/ahmed/AGENTS.md` (257 KB, ~64k tokens) y los prompts iniciales piden
+  leer el indice y hacer grep dirigido en vez de leer el archivo completo.
+- Tests: `tests/test_sofia_devin_bridge.py` (163), `test_health_service.py` (21),
+  `test_restore_health.py`, `test_self_health.py` — 193+ pasando.

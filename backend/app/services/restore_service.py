@@ -127,6 +127,31 @@ SERVICE_CONTEXT = {
         "start_cmd": r".\SapDiApiMiddleware.exe",
         "extra": "SAP DIAPI middleware shared by Mayor and Packing.",
     },
+    # Puentes Sofia-Devin: no son servicios NSSM, son tareas programadas.
+    # El comando reinicia la tarea (End + Run) y _run_start_command espera a
+    # que /health vuelva a responder.
+    "sofia-devin-local": {
+        "port": 5185,
+        "health_url": "http://127.0.0.1:5185/health",
+        "work_dir": r"C:\Users\ahmed\apps\sofia\backend",
+        "start_cmd": (
+            'schtasks /End /TN "Sofia-Devin-AppsPC" 2>$null; '
+            "Start-Sleep -Seconds 2; "
+            'schtasks /Run /TN "Sofia-Devin-AppsPC"'
+        ),
+        "extra": "Watcher del puente Sofia-Devin para las apps de esta PC.",
+    },
+    "sofia-devin-elenatec": {
+        "port": 5186,
+        "health_url": "http://127.0.0.1:5186/health",
+        "work_dir": r"C:\Users\ahmed\apps\sofia\backend",
+        "start_cmd": (
+            'schtasks /End /TN "Sofia-Devin-ElenaTec" 2>$null; '
+            "Start-Sleep -Seconds 2; "
+            'schtasks /Run /TN "Sofia-Devin-ElenaTec"'
+        ),
+        "extra": "Watcher del puente Sofia-Devin para ElenaTec (host magnate).",
+    },
 }
 
 

@@ -36,7 +36,7 @@ from contextlib import contextmanager
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[3]
@@ -136,6 +136,10 @@ class BridgeError(Exception):
 
 
 class StateError(BridgeError):
+    pass
+
+
+class StateLockError(StateError):
     pass
 
 
@@ -674,7 +678,58 @@ def is_user_admin() -> bool:
         return False
 
 
+def remote_group_cfg(group_cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Config del modo remoto de un grupo, o None si trabaja en local.
+
+    Un grupo remoto ejecuta el agente ACP en otro host (por SSH) con el
+    working tree de produccion como cwd. El commit queda en ese repo, que es
+    el propio `origin`, asi que no hace falta push.
+    """
+    remote = group_cfg.get("remote")
+    if isinstance(remote, dict) and remote.get("host"):
+        return remote
+    return None
+
+
+def group_agent_cwd(group_cfg: Dict[str, Any]) -> str:
+    remote = remote_group_cfg(group_cfg)
+    if remote:
+        return str(remote.get("cwd") or group_cfg["cwd"])
+    return str(group_cfg["cwd"])
+
+
+def group_devin_executable(policy: Dict[str, Any],
+                           group_cfg: Dict[str, Any]) -> str:
+    remote = remote_group_cfg(group_cfg)
+    if remote:
+        return str(remote.get("devin_executable")
+                   or policy.get("devin_executable", ""))
+    return str(policy.get("devin_executable", ""))
+
+
+def _ssh_base(host: str, timeout: int = 20) -> List[str]:
+    return ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}",
+            "-o", "ServerAliveInterval=30", host]
+
+
 def verify_elevation(group_cfg: Dict[str, Any]) -> None:
+    remote = remote_group_cfg(group_cfg)
+    if remote:
+        if not bool(remote.get("require_root", True)):
+            return
+        host = str(remote["host"])
+        try:
+            proc = subprocess.run(
+                _ssh_base(host) + ["id", "-u"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True, timeout=40)
+        except Exception as exc:
+            raise ElevationMismatch(
+                f"ssh a {host} fallo: {redact_text(exc)[:200]}") from exc
+        if proc.returncode != 0 or proc.stdout.strip() != b"0":
+            raise ElevationMismatch(
+                f"remoto {host}: se esperaba root (uid 0)")
+        return
     expected = bool(group_cfg.get("elevated"))
     if is_user_admin() != expected:
         raise ElevationMismatch(
@@ -685,10 +740,48 @@ def devin_authenticated(executable: str) -> bool:
     try:
         proc = subprocess.run(
             [executable, "auth", "status"],
+            stdin=subprocess.DEVNULL,
             capture_output=True, timeout=20)
         return proc.returncode == 0
     except Exception:
         return False
+
+
+def devin_authenticated_remote(host: str, executable: str) -> bool:
+    return devin_authenticated_remote_detail(host, executable)[0]
+
+
+def devin_authenticated_remote_detail(
+        host: str, executable: str) -> Tuple[bool, Optional[str]]:
+    """`devin auth status` por SSH: (ok, detalle del fallo).
+
+    El detalle importa: un timeout de ssh y un "no autenticado" real se veian
+    igual (auth_required sin motivo), y el 503 del puente no dejaba rastro.
+    IMPORTANTE: pasar stdin=DEVNULL porque _stdin_loop ya bloquea sobre el
+    STD_INPUT_HANDLE de la consola en Windows y ssh.exe colisiona si lo hereda.
+    """
+    try:
+        proc = subprocess.run(
+            _ssh_base(host) + [executable, "auth", "status"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True, timeout=40)
+    except subprocess.TimeoutExpired:
+        return False, "devin auth status remoto: ssh sin respuesta en 40 s"
+    except Exception as exc:
+        return False, f"devin auth status remoto: {redact_text(exc)[:160]}"
+    if proc.returncode == 0:
+        return True, None
+    err = redact_text(proc.stderr.decode("utf-8", "replace")).strip()
+    if not err:
+        return False, f"devin auth status remoto rc={proc.returncode}"
+    return False, f"devin auth status remoto rc={proc.returncode}: {err}"[:300]
+
+
+def _auth_result(value: Any) -> Tuple[bool, Optional[str]]:
+    """Normaliza el resultado de un auth_fn (bool o (ok, detalle))."""
+    if isinstance(value, tuple):
+        return bool(value[0]), value[1]
+    return bool(value), None
 
 
 def set_console_title(title: str) -> None:
@@ -748,7 +841,7 @@ class StateStore:
             mutex = LockMutex(self._lock_name())
             if not mutex.acquire():
                 mutex.close()
-                raise StateError("no se pudo adquirir el lock de estado")
+                raise StateLockError("no se pudo adquirir el lock de estado")
             try:
                 state = self.load()
                 yield state
@@ -1105,6 +1198,26 @@ def build_initial_prompt(template: str, day: str,
     return template.replace("{day}", day).replace("{report}", body)
 
 
+def _worker_stderr_sink(policy: Dict[str, Any], group: str):
+    """Archivo donde el worker vuelca su stderr (tracebacks).
+
+    Sin esto, un worker que muere antes de marcar estado no deja ninguna
+    evidencia: la consola se cierra y el watcher solo cuenta el fallo.
+    """
+    try:
+        log_dir = Path(policy["state_root"]) / group
+        log_dir.mkdir(parents=True, exist_ok=True)
+        path = log_dir / "worker.err.log"
+        try:
+            if path.stat().st_size > 1_048_576:
+                os.replace(path, log_dir / "worker.err.log.1")
+        except OSError:
+            pass
+        return open(path, "a", encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+
 def default_spawn_worker(policy: Dict[str, Any], group: str,
                          day: str) -> subprocess.Popen:
     py = policy.get("python_executable") or sys.executable
@@ -1115,6 +1228,11 @@ def default_spawn_worker(policy: Dict[str, Any], group: str,
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = SW_SHOWMINNOACTIVE
+    # IMPORTANTE: NO pasar stderr/stdout/stdin a Popen con CREATE_NEW_CONSOLE
+    # desde pythonw.exe. En Windows, pasar cualquier handle activa
+    # STARTF_USESTDHANDLES y copia STD_INPUT_HANDLE/STD_OUTPUT_HANDLE invalidos
+    # de pythonw al hijo (OSError [Errno 22] en stdout y EOF inmediato en stdin).
+    # El worker redirige su propio sys.stderr a worker.err.log al iniciar.
     return subprocess.Popen(cmd, creationflags=CREATE_NEW_CONSOLE,
                             startupinfo=startupinfo)
 
@@ -1122,6 +1240,13 @@ def default_spawn_worker(policy: Dict[str, Any], group: str,
 def default_spawn_agent(executable: str, mode: str,
                         cwd: str) -> subprocess.Popen:
     env = dict(os.environ)
+    # Menos ruido en el stderr del CLI (y por tanto en devin-diagnostics.log):
+    # el descubrimiento de skills y la revalidacion de config remota son
+    # INFO/WARN periodicos sin valor diagnostico.
+    env.setdefault(
+        "RUST_LOG",
+        "info,chisel_agent::skills_loading=warn,"
+        "windsurf_api_client::remote_config=error")
     argv = [executable]
     if mode:
         env["DEVIN_PERMISSION_MODE"] = mode
@@ -1130,6 +1255,24 @@ def default_spawn_agent(executable: str, mode: str,
     return subprocess.Popen(
         argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, bufsize=0, cwd=cwd or None, env=env)
+
+
+def default_spawn_agent_remote(host: str, executable: str,
+                               mode: str) -> subprocess.Popen:
+    """Arranca `devin acp` en el host remoto y habla ACP por stdio de ssh.
+
+    El agente corre con el cwd del grupo (p. ej. /root/tec), asi que sus
+    herramientas editan el codigo de produccion y sus commits quedan en el
+    repo que es `origin`. No se envia DEVIN_PERMISSION_MODE: el modo se fija
+    con el flag y se confirma luego por RPC.
+    """
+    argv = _ssh_base(host) + [executable]
+    if mode:
+        argv += ["--permission-mode", mode]
+    argv.append("acp")
+    return subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, bufsize=0)
 
 
 def process_commit_bytes(pid: Optional[int]) -> Optional[int]:
@@ -1371,10 +1514,11 @@ class AcpSession:
         return str(sid)
 
     def load_session(self, session_id: str, cwd: str) -> str:
+        load_timeout = max(CONTROL_RPC_TIMEOUT, SESSION_LOAD_TIMEOUT)
         result = self.transport.request("session/load", {
             "sessionId": session_id, "cwd": cwd, "mcpServers": []},
-            timeout=max(CONTROL_RPC_TIMEOUT, SESSION_LOAD_TIMEOUT),
-            idle_timeout=CONTROL_RPC_TIMEOUT)
+            timeout=load_timeout,
+            idle_timeout=load_timeout)
         sid = str((result or {}).get("sessionId") or session_id)
         self.session_info[sid] = result or {}
         return sid
@@ -1575,12 +1719,47 @@ class Watcher:
         self.today = today
         self.log = log or default_log_sink(Path(policy["state_root"]) / group)
         if devin_exists is None:
-            exe = policy.get("devin_executable", "")
-            devin_exists = lambda: bool(exe) and Path(exe).exists()
+            if remote_group_cfg(policy["groups"][group]):
+                # El ejecutable vive en el host remoto; el worker valida
+                # ssh/auth al arrancar y falla cerrado.
+                devin_exists = lambda: True
+            else:
+                exe = policy.get("devin_executable", "")
+                devin_exists = lambda: bool(exe) and Path(exe).exists()
         self.devin_exists = devin_exists
         self.alert_sender = alert_sender or BridgeAlertSender(policy, group)
         self._last_child = None
         self._last_poll_at: Optional[float] = None
+        self._policy_mtime: Optional[float] = None
+
+    def _reload_policy_if_changed(self) -> None:
+        """Recarga policy.json cuando cambia (mute rules, digest, batch).
+
+        Antes habia que reiniciar el watcher para aplicar una regla de
+        silencio, y reiniciar la tarea desde dentro de una sesion mata al
+        propio agente a mitad de turno. Las claves de alerta (alert_url,
+        token) siguen leyendose al arrancar.
+        """
+        policy_dir = Path(str(self.policy.get("_dir") or ""))
+        path = policy_dir / "policy.json"
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return
+        if self._policy_mtime is None:
+            self._policy_mtime = mtime
+            return
+        if mtime == self._policy_mtime:
+            return
+        try:
+            fresh = load_policy(policy_dir)
+        except BridgeError as exc:
+            self._policy_mtime = mtime
+            self.log(f"policy.json invalido; sigo con la anterior: {exc}")
+            return
+        self._policy_mtime = mtime
+        self.policy = fresh
+        self.log("policy.json recargado en caliente")
 
     def health_snapshot(self):
         """(payload, http_status) para el endpoint de salud del puente."""
@@ -1609,6 +1788,7 @@ class Watcher:
         }, (200 if ok else 503))
 
     def poll_once(self) -> Dict[str, Any]:
+        self._reload_policy_if_changed()
         decision: Dict[str, Any] = {"spawn_day": None, "queued": 0,
                                     "deduped": 0, "dropped": 0, "evicted": 0,
                                     "suppressed": 0, "muted": 0,
@@ -1631,6 +1811,7 @@ class Watcher:
             else:
                 cursor = int(state["cursor"])
                 batch_limit = int(self.policy.get("batch_size", 50))
+                saw_routed = False
                 rows = self.source.fetch(cursor, batch_limit)
                 if not rows:
                     max_id = self.source.highwater()
@@ -1654,6 +1835,7 @@ class Watcher:
                     for row in rows:
                         rid = int(row["occurrence_id"])
                         if route_event(self.policy, row) == self.group:
+                            saw_routed = True
                             ev = event_from_row(row, day)
                             muted = mute_rule_for(self.policy, ev, day)
                             queued_now = False
@@ -1724,7 +1906,8 @@ class Watcher:
                         state["status_at"] = self.now()
                         if not state["uncertain"]:
                             state["last_error"] = None
-                    self._heal_stale_pause_locked(state)
+                    self._heal_stale_pause_locked(state, new_notice=saw_routed)
+                    self._heal_manual_gap_locked(state)
                     decision["spawn_day"] = self._spawn_day_locked(state)
         if escalation is not None:
             if not self._send_escalation(escalation):
@@ -1820,28 +2003,62 @@ class Watcher:
         if float(state.get("hold_until") or 0.0) <= self.now():
             state["hold_until"] = self.now() + hold
 
-    def _heal_stale_pause_locked(self, state) -> None:
+    def _heal_stale_pause_locked(self, state, new_notice: bool = False) -> None:
         """Levanta la pausa por consola cerrada cuando llego un reporte nuevo
         despues de pausar (occurrence_id > pause_cursor).
 
         No depende de que el poll actual haya encolado algo: si el aviso se
         encolo en un ciclo anterior y la pausa no se limpio, el watcher se
         recupera solo en el siguiente ciclo.
+
+        `new_notice` cubre los avisos del grupo que no llegan a `pending`
+        (muteados, deduplicados o suprimidos por firma): tambien son reportes
+        nuevos y sin ellos la pausa quedaba permanente.
         """
-        if not state["paused"] or state["circuit_open"] \
-                or state["status"] != "paused":
+        if not state["paused"] or state["circuit_open"]:
             return
         cursor = int(state.get("pause_cursor") or 0)
         if not cursor:
             return
-        if any(int(e.get("occurrence_id") or 0) > cursor
-               for e in state["pending"]):
+        if new_notice or any(int(e.get("occurrence_id") or 0) > cursor
+                             for e in state["pending"]):
             state["paused"] = False
             state["pause_cursor"] = 0
             state["status"] = "uncertain" if state["uncertain"] else "ok"
             state["status_at"] = self.now()
             if not state["uncertain"]:
                 state["last_error"] = None
+
+    def _auto_resume_minutes(self) -> float:
+        try:
+            return max(0.0, float(self.policy.get("auto_resume_minutes", 15)))
+        except (TypeError, ValueError):
+            return 15.0
+
+    def _heal_manual_gap_locked(self, state) -> None:
+        """Un `manual_gap` no puede durar para siempre.
+
+        Caso real 2026-11-07: `session/load` fallo, el estado quedo en
+        manual_gap + paused con 500 pendientes y el grupo estuvo ~12 h sin
+        triaje hasta que alguien lo miro. Si hay trabajo y la marca tiene mas
+        de `auto_resume_minutes`, se levanta la pausa y el siguiente ciclo
+        abre sesion (con el fallback a sesion nueva de `_ensure_session`).
+        """
+        if state.get("status") != "manual_gap" or state["circuit_open"]:
+            return
+        if not state["pending"]:
+            return
+        minutes = self._auto_resume_minutes()
+        if minutes <= 0:
+            return
+        since = float(state.get("status_at") or 0.0)
+        if since and self.now() - since < minutes * 60.0:
+            return
+        state["paused"] = False
+        state["pause_cursor"] = 0
+        state["status"] = "uncertain" if state["uncertain"] else "ok"
+        state["status_at"] = self.now()
+        state["last_error"] = None
 
     def _spawn_day_locked(self, state) -> Optional[str]:
         if not state["pending"] or state["paused"] or state["circuit_open"]:
@@ -1854,6 +2071,16 @@ class Watcher:
                 and all(e.get("level") in held_levels
                         for e in state["pending"]):
             return None
+        # Un backlog de dias anteriores no debe abrir la consola de ese dia
+        # (nacio, trabajo 2 minutos y murio al reiniciar el watcher). Los
+        # avisos viejos se reagrupan en el dia actual para que el reporte y la
+        # sesion sean los de hoy.
+        today = self.today()
+        stale = [e for e in state["pending"]
+                 if str(e.get("received_day") or "") < today]
+        if stale:
+            for e in stale:
+                e["received_day"] = today
         days = [e["received_day"] for e in state["pending"]]
         return min(days) if days else None
 
@@ -2024,9 +2251,11 @@ class Watcher:
                 has_more = bool(result.get("has_more"))
                 if result.get("status") not in ("idle", "ok"):
                     self.log(f"[watcher {self.group}] {result}")
+            except StateLockError as exc:
+                self.log(f"[watcher {self.group}] error de ciclo: {redact_text(exc)}")
             except (StateError, BridgeError) as exc:
                 self.log(f"[watcher {self.group}] ERROR cerrado: {redact_text(exc)}")
-                break
+                raise
             except Exception as exc:
                 self.log(f"[watcher {self.group}] error de ciclo: {redact_text(exc)}")
             cycles += 1
@@ -2045,11 +2274,19 @@ HELP_TEXT = (
 _DEVIN_LEVEL_TOKEN_RE = re.compile(
     r"(?i)\b(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|PANIC)\b")
 _DEVIN_ERR_LEVELS = ("ERROR", "FATAL", "PANIC")
+# Ruido del CLI que no aporta a un diagnostico: descubrimiento de skills cada
+# 15 s, timeouts de revalidacion de config remota y esperas internas de stop.
+# Se descarta antes de escribir devin-diagnostics.log (rotaba 1 MiB cada pocas
+# horas solo con estas lineas).
+_DEVIN_NOISE_RE = re.compile(
+    r"skills discovery:|remote config revalidation failed|"
+    r"Waiting for stop token", re.IGNORECASE)
 
 
 class ConsoleWorker:
     def __init__(self, policy, group, day, store,
                  spawn_agent=default_spawn_agent,
+                 spawn_agent_remote=default_spawn_agent_remote,
                  stdin_queue=None, stdout=None,
                  now=time.time,
                  today=lambda: date.today().isoformat(),
@@ -2057,6 +2294,7 @@ class ConsoleWorker:
                  verify_elevation_fn=verify_elevation,
                  mutex_factory=HeldMutex,
                  auth_fn=devin_authenticated,
+                 auth_remote_fn=devin_authenticated_remote_detail,
                  title_fn=set_console_title,
                  commit_fn=process_commit_bytes):
         self.policy = policy
@@ -2065,6 +2303,7 @@ class ConsoleWorker:
         self.day = day
         self.store = store
         self.spawn_agent = spawn_agent
+        self.spawn_agent_remote = spawn_agent_remote
         self.commit_fn = commit_fn
         self.now = now
         self.today = today
@@ -2072,6 +2311,7 @@ class ConsoleWorker:
         self.verify_elevation_fn = verify_elevation_fn
         self.mutex_factory = mutex_factory
         self.auth_fn = auth_fn
+        self.auth_remote_fn = auth_remote_fn
         self.title_fn = title_fn
         self.out = stdout if stdout is not None else sys.stdout
         self.stdin_queue = stdin_queue or queue.Queue()
@@ -2148,6 +2388,8 @@ class ConsoleWorker:
 
     def _devin_log(self, line: str) -> None:
         text = redact_text(str(line))[:1000]
+        if _DEVIN_NOISE_RE.search(text):
+            return
         self._diag_lines.append(text)
         try:
             logger = self._rotating_logger(
@@ -2240,9 +2482,15 @@ class ConsoleWorker:
                                event_ids=list(self._active_event_ids))
 
     def _stdin_loop(self) -> None:
+        if sys.stdin is None:
+            return
         try:
             for line in sys.stdin:
                 self.stdin_queue.put(line.rstrip("\r\n"))
+        except OSError:
+            # Handle de stdin invalido (p. ej. consola desacoplada): no enviar
+            # None para no disparar un falso EOF que cierre/pause el worker.
+            return
         except Exception:
             pass
         self.stdin_queue.put(None)
@@ -2452,16 +2700,31 @@ class ConsoleWorker:
         self._print("  Escribí /ayuda para ver los comandos.")
         self._print("=" * 60)
         self._start_dispatchers()
-        exe = self.policy.get("devin_executable", "")
-        if not exe or not Path(exe).exists():
-            self._print("ERROR: no se encontro el ejecutable de Devin CLI.")
-            self._mark_status("agent_missing", "devin_executable no existe")
-            return 5
-        if not self.auth_fn(exe):
-            self._print("ERROR: Devin CLI no esta autenticado. "
-                        "Se detiene la activacion; avisar al usuario.")
-            self._mark_status("auth_required", "devin auth status fallo")
-            return 5
+        remote = remote_group_cfg(self.group_cfg)
+        exe = group_devin_executable(self.policy, self.group_cfg)
+        if remote:
+            host = str(remote["host"])
+            if not exe:
+                self._print("ERROR: modo remoto sin devin_executable.")
+                self._mark_status("agent_missing", "remoto sin ejecutable")
+                return 5
+            ok, detail = _auth_result(self.auth_remote_fn(host, exe))
+            if not ok:
+                self._print("ERROR: Devin CLI remoto no esta autenticado. "
+                            "Se detiene la activacion; avisar al usuario.")
+                self._mark_status("auth_required",
+                                  detail or "devin auth status remoto fallo")
+                return 5
+        else:
+            if not exe or not Path(exe).exists():
+                self._print("ERROR: no se encontro el ejecutable de Devin CLI.")
+                self._mark_status("agent_missing", "devin_executable no existe")
+                return 5
+            if not self.auth_fn(exe):
+                self._print("ERROR: Devin CLI no esta autenticado. "
+                            "Se detiene la activacion; avisar al usuario.")
+                self._mark_status("auth_required", "devin auth status fallo")
+                return 5
         try:
             st = self.store.load()
             sess = st["sessions"].get(self.day) or {}
@@ -2528,11 +2791,18 @@ class ConsoleWorker:
                             "terminar el turno actual.")
 
     def _connect(self) -> bool:
-        exe = self.policy.get("devin_executable", "")
+        remote = remote_group_cfg(self.group_cfg)
+        mode = str(self.policy.get("permission_mode", ""))
         try:
-            proc = self.spawn_agent(
-                exe, str(self.policy.get("permission_mode", "")),
-                self.group_cfg["cwd"])
+            if remote:
+                proc = self.spawn_agent_remote(
+                    str(remote["host"]),
+                    group_devin_executable(self.policy, self.group_cfg),
+                    mode)
+            else:
+                proc = self.spawn_agent(
+                    group_devin_executable(self.policy, self.group_cfg),
+                    mode, group_agent_cwd(self.group_cfg))
         except Exception as exc:
             self._print(f"ERROR: no se pudo iniciar devin acp: {redact_text(exc)}")
             self._mark_status("agent_spawn_error", str(exc)[:300])
@@ -2683,31 +2953,51 @@ class ConsoleWorker:
         return True
 
     def _ensure_session(self) -> Optional[str]:
-        cwd = self.group_cfg["cwd"]
+        cwd = group_agent_cwd(self.group_cfg)
+        want_remote = remote_group_cfg(self.group_cfg) is not None
         state = self.store.load()
         session = state["sessions"].get(self.day)
-        if session and session.get("session_id"):
+        if session and session.get("session_id") \
+                and bool(session.get("remote")) == want_remote:
             sid = str(session["session_id"])
+            reason = None
             if not self._session.load_supported():
-                self._mark_status(
-                    "manual_gap",
-                    "sesion previa del dia pero agente sin loadSession")
-                self._print("No se puede reanudar la sesion del dia; "
-                            "recuperacion manual requerida.")
-                return None
-            try:
-                self._loading_session = True
-                new_sid = self._session.load_session(sid, cwd)
-            except Exception as exc:
-                self._mark_status("manual_gap", f"session/load fallo: {exc}")
-                self._print("Fallo la reanudacion; no se crea reemplazo "
-                            "automatico.")
-                return None
-            finally:
-                self._loading_session = False
+                reason = "agente sin loadSession"
+            else:
+                try:
+                    self._loading_session = True
+                    new_sid = self._session.load_session(sid, cwd)
+                except Exception as exc:
+                    reason = f"session/load fallo: {exc}"
+                finally:
+                    self._loading_session = False
+            if reason:
+                # Auto-recuperacion: una sesion que ya no se puede reanudar
+                # (expirada, CLI actualizado, agente sin loadSession) no debe
+                # dejar el puente en manual_gap hasta que alguien lo mire.
+                # Se abre una sesion nueva del dia y se reenvia el prompt
+                # inicial con el siguiente lote; el historial previo queda
+                # solo en sessions.db.
+                self._print(f"No se pudo reanudar la sesion ({reason}); "
+                            "abro una nueva y sigo.")
+                self._ui_event("session_load_failed", session_id=sid,
+                               error=redact_text(reason)[:200])
+                sid = self._session.new_session(cwd)
+                with self.store.transaction() as st:
+                    st["sessions"][self.day] = {
+                        "session_id": sid, "initial_prompt_sent": False,
+                        "prompts_sent": 0, "started_at": self.now(),
+                        "remote": want_remote, "recovered_from": session.get(
+                            "session_id")}
+                self._session_id = sid
+                self._mark_status("ok", None)
+                self._ui_event("session_ready", session_id=sid,
+                               resumed=False, recovered=True)
+                return sid
             with self.store.transaction() as st:
                 renewed = dict(session)
                 renewed["session_id"] = new_sid
+                renewed["remote"] = want_remote
                 renewed["initial_prompt_sent"] = bool(
                     session.get("initial_prompt_sent"))
                 renewed.setdefault("prompts_sent", 0)
@@ -2725,7 +3015,8 @@ class ConsoleWorker:
         with self.store.transaction() as st:
             st["sessions"][self.day] = {
                 "session_id": sid, "initial_prompt_sent": False,
-                "prompts_sent": 0, "started_at": self.now()}
+                "prompts_sent": 0, "started_at": self.now(),
+                "remote": want_remote}
         self._session_id = sid
         self._ui_event("session_ready", session_id=sid, resumed=False)
         return sid
@@ -2771,7 +3062,7 @@ class ConsoleWorker:
         if self._session is None:
             return False
         try:
-            sid = self._session.new_session(self.group_cfg["cwd"])
+            sid = self._session.new_session(group_agent_cwd(self.group_cfg))
         except Exception as exc:
             self._mark_status("session_rotate_error",
                               f"session/new fallo: {exc}")
@@ -2798,7 +3089,8 @@ class ConsoleWorker:
         with self.store.transaction() as st:
             st["sessions"][self.day] = {
                 "session_id": sid, "initial_prompt_sent": False,
-                "prompts_sent": 0, "started_at": self.now()}
+                "prompts_sent": 0, "started_at": self.now(),
+                "remote": remote_group_cfg(self.group_cfg) is not None}
         self._session_id = sid
         if effective:
             self._effective_mode = effective
@@ -3372,10 +3664,10 @@ class ConsoleWorker:
                     with self.store.transaction() as st:
                         if st["pending"] or st["uncertain"]:
                             st["paused"] = True
+                            st["pause_cursor"] = int(st["cursor"])
                             if st["status"] == "ok":
                                 st["status"] = "paused"
                                 st["status_at"] = self.now()
-                                st["pause_cursor"] = int(st["cursor"])
                 except Exception:
                     pass
             return 0
@@ -3451,8 +3743,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         finally:
             mutex.release()
     day = args.day or date.today().isoformat()
-    worker = ConsoleWorker(policy, args.group, day, store)
-    return worker.run()
+    err_sink = _worker_stderr_sink(policy, args.group)
+    if err_sink is not None:
+        sys.stderr = err_sink
+    try:
+        worker = ConsoleWorker(policy, args.group, day, store)
+        return worker.run()
+    finally:
+        if err_sink is not None:
+            try:
+                err_sink.flush()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

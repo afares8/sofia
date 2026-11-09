@@ -932,9 +932,75 @@ def test_rollover_day_routing(env):
     add_occurrence(env.db, level="ERROR", message="hoy")
     w.poll_once()
     st = store.load()
+    # El backlog de ayer no abre la consola de ayer: se reagrupa en el dia
+    # actual (2026-11-08 paso justo eso: sesion del 7-nov abierta a las 21:08
+    # que murio a los 2 minutos al reiniciar el watcher).
     days = {e["received_day"] for e in st["pending"]}
-    assert days == {"2026-01-01", "2026-01-02"}
-    assert spawns[-1] == ("local", "2026-01-01")
+    assert days == {"2026-01-02"}
+    # No se abre una consola nueva para el dia viejo (el reloj esta congelado,
+    # asi que el lease de spawn impide ademas abrir la del dia nuevo aqui;
+    # test_stale_backlog_moves_to_today cubre ese spawn).
+    assert ("local", "2026-01-01") not in spawns[1:]
+
+
+def test_stale_backlog_moves_to_today(env):
+    clock = {"day": "2026-01-02"}
+    w, store, spawns = make_watcher(env, today=lambda: clock["day"])
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["pending"] = [ev(1, day="2026-01-01")]
+    w.poll_once()
+    st = store.load()
+    assert {e["received_day"] for e in st["pending"]} == {"2026-01-02"}
+    assert spawns == [("local", "2026-01-02")]
+
+
+def test_manual_gap_auto_resume(env):
+    now = {"t": 1000.0}
+    w, store, spawns = make_watcher(env, now=lambda: now["t"])
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["paused"] = True
+        st["status"] = "manual_gap"
+        st["status_at"] = now["t"] - 20 * 60
+        st["pending"] = [ev(1)]
+    w.poll_once()
+    assert spawns == [("local", "2026-01-01")]
+    st = store.load()
+    assert st["paused"] is False
+    assert st["status"] == "ok"
+
+
+def test_manual_gap_waits_its_window(env):
+    now = {"t": 1000.0}
+    w, store, spawns = make_watcher(env, now=lambda: now["t"])
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["paused"] = True
+        st["status"] = "manual_gap"
+        st["status_at"] = now["t"] - 5 * 60
+        st["pending"] = [ev(1)]
+    w.poll_once()
+    assert spawns == []
+    assert store.load()["paused"] is True
+
+
+def test_policy_hot_reload_applies_mute_rule(env):
+    w, store, spawns = make_watcher(env)
+    with store.transaction() as st:
+        st["initialized"] = True
+    w.poll_once()
+    raw = json.loads((env.policy_dir / "policy.json").read_text("utf-8"))
+    raw["mute_rules"] = [{"id": "boom", "pattern": "boom",
+                          "levels": ["ERROR"]}]
+    (env.policy_dir / "policy.json").write_text(json.dumps(raw), encoding="utf-8")
+    future = time.time() + 5
+    os.utime(env.policy_dir / "policy.json", (future, future))
+    add_occurrence(env.db, level="ERROR", message="boom")
+    w.poll_once()
+    st = store.load()
+    assert st["pending"] == []
+    assert st["muted"] >= 1
 
 
 def test_abandoned_inflight_marked_uncertain(env):
@@ -1507,16 +1573,23 @@ def test_resume_exact_session_id(env):
     assert load["params"]["sessionId"] == "sess-previa"
 
 
-def test_load_failure_no_replacement_session(env):
+def test_load_failure_recovers_with_new_session(env):
     store = bridge.StateStore(env.state_root / "local")
     with store.transaction() as st:
         st["sessions"]["2026-01-01"] = {"session_id": "sess-previa",
                                         "initial_prompt_sent": True}
+        st["pending"] = [ev(1)]
     agent = FakeAcpProc(load_error="sesion expirada")
     worker, wstore, out, ph = make_worker(env, agent=agent, store=store)
-    assert worker.run() == 5
-    assert "session/new" not in [m["method"] for m in agent.received]
-    assert wstore.load()["status"] == "manual_gap"
+    worker.run()
+    methods = [m["method"] for m in agent.received]
+    assert "session/load" in methods
+    assert "session/new" in methods
+    assert "session/prompt" in methods
+    st = wstore.load()
+    assert st["status"] == "ok"
+    assert st["sessions"]["2026-01-01"]["session_id"] != "sess-previa"
+    assert st["sessions"]["2026-01-01"]["recovered_from"] == "sess-previa"
 
 
 def test_elevation_mismatch_fail_closed(env):
@@ -2426,6 +2499,75 @@ def test_spawn_agent_argv_includes_mode(monkeypatch):
     assert captured["cwd"] == "C:/tmp"
 
 
+def test_spawn_agent_remote_uses_ssh_without_local_cwd(monkeypatch):
+    captured = {}
+
+    def fake_popen(argv, **kw):
+        captured["argv"] = argv
+        captured["kw"] = kw
+        return Simple()
+
+    monkeypatch.setattr(bridge.subprocess, "Popen", fake_popen)
+    bridge.default_spawn_agent_remote(
+        "magnate", "/root/.local/bin/devin", "dangerous")
+    argv = captured["argv"]
+    assert argv[0] == "ssh"
+    assert "BatchMode=yes" in argv
+    assert argv[-5] == "magnate"
+    assert argv[-4:] == ["/root/.local/bin/devin",
+                         "--permission-mode", "dangerous", "acp"]
+    assert captured["kw"].get("cwd") is None
+    assert "env" not in captured["kw"]
+
+
+def test_remote_group_helpers_use_remote_cwd_and_executable():
+    policy = {"devin_executable": "C:/local/devin.exe"}
+    local = {"cwd": "C:/repo"}
+    remote = {"cwd": "C:/repo",
+              "remote": {"host": "magnate", "cwd": "/root/tec",
+                         "devin_executable": "/root/.local/bin/devin"}}
+    assert bridge.remote_group_cfg(local) is None
+    assert bridge.group_agent_cwd(local) == "C:/repo"
+    assert bridge.group_devin_executable(policy, local) == "C:/local/devin.exe"
+    assert bridge.group_agent_cwd(remote) == "/root/tec"
+    assert bridge.group_devin_executable(
+        policy, remote) == "/root/.local/bin/devin"
+
+
+def test_verify_elevation_remote_requires_root(monkeypatch):
+    group = {"cwd": "/root/tec",
+             "remote": {"host": "magnate", "cwd": "/root/tec"}}
+
+    def fake_run(argv, **kw):
+        return Simple(returncode=0, stdout=b"0\n")
+
+    monkeypatch.setattr(bridge.subprocess, "run", fake_run)
+    bridge.verify_elevation(group)
+
+    def fake_run_non_root(argv, **kw):
+        return Simple(returncode=0, stdout=b"1000\n")
+
+    monkeypatch.setattr(bridge.subprocess, "run", fake_run_non_root)
+    with pytest.raises(bridge.ElevationMismatch):
+        bridge.verify_elevation(group)
+
+
+def test_devin_authenticated_remote_uses_ssh(monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = argv
+        return Simple(returncode=0)
+
+    monkeypatch.setattr(bridge.subprocess, "run", fake_run)
+    assert bridge.devin_authenticated_remote(
+        "magnate", "/root/.local/bin/devin") is True
+    assert seen["argv"][0] == "ssh"
+    assert seen["argv"][-4:] == ["magnate", "/root/.local/bin/devin",
+                                 "auth", "status"]
+
+
+
 def test_healthy_worker_hard_close_pauses(env):
     now = {"t": 7000.0}
     w, store, spawns = make_watcher(
@@ -2932,8 +3074,10 @@ def test_uncertain_idle_parks_agent_and_reintentar_reconnects(env):
         auth_fn=lambda e: True, title_fn=lambda t: None)
     t = threading.Thread(target=worker.run, daemon=True)
     t.start()
+    # El aviso se imprime antes de cerrar el transporte; esperar ambas cosas
+    # evita un falso fallo cuando la maquina esta cargada.
     for _ in range(500):
-        if "liberar memoria" in out.getvalue():
+        if "liberar memoria" in out.getvalue() and worker._transport is None:
             break
         time.sleep(0.02)
     assert worker._transport is None
@@ -3305,3 +3449,124 @@ def test_repeat_suppress_window_by_level(env):
     assert bridge.repeat_suppress_seconds(env.policy, "WARNING") == 240 * 60
     assert bridge.repeat_suppress_seconds(env.policy, "ERROR") == 60 * 60
     assert bridge.repeat_suppress_seconds(env.policy) == 240 * 60
+
+
+def test_default_spawn_worker_does_not_pass_std_handles(monkeypatch, tmp_path):
+    """Pasar stderr/stdout/stdin a Popen con CREATE_NEW_CONSOLE desde pythonw
+    activa STARTF_USESTDHANDLES y hereda handles invalidos en la consola."""
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(bridge.subprocess, "Popen", FakePopen)
+    policy = {"python_executable": "python.exe",
+              "state_root": str(tmp_path), "_dir": str(tmp_path)}
+    bridge.default_spawn_worker(policy, "local", "2026-01-01")
+    kwargs = captured["kwargs"]
+    assert kwargs.get("stdin") is None
+    assert kwargs.get("stdout") is None
+    assert kwargs.get("stderr") is None
+
+
+def test_stdin_loop_oserror_does_not_emit_false_eof(env, monkeypatch):
+    """Un handle de stdin invalido (OSError) no debe encolar None (EOF)."""
+    class BrokenStdin:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise OSError(22, "Invalid argument")
+
+    monkeypatch.setattr(bridge.sys, "stdin", BrokenStdin())
+    worker, _, _, _ = make_worker(env, stdin_lines=[])
+    # Limpiar el None que make_worker encola por defecto
+    while not worker.stdin_queue.empty():
+        worker.stdin_queue.get_nowait()
+    worker._stdin_loop()
+    assert worker.stdin_queue.empty()
+
+
+def test_watcher_run_survives_state_lock_error_and_raises_fatal(env):
+    """StateLockError transitorio no mata el loop del watcher; StateError
+    corrupto si propaga excepcion para que main() devuelva rc != 0."""
+    logs = []
+    w, _, _ = make_watcher(env, log=logs.append)
+    calls = {"n": 0}
+
+    def flaky_poll():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise bridge.StateLockError("no se pudo adquirir el lock de estado")
+        return {"status": "ok", "has_more": False}
+
+    w.poll_once = flaky_poll
+    w.run(poll_seconds=0.01, sleep=lambda s: None, max_cycles=2)
+    assert calls["n"] == 2
+    assert any("error de ciclo: no se pudo adquirir el lock de estado" in m
+               for m in logs)
+
+    def corrupt_poll():
+        raise bridge.StateError("estado corrupto")
+
+    w.poll_once = corrupt_poll
+    with pytest.raises(bridge.StateError):
+        w.run(poll_seconds=0.01, sleep=lambda s: None, max_cycles=2)
+
+
+def test_pause_while_uncertain_sets_pause_cursor_and_heals(env):
+    """Si un worker se detiene estando en uncertain, registra pause_cursor
+    y _heal_stale_pause_locked levanta la pausa ante un aviso nuevo."""
+    w, store, _ = make_watcher(env)
+    w.poll_once()
+    with store.transaction() as st:
+        st["initialized"] = True
+        st["cursor"] = 10
+        st["pending"] = [ev(10, message="viejo")]
+        st["uncertain"] = True
+        st["status"] = "uncertain"
+        st["inflight"] = {"event_ids": [10], "prompt_sent": True,
+                          "uncertain": True, "use_initial": False,
+                          "day": "2026-01-01", "stop_reason": None}
+    agent = FakeAcpProc(load_session=True)
+    worker, _, _, _ = make_worker(env, agent=agent, store=store, stdin_lines=[])
+    assert worker.run() == 0
+    st_after = store.load()
+    assert st_after["paused"] is True
+    assert st_after["pause_cursor"] == 10
+
+    with store.transaction() as st:
+        st["pending"].append(ev(11, message="nuevo"))
+        w._heal_stale_pause_locked(st)
+    healed = store.load()
+    assert healed["paused"] is False
+    assert healed["pause_cursor"] == 0
+    assert healed["status"] == "uncertain"
+
+
+def test_muted_notice_heals_stale_pause(env):
+    """Un aviso muteado del grupo tambien es un reporte nuevo: levanta la
+    pausa por consola cerrada aunque nunca llegue a `pending`."""
+    env.policy["_mute_rules"] = bridge.compile_mute_rules([{
+        "id": "slow", "service_id": "mayor", "pattern": "^Slow request"}])
+    add_occurrence(env.db, service_id="mayor", service_name="Mayor",
+                   level="WARNING", message="primero")
+    w, store, _ = make_watcher(env)
+    w.poll_once()
+    with store.transaction() as st:
+        assert st["cursor"] == 1
+        st["pending"] = [ev(1, message="viejo")]
+        st["paused"] = True
+        st["status"] = "paused"
+        st["pause_cursor"] = 1
+        st["last_error"] = "consola cerrada por el usuario con reportes pendientes"
+    add_occurrence(env.db, service_id="mayor", service_name="Mayor",
+                   level="WARNING", message="Slow request GET /api/x")
+    res = w.poll_once()
+    assert res["muted"] == 1 and res["queued"] == 0
+    healed = store.load()
+    assert healed["paused"] is False
+    assert healed["pause_cursor"] == 0
+    assert healed["status"] == "ok"
+
