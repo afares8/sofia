@@ -1643,3 +1643,21 @@ Hallazgos y cambios aplicados:
   leer el indice y hacer grep dirigido en vez de leer el archivo completo.
 - Tests: `tests/test_sofia_devin_bridge.py` (163), `test_health_service.py` (21),
   `test_restore_health.py`, `test_self_health.py` — 193+ pasando.
+
+### Cierre 2026-11-09: puentes 24/7 verificados
+
+- `Sofia-Devin-AppsPC` y `Sofia-Devin-ElenaTec` quedaron re-registradas con
+  `LogonType S4U`, triggers `Boot+Logon`, `RestartCount 3` y `StartWhenAvailable`
+  (backup y reversion en `C:\ProgramData\ServerSofia\tasks-backup-20261109-002654`).
+- Verificado en vivo: los dos watchers corren en **sesion 0** (`pythonw`,
+  PIDs 21664/26192) y `/health` responde 200 sin sesion interactiva. `local`
+  mantiene `RunLevel Highest`; `elenatec` `Limited`.
+- Probe S4U (tarea temporal eliminada tras la prueba, salida en
+  `C:\ProgramData\ServerSofia\s4u-probe-result.txt`): bajo el token S4U el
+  `ssh` del PATH es **Windows OpenSSH** (`C:\Windows\System32\OpenSSH\ssh.exe`),
+  `ssh magnate id -u` = 0 y `/root/.local/bin/devin auth status` = Logged in.
+  Por tanto el worker de ElenaTec puede autenticar sin sesion interactiva.
+- Leccion del primer intento: reiniciar un puente con `inflight.prompt_sent`
+  deja `uncertain` (503 transitorio, se reintenta solo). El setup ahora espera
+  inactividad (`-WaitIdleMinutes`, default 5) y `health_snapshot` reporta 200
+  para `uncertain`; `paused`/`circuit_open`/`source_reset` siguen 503.
