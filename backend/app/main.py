@@ -32,6 +32,136 @@ logging.basicConfig(
 logger = logging.getLogger("sofia")
 
 
+def install_proactor_accept_guard() -> bool:
+    """Evita que un reset de cliente en AcceptEx (WinError 64/10054/etc.)
+    cierre el socket de escucha en BaseProactorEventLoop (CPython Windows)."""
+    try:
+        from asyncio import exceptions as _aio_exc
+        from asyncio import proactor_events as _pe
+    except ImportError:
+        return False
+    base_cls = getattr(_pe, "BaseProactorEventLoop", None)
+    if base_cls is None:
+        return False
+    if getattr(base_cls, "_sofia_accept_guard_installed", False):
+        return True
+
+    def _guarded_start_serving(
+        self, protocol_factory, sock,
+        sslcontext=None, server=None, backlog=100,
+        ssl_handshake_timeout=None, ssl_shutdown_timeout=None,
+    ):
+        def loop(f=None):
+            try:
+                if f is not None:
+                    conn = None
+                    try:
+                        conn, addr = f.result()
+                        if self._debug:
+                            _pe.logger.debug(
+                                "%r got a new connection from %r: %r",
+                                server, addr, conn)
+                        protocol = protocol_factory()
+                        if sslcontext is not None:
+                            self._make_ssl_transport(
+                                conn, protocol, sslcontext, server_side=True,
+                                extra={"peername": addr}, server=server,
+                                ssl_handshake_timeout=ssl_handshake_timeout,
+                                ssl_shutdown_timeout=ssl_shutdown_timeout)
+                        else:
+                            self._make_socket_transport(
+                                conn, protocol,
+                                extra={"peername": addr}, server=server)
+                    except _aio_exc.CancelledError:
+                        if conn is not None:
+                            conn.close()
+                        sock.close()
+                        return
+                    except OSError as exc:
+                        if conn is not None:
+                            try:
+                                conn.close()
+                            except OSError:
+                                pass
+                        if self._debug:
+                            _pe.logger.debug(
+                                "Transient accept error on %r ignored: %r",
+                                sock, exc, exc_info=True)
+                if self.is_closed() or sock.fileno() == -1:
+                    return
+                f = self._proactor.accept(sock)
+            except _aio_exc.CancelledError:
+                sock.close()
+            except OSError as exc:
+                if sock.fileno() != -1 and not self.is_closed():
+                    if getattr(exc, "winerror", None) == 10038:
+                        sock.close()
+                        return
+                    _pe.logger.warning(
+                        "Accept arm failed on %r (%r); retrying in 0.1s",
+                        sock, exc)
+                    self.call_later(0.1, loop)
+            else:
+                self._accept_futures[sock.fileno()] = f
+                f.add_done_callback(loop)
+
+        self.call_soon(loop)
+
+    base_cls._start_serving = _guarded_start_serving
+    base_cls._sofia_accept_guard_installed = True
+
+    try:
+        import struct as _struct
+        import socket as _socket
+        from asyncio import tasks as _tasks
+        from asyncio import windows_events as _we
+        iocp_cls = getattr(_we, "IocpProactor", None)
+        _overlapped = getattr(_we, "_overlapped", None)
+        _null = getattr(_we, "NULL", 0)
+        if (iocp_cls is not None and _overlapped is not None
+                and not getattr(iocp_cls, "_sofia_accept_guard_installed", False)):
+            def _guarded_iocp_accept(self, listener):
+                self._register_with_iocp(listener)
+                conn = self._get_accept_socket(listener.family)
+                ov = _overlapped.Overlapped(_null)
+                try:
+                    ov.AcceptEx(listener.fileno(), conn.fileno())
+                except BaseException:
+                    conn.close()
+                    raise
+
+                def finish_accept(trans, key, ov):
+                    ov.getresult()
+                    buf = _struct.pack("@P", listener.fileno())
+                    conn.setsockopt(_socket.SOL_SOCKET,
+                                    _overlapped.SO_UPDATE_ACCEPT_CONTEXT, buf)
+                    conn.settimeout(listener.gettimeout())
+                    return conn, conn.getpeername()
+
+                async def accept_coro(future, conn):
+                    try:
+                        await future
+                    except _aio_exc.CancelledError:
+                        conn.close()
+                        raise
+                    except BaseException:
+                        conn.close()
+
+                future = self._register(ov, listener, finish_accept)
+                coro = accept_coro(future, conn)
+                _tasks.ensure_future(coro, loop=self._loop)
+                return future
+
+            iocp_cls.accept = _guarded_iocp_accept
+            iocp_cls._sofia_accept_guard_installed = True
+    except Exception:
+        pass
+    return True
+
+
+install_proactor_accept_guard()
+
+
 # Paths exempt from API-key auth (SDKs and WPPConnect can't send a header).
 AUTH_EXEMPT_PREFIXES = (
     "/api/ping",
